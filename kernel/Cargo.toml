@@ -1,0 +1,10 @@
+[package]
+name = "je4os-kernel"
+version.workspace = true
+edition.workspace = true
+
+[features]
+visualize-allocator = ["je4os-common/visualize-allocator"]
+
+[dependencies]
+je4os-common = { path = "../common" }

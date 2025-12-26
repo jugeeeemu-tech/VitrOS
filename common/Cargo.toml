@@ -1,0 +1,9 @@
+[package]
+name = "je4os-common"
+version.workspace = true
+edition.workspace = true
+
+[features]
+visualize-allocator = []
+
+[dependencies]

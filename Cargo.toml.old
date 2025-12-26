@@ -1,0 +1,18 @@
+[package]
+name = "je4OS"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+# メモリアロケータの可視化機能（開発者用）
+# 有効化: cargo build --release --features visualize-allocator
+visualize-allocator = []
+
+[dependencies]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true

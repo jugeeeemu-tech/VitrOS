@@ -3,5 +3,19 @@
 version = 4
 
 [[package]]
-name = "je4OS"
+name = "je4os-bootloader"
 version = "0.1.0"
+dependencies = [
+ "je4os-common",
+]
+
+[[package]]
+name = "je4os-common"
+version = "0.1.0"
+
+[[package]]
+name = "je4os-kernel"
+version = "0.1.0"
+dependencies = [
+ "je4os-common",
+]

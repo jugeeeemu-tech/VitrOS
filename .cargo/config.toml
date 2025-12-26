@@ -1,6 +1,12 @@
 [build]
-target = 'x86_64-unknown-uefi'
-rustflags = ["-Cforce-unwind-tables", "-Cforce-frame-pointers", "-Cno-redzone"]
+target = "x86_64-unknown-uefi"
 
-[target.'cfg(target_os = "uefi")']
-runner = "bash scripts/launch_qemu.sh"
+[target.x86_64-unknown-none]
+linker = "rust-lld"
+
+[target.x86_64-unknown-uefi]
+runner = "scripts/launch_qemu.sh"
+
+[unstable]
+build-std = ["core", "alloc", "compiler_builtins"]
+build-std-features = ["compiler-builtins-mem"]
