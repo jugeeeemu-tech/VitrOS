@@ -50,7 +50,15 @@ pub fn draw_rect(fb_base: u64, width: u32, x: usize, y: usize, w: usize, h: usiz
 }
 
 // 矩形の枠線を描画
-pub fn draw_rect_outline(fb_base: u64, width: u32, x: usize, y: usize, w: usize, h: usize, color: u32) {
+pub fn draw_rect_outline(
+    fb_base: u64,
+    width: u32,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    color: u32,
+) {
     let fb = fb_base as *mut u32;
 
     // 上下の辺

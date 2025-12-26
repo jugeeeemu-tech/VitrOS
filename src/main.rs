@@ -5,30 +5,21 @@ extern crate alloc;
 use core::arch::asm;
 use core::fmt::Write;
 
-mod uefi;
+mod allocator;
 mod graphics;
 mod io;
 mod serial;
-mod allocator;
+mod uefi;
 
 #[cfg(feature = "visualize")]
 mod visualization;
 
-use uefi::*;
 use graphics::FramebufferWriter;
+use uefi::*;
 
 fn hlt() {
     unsafe {
         asm!("hlt");
-    }
-}
-
-// 待機関数（簡易版）
-fn wait_cycles(cycles: usize) {
-    for _ in 0..cycles {
-        unsafe {
-            core::arch::asm!("nop", options(nomem, nostack));
-        }
     }
 }
 
@@ -156,28 +147,26 @@ extern "efiapi" fn efi_main(
         writer.set_position(10, 30);
         let max_display = 20;
 
-        println!("\nMemory Map (first {} entries):", max_display.min(entry_count));
+        println!(
+            "\nMemory Map (first {} entries):",
+            max_display.min(entry_count)
+        );
         for i in 0..entry_count.min(max_display) {
             let offset = i * descriptor_size;
 
             // SAFETY: バッファ内の有効なメモリディスクリプタを参照
-            let desc = unsafe {
-                &*(buffer.as_ptr().add(offset) as *const EfiMemoryDescriptor)
-            };
+            let desc = unsafe { &*(buffer.as_ptr().add(offset) as *const EfiMemoryDescriptor) };
 
             let type_str = memory_type_str(desc.r#type);
-            println!("  {:<12} 0x{:016X}  Pages: 0x{:X}",
-                type_str,
-                desc.physical_start,
-                desc.number_of_pages
+            println!(
+                "  {:<12} 0x{:016X}  Pages: 0x{:X}",
+                type_str, desc.physical_start, desc.number_of_pages
             );
 
             let _ = writeln!(
                 writer,
                 "{:<12} 0x{:016X}  Pages: 0x{:X}",
-                type_str,
-                desc.physical_start,
-                desc.number_of_pages
+                type_str, desc.physical_start, desc.number_of_pages
             );
         }
 
@@ -190,9 +179,7 @@ extern "efiapi" fn efi_main(
 
         for i in 0..entry_count {
             let offset = i * descriptor_size;
-            let desc = unsafe {
-                &*(buffer.as_ptr().add(offset) as *const EfiMemoryDescriptor)
-            };
+            let desc = unsafe { &*(buffer.as_ptr().add(offset) as *const EfiMemoryDescriptor) };
 
             // EFI_CONVENTIONAL_MEMORY（利用可能なメモリ）を探す
             if desc.r#type == EFI_CONVENTIONAL_MEMORY {
@@ -222,9 +209,7 @@ extern "efiapi" fn efi_main(
 
     // SAFETY: UEFI 関数呼び出し - ブートサービス終了
     info!("Exiting boot services...");
-    let status = unsafe {
-        ((*boot_services).exit_boot_services)(image_handle, map_key)
-    };
+    let status = unsafe { ((*boot_services).exit_boot_services)(image_handle, map_key) };
 
     writer.set_position(10, 280);
     if status == EFI_SUCCESS {
@@ -234,117 +219,8 @@ extern "efiapi" fn efi_main(
 
         #[cfg(feature = "visualize")]
         {
-            use visualization::*;
-
-            // スラブアロケータの可視化（複数サイズクラス表示）
-            let _ = writeln!(writer, "=== Memory Allocator Visualization ===");
-
-            // 初期状態を表示
-            draw_code_snippet(&mut writer, &[
-                "// Initial state",
-                "// No allocations yet",
-            ]);
-            draw_memory_grids_multi(&mut writer, "Initial State");
-        wait_cycles(150_000_000);
-
-        // テスト1: 16Bクラス
-        info!("\n=== Test 1: Vec<u8> (16B class) ===");
-
-        let vec1: alloc::vec::Vec<u8> = (0..12).collect();
-
-        draw_code_snippet(&mut writer, &[
-            "let vec1: Vec<u8>",
-            "  = (0..12).collect();",
-            "",
-            "// 12 x u8 = 12B",
-            "// -> 16B size class",
-        ]);
-        draw_memory_grids_multi(&mut writer, "After 16B alloc");
-        info!("Allocated Vec<u8> (12 elements = 12B -> 16B)");
-        wait_cycles(150_000_000);
-
-        // テスト2: 64Bクラス
-        info!("\n=== Test 2: Vec<u8> (64B class) ===");
-
-        let vec2: alloc::vec::Vec<u8> = (0..50).collect();
-
-        draw_code_snippet(&mut writer, &[
-            "let vec2: Vec<u8>",
-            "  = (0..50).collect();",
-            "",
-            "// 50 x u8 = 50B",
-            "// -> 64B size class",
-        ]);
-        draw_memory_grids_multi(&mut writer, "After 16B + 64B");
-        info!("Allocated Vec<u8> (50 elements = 50B -> 64B)");
-        wait_cycles(150_000_000);
-
-        // テスト3: 128Bクラス
-        info!("\n=== Test 3: Vec<u64> (128B class) ===");
-
-        let vec3: alloc::vec::Vec<u64> = (0..10).collect();
-
-        draw_code_snippet(&mut writer, &[
-            "let vec3: Vec<u64>",
-            "  = (0..10).collect();",
-            "",
-            "// 10 x u64 = 80B",
-            "// -> 128B size class",
-        ]);
-        draw_memory_grids_multi(&mut writer, "16B+64B+128B");
-        info!("Allocated Vec<u64> (10 elements = 80B -> 128B)");
-        wait_cycles(150_000_000);
-
-        // テスト4: 256Bクラスを追加
-        info!("\n=== Test 4: Vec<u64> (256B class) ===");
-
-        let vec4: alloc::vec::Vec<u64> = (0..25).collect();
-
-        draw_code_snippet(&mut writer, &[
-            "let vec4: Vec<u64>",
-            "  = (0..25).collect();",
-            "",
-            "// 25 x u64 = 200B",
-            "// -> 256B size class",
-        ]);
-        draw_memory_grids_multi(&mut writer, "All 4 sizes");
-        info!("Allocated Vec<u64> (25 elements = 200B -> 256B)");
-        wait_cycles(150_000_000);
-
-        // テスト5: 64Bと256Bを解放
-        info!("\n=== Test 5: Free 64B and 256B ===");
-
-        drop(vec2);
-        drop(vec4);
-
-        draw_code_snippet(&mut writer, &[
-            "drop(vec2);",
-            "drop(vec4);",
-            "",
-            "// Freed 64B and 256B",
-            "// 16B + 128B remain",
-        ]);
-        draw_memory_grids_multi(&mut writer, "After freeing 2");
-        info!("Freed 64B and 256B blocks");
-        wait_cycles(150_000_000);
-
-        // テスト6: 全て解放
-        info!("\n=== Test 6: Free all ===");
-
-        drop(vec1);
-        drop(vec3);
-
-        draw_code_snippet(&mut writer, &[
-            "drop(vec1);",
-            "drop(vec3);",
-            "",
-            "// All freed!",
-        ]);
-        draw_memory_grids_multi(&mut writer, "All freed");
-        info!("All blocks freed");
-        wait_cycles(150_000_000);
-        } // end of visualize cfg
-
+            visualization::run_visualization_tests(&mut writer);
+        }
     } else {
         error!("Failed to exit boot services! Status: 0x{:X}", status);
         writer.set_color(0xFF0000); // 赤色

@@ -98,18 +98,18 @@ pub struct EfiMemoryDescriptor {
 #[repr(C)]
 pub struct EfiBootServices {
     pub hdr: EfiTableHeader,
-    _pad1: [usize; 4],  // 1-4: RaiseTPL, RestoreTPL, AllocatePages, FreePages
+    _pad1: [usize; 4], // 1-4: RaiseTPL, RestoreTPL, AllocatePages, FreePages
     pub get_memory_map: extern "efiapi" fn(
-        *mut usize,                      // MemoryMapSize
-        *mut EfiMemoryDescriptor,        // MemoryMap
-        *mut usize,                      // MapKey
-        *mut usize,                      // DescriptorSize
-        *mut u32,                        // DescriptorVersion
+        *mut usize,               // MemoryMapSize
+        *mut EfiMemoryDescriptor, // MemoryMap
+        *mut usize,               // MapKey
+        *mut usize,               // DescriptorSize
+        *mut u32,                 // DescriptorVersion
     ) -> EfiStatus,
     _pad2: [usize; 21], // 6-26: その他の関数
     pub exit_boot_services: extern "efiapi" fn(
-        EfiHandle,  // ImageHandle
-        usize,      // MapKey
+        EfiHandle, // ImageHandle
+        usize,     // MapKey
     ) -> EfiStatus,
     _pad3: [usize; 10], // 28-37: その他の関数
     pub locate_protocol: extern "efiapi" fn(

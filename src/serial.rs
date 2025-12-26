@@ -1,6 +1,6 @@
 // シリアルポート（COM1）ドライバ
-use core::fmt;
 use crate::io::{port_read_u8, port_write_u8};
+use core::fmt;
 
 const COM1: u16 = 0x3F8;
 

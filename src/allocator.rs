@@ -1,7 +1,7 @@
 // スラブアロケータ実装（Linuxスタイル）
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
-use core::ptr::{null_mut, NonNull};
+use core::ptr::{NonNull, null_mut};
 
 use crate::info;
 
@@ -108,7 +108,8 @@ impl SlabAllocator {
     // ヒープを初期化
     pub unsafe fn init(&self, heap_start: usize, heap_size: usize) {
         info!("Initializing Slab Allocator...");
-        info!("Heap: 0x{:X} - 0x{:X} ({} MB)",
+        info!(
+            "Heap: 0x{:X} - 0x{:X} ({} MB)",
             heap_start,
             heap_start + heap_size,
             heap_size / 1024 / 1024
@@ -266,14 +267,15 @@ pub unsafe fn init_heap(heap_start: usize, heap_size: usize) {
 }
 
 // =============================================================================
-// 可視化機能専用のユーティリティ関数
+// 可視化機能専用の内部アクセス関数
+// visualization.rsからのみ呼ばれる想定
 // =============================================================================
 #[cfg(feature = "visualize")]
-pub fn get_allocator() -> &'static SlabAllocator {
+pub(crate) fn get_allocator_internal() -> &'static SlabAllocator {
     &ALLOCATOR
 }
 
 #[cfg(feature = "visualize")]
-pub fn get_size_classes() -> &'static [usize] {
+pub(crate) fn get_size_classes_internal() -> &'static [usize] {
     SIZE_CLASSES
 }
