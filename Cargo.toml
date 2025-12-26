@@ -9,3 +9,10 @@ edition = "2024"
 visualize-allocator = []
 
 [dependencies]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
