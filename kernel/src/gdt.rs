@@ -100,10 +100,13 @@ pub mod selector {
     /// カーネルコードセグメントセレクタ
     pub const KERNEL_CODE: u16 = 0x08;
     /// カーネルデータセグメントセレクタ
+    #[allow(dead_code)]
     pub const KERNEL_DATA: u16 = 0x10;
     /// ユーザーコードセグメントセレクタ（RPL=3を含む）
+    #[allow(dead_code)]
     pub const USER_CODE: u16 = 0x18 | 3;
     /// ユーザーデータセグメントセレクタ（RPL=3を含む）
+    #[allow(dead_code)]
     pub const USER_DATA: u16 = 0x20 | 3;
 }
 
