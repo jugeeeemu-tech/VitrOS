@@ -10,6 +10,11 @@ use je4os_common::serial;
 use je4os_common::uefi::*;
 use je4os_common::{error, info, println};
 
+// BOOT_INFOをカーネル直前の固定アドレスに配置
+// 0x90000 (576KB) - カーネル(0x100000=1MB)の手前で安全
+// この領域はConventional Memoryで、ExitBootServices後も有効
+const BOOT_INFO_ADDR: usize = 0x90000;
+
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     println!("\n!!! BOOTLOADER PANIC !!!");
@@ -134,8 +139,9 @@ extern "efiapi" fn efi_main(
         )
     };
 
-    static mut BOOT_INFO: BootInfo = BootInfo::new();
-    let boot_info = unsafe { &mut *core::ptr::addr_of_mut!(BOOT_INFO) };
+    // BOOT_INFOを固定アドレス（0xF000）に配置
+    let boot_info = unsafe { &mut *(BOOT_INFO_ADDR as *mut BootInfo) };
+    *boot_info = BootInfo::new();
 
     // フレームバッファ情報を設定
     boot_info.framebuffer = FramebufferInfo {
@@ -177,7 +183,7 @@ extern "efiapi" fn efi_main(
             );
         }
 
-        let _ = writeln!(writer, "");
+        let _ = writeln!(writer);
         let _ = writeln!(writer, "Total entries: {}", entry_count);
 
         // BootInfo にメモリマップをコピー
@@ -192,6 +198,12 @@ extern "efiapi" fn efi_main(
             };
         }
         boot_info.memory_map_count = entry_count.min(boot_info.memory_map.len());
+        info!("BOOT_INFO at 0x{:X}", BOOT_INFO_ADDR);
+        info!("BOOT_INFO.memory_map_count = {}", boot_info.memory_map_count);
+        info!(
+            "BOOT_INFO.memory_map[0]: start=0x{:X}, size=0x{:X}, type={}",
+            boot_info.memory_map[0].start, boot_info.memory_map[0].size, boot_info.memory_map[0].region_type
+        );
     }
 
     // カーネルをロード (ブートサービス終了前に実行)
@@ -206,16 +218,62 @@ extern "efiapi" fn efi_main(
     }
     info!("Kernel entry point: 0x{:X}", kernel_entry);
 
+    // カーネルロード後にメモリマップが変更されているので、再取得
+    info!("Updating memory map before ExitBootServices...");
+
+    // まず必要なサイズを取得
+    map_size = 0;
+    unsafe {
+        ((*boot_services).get_memory_map)(
+            &mut map_size,
+            core::ptr::null_mut(),
+            &mut map_key,
+            &mut descriptor_size,
+            &mut descriptor_version,
+        );
+    }
+
+    // 余裕を持たせる（メモリマップが増える可能性があるため）
+    map_size += descriptor_size * 2;
+
+    if map_size > buffer.len() {
+        error!("Memory map too large! Required: {}, Available: {}", map_size, buffer.len());
+        loop {
+            unsafe { core::arch::asm!("hlt") }
+        }
+    }
+
+    let status = unsafe {
+        ((*boot_services).get_memory_map)(
+            &mut map_size,
+            buffer.as_mut_ptr() as *mut EfiMemoryDescriptor,
+            &mut map_key,
+            &mut descriptor_size,
+            &mut descriptor_version,
+        )
+    };
+    if status != EFI_SUCCESS {
+        error!("Failed to get updated memory map! Status: 0x{:X}", status);
+        loop {
+            unsafe { core::arch::asm!("hlt") }
+        }
+    }
+
+    // ブートローダーの最終メッセージ（メモリマップの後に表示）
+    let _ = writeln!(writer);
+    let _ = writeln!(writer, "Exiting boot services...");
+
     // SAFETY: UEFI 関数呼び出し - ブートサービス終了
     info!("Exiting boot services...");
     let status = unsafe { ((*boot_services).exit_boot_services)(image_handle, map_key) };
 
-    writer.set_position(10, 280);
     if status == EFI_SUCCESS {
         info!("Boot services exited successfully!");
         let _ = writeln!(writer, "Boot Services Exited!");
-        let _ = writeln!(writer, "");
+        let _ = writeln!(writer);
         let _ = writeln!(writer, "Jumping to kernel...");
+        let _ = writeln!(writer);
+        let _ = writeln!(writer, "--- Kernel Output ---");
     } else {
         error!("Failed to exit boot services! Status: 0x{:X}", status);
         writer.set_color(0xFF0000);
@@ -227,10 +285,15 @@ extern "efiapi" fn efi_main(
 
     info!("Bootloader finished, jumping to kernel...");
 
-    // カーネルにジャンプ
-    type KernelEntry = extern "C" fn(&'static BootInfo) -> !;
+    // カーネルジャンプ直前にBOOT_INFOを再確認
+    let boot_info_check = unsafe { &*(BOOT_INFO_ADDR as *const BootInfo) };
+    info!("Pre-jump check: BOOT_INFO.memory_map_count = {}", boot_info_check.memory_map_count);
+    info!("Pre-jump check: BOOT_INFO.framebuffer.base = 0x{:X}", boot_info_check.framebuffer.base);
+
+    // カーネルにジャンプ (efiapi calling convention to match kernel entry point)
+    type KernelEntry = extern "efiapi" fn(&'static BootInfo) -> !;
     let kernel_fn: KernelEntry = unsafe { core::mem::transmute(kernel_entry as *const ()) };
-    kernel_fn(unsafe { &*core::ptr::addr_of!(BOOT_INFO) });
+    kernel_fn(boot_info_check);
 }
 
 /// ELFファイルからカーネルをロード

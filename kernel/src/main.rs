@@ -32,10 +32,24 @@ fn hlt() {
     }
 }
 
-/// カーネルエントリポイント
-/// ブートローダから呼ばれる
+/// カーネルエントリポイント（トランポリン）
+/// UEFIブートローダから呼ばれる - MS x64 ABI (RCX) から System V ABI (RDI) に変換
 #[unsafe(no_mangle)]
-extern "C" fn kernel_main(boot_info: &'static BootInfo) -> ! {
+#[unsafe(naked)]
+extern "efiapi" fn kernel_main() -> ! {
+    core::arch::naked_asm!(
+        // MS x64 ABI: 第1引数は RCX
+        // System V ABI: 第1引数は RDI
+        // RCX の値を RDI に移動
+        "mov rdi, rcx",
+        // 実際のカーネルメイン関数を呼び出し
+        "jmp {kernel_main_inner}",
+        kernel_main_inner = sym kernel_main_inner,
+    )
+}
+
+/// 実際のカーネルメイン関数 (System V ABI)
+extern "C" fn kernel_main_inner(boot_info: &'static BootInfo) -> ! {
     info!("=== Kernel Started ===");
 
     // フレームバッファライターを作成
@@ -45,7 +59,9 @@ extern "C" fn kernel_main(boot_info: &'static BootInfo) -> ! {
         boot_info.framebuffer.height,
         0xFFFFFFFF,
     );
-    writer.set_position(10, 300);
+
+    // ブートローダーの出力の後に配置（時系列順）
+    writer.set_position(10, 350);
 
     // boot_info の情報はFramebufferWriterで表示（こちらは安全）
     let _ = writeln!(
@@ -54,12 +70,18 @@ extern "C" fn kernel_main(boot_info: &'static BootInfo) -> ! {
         boot_info.framebuffer.base, boot_info.framebuffer.width, boot_info.framebuffer.height
     );
     let _ = writeln!(writer, "Memory regions: {}", boot_info.memory_map_count);
+    info!("Memory map count: {}", boot_info.memory_map_count);
+    info!("Memory map array len: {}", boot_info.memory_map.len());
 
     // 利用可能なメモリを探してアロケータを初期化
     let mut largest_start = 0;
     let mut largest_size = 0;
 
-    for i in 0..boot_info.memory_map_count {
+    // 配列の範囲内に制限
+    let safe_count = boot_info.memory_map_count.min(boot_info.memory_map.len());
+    info!("Using safe count: {}", safe_count);
+
+    for i in 0..safe_count {
         let region = &boot_info.memory_map[i];
         // region_type == 7 は EFI_CONVENTIONAL_MEMORY
         if region.region_type == uefi::EFI_CONVENTIONAL_MEMORY && region.size > largest_size as u64
@@ -106,7 +128,7 @@ extern "C" fn kernel_main(boot_info: &'static BootInfo) -> ! {
 
     #[cfg(not(feature = "visualize-allocator"))]
     {
-        let _ = writeln!(writer, "");
+        let _ = writeln!(writer);
         let _ = writeln!(writer, "Kernel running...");
         let _ = writeln!(writer, "System ready.");
     }

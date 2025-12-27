@@ -6,3 +6,6 @@ qemu-system-x86_64 \
     -m 2G \
     -bios /usr/share/ovmf/OVMF.fd \
     -drive format=raw,file=fat:rw:mnt
+
+メモリアロケータ可視化
+KERNEL_FEATURES=visualize-allocator cargo run
