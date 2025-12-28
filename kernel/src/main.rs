@@ -9,6 +9,7 @@ extern crate alloc;
 mod apic;
 mod gdt;
 mod idt;
+mod paging;
 mod pit;
 mod timer;
 
@@ -78,20 +79,51 @@ extern "efiapi" fn kernel_main() -> ! {
         // System V ABI: 第1引数は RDI
         // RCX の値を RDI に移動
         "mov rdi, rcx",
+
+        // カーネルスタックに切り替え（Rust関数を呼ぶ前に実行）
+        "lea rsp, [rip + {kernel_stack}]",
+        "add rsp, {stack_size}",
+
         // 実際のカーネルメイン関数を呼び出し
-        "jmp {kernel_main_inner}",
+        // この時点で既に新しいカーネルスタック上で動作している
+        "call {kernel_main_inner}",
+
+        // kernel_main_inner は戻ってこないが、念のため無限ループ
+        "2: jmp 2b",
+
+        kernel_stack = sym paging::KERNEL_STACK,
+        stack_size = const core::mem::size_of::<paging::KernelStack>(),
         kernel_main_inner = sym kernel_main_inner,
     )
 }
 
 /// 実際のカーネルメイン関数 (System V ABI)
-extern "C" fn kernel_main_inner(boot_info: &'static BootInfo) -> ! {
+/// この関数が呼ばれた時点で既にカーネルスタック上で動作している
+extern "C" fn kernel_main_inner(boot_info_ptr: &'static BootInfo) -> ! {
     info!("=== Kernel Started ===");
+    info!("Running on kernel stack");
+
+    // boot_infoを新しいスタックにコピー
+    // この時点ではまだ低位アドレス（0x90000）にアクセス可能
+    let boot_info = *boot_info_ptr;
 
     // GDTを初期化
     info!("Initializing GDT...");
     gdt::init();
     info!("GDT initialized");
+
+    // ブートローダーが既にページングを設定し、高位アドレスで起動している
+    info!("Running in higher-half (set up by bootloader)");
+
+    // カーネル用のページテーブルを作成（高位アドレスのみ、低位は自動的にアンマップ）
+    info!("Creating kernel page tables...");
+    paging::init();
+    info!("Kernel page tables created and loaded (low addresses now unmapped)");
+
+    // GDTを高位アドレスで再ロード（念のため）
+    info!("Reloading GDT...");
+    gdt::init();
+    info!("GDT reloaded");
 
     // IDTを初期化
     info!("Initializing IDT...");
@@ -107,12 +139,6 @@ extern "C" fn kernel_main_inner(boot_info: &'static BootInfo) -> ! {
     info!("Calibrating APIC Timer...");
     apic::calibrate_timer();
 
-    // 割り込みを有効化
-    unsafe {
-        asm!("sti");
-    }
-    info!("Interrupts enabled");
-
     // グローバルフレームバッファを初期化（表示はヒープ初期化後）
     init_global_framebuffer(
         boot_info.framebuffer.base,
@@ -121,13 +147,6 @@ extern "C" fn kernel_main_inner(boot_info: &'static BootInfo) -> ! {
         0xFFFFFFFF,
     );
 
-    // APIC Timerを初期化（100Hz）
-    info!("Initializing APIC Timer...");
-    const TIMER_FREQUENCY_HZ: u64 = 100;
-    apic::init_timer(TIMER_FREQUENCY_HZ as u32);
-
-    // タイマーシステムを初期化
-    timer::init(TIMER_FREQUENCY_HZ);
     info!("Memory map count: {}", boot_info.memory_map_count);
     info!("Memory map array len: {}", boot_info.memory_map.len());
 
@@ -164,6 +183,20 @@ extern "C" fn kernel_main_inner(boot_info: &'static BootInfo) -> ! {
         }
 
         info!("Heap initialized successfully");
+
+        // タイマーシステムを初期化（ヒープが必要）
+        const TIMER_FREQUENCY_HZ: u64 = 100;
+        timer::init(TIMER_FREQUENCY_HZ);
+
+        // APIC Timerを初期化（100Hz）
+        info!("Initializing APIC Timer...");
+        apic::init_timer(TIMER_FREQUENCY_HZ as u32);
+
+        // すべての初期化が完了したので、割り込みを有効化
+        unsafe {
+            asm!("sti");
+        }
+        info!("Interrupts enabled");
 
         // ヒープ初期化後、フレームバッファに情報を表示
         // ブートローダーの出力の後に配置（時系列順）

@@ -22,6 +22,7 @@ pub struct MemoryRegion {
 pub const MAX_MEMORY_REGIONS: usize = 128;
 
 #[repr(C)]
+#[derive(Copy, Clone)]
 pub struct BootInfo {
     pub framebuffer: FramebufferInfo,
     pub memory_map: [MemoryRegion; MAX_MEMORY_REGIONS],

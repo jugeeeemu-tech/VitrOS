@@ -5,8 +5,10 @@ target = "x86_64-unknown-uefi"
 linker = "rust-lld"
 rustflags = [
     "-C", "link-arg=-Tkernel/linker.ld",
+    "-C", "link-arg=-znorelro",
+    "-C", "link-arg=--no-pie",
     "-C", "relocation-model=static",
-    "-C", "code-model=kernel",
+    "-C", "code-model=large",
 ]
 
 [target.x86_64-unknown-uefi]

@@ -36,4 +36,5 @@ qemu-system-x86_64 \
     -device isa-debug-exit,iobase=0xf4,iosize=0x01 \
     -chardev stdio,id=char_com1,mux=on,logfile=serial.log \
     -serial chardev:char_com1 \
-    -mon chardev=char_com1
+    -mon chardev=char_com1 \
+    # -s -S

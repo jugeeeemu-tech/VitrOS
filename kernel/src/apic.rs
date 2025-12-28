@@ -7,9 +7,11 @@ use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::pit;
+use crate::paging::KERNEL_VIRTUAL_BASE;
 
-/// Local APICのベースアドレス（デフォルト）
-const APIC_BASE: u64 = 0xFEE00000;
+/// Local APICのベースアドレス（高位仮想アドレス）
+/// 物理アドレス 0xFEE00000 を高位仮想アドレス経由でアクセス
+const APIC_BASE: u64 = KERNEL_VIRTUAL_BASE + 0xFEE00000;
 
 /// Local APICレジスタのオフセット
 mod registers {

@@ -9,6 +9,16 @@ use spin::Mutex;
 use crate::apic;
 use crate::gdt;
 use crate::timer;
+use crate::paging::KERNEL_VIRTUAL_BASE;
+
+/// 現在高位アドレス空間で実行されているかチェック
+fn is_higher_half() -> bool {
+    let rip: u64;
+    unsafe {
+        asm!("lea {}, [rip]", out(reg) rip, options(nomem, nostack));
+    }
+    rip >= KERNEL_VIRTUAL_BASE
+}
 
 /// IDTエントリ（割り込みゲートディスクリプタ）
 #[repr(C, packed)]
@@ -145,6 +155,8 @@ extern "C" fn timer_handler_inner() {
 /// IDTエントリを設定
 fn set_idt_entry(vector: u8, handler: usize) {
     let mut idt = IDT.lock();
+
+    // カーネルが高位アドレスでリンクされているため、ハンドラアドレスは既に高位
     idt.entries[vector as usize] = IdtEntry::new(
         handler,
         gdt::selector::KERNEL_CODE,
@@ -158,13 +170,13 @@ pub fn init() {
     set_idt_entry(apic::TIMER_INTERRUPT_VECTOR, timer_interrupt_handler as usize);
 
     unsafe {
-        // IDTのアドレスを取得（Mutexの中身へのポインタ）
+        // IDTのアドレスを取得（カーネルが高位アドレスでリンクされているため既に高位）
         let idt = IDT.lock();
-        let idt_ptr = &*idt as *const Idt;
+        let idt_addr = &*idt as *const Idt as u64;
 
         let idtr = Idtr {
             limit: (core::mem::size_of::<Idt>() - 1) as u16,
-            base: idt_ptr as u64,
+            base: idt_addr,
         };
 
         // LIDT命令でIDTをロード

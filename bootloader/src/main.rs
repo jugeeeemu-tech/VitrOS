@@ -45,6 +45,81 @@ fn memory_type_str(mem_type: u32) -> &'static str {
     }
 }
 
+// ページテーブルエントリのフラグ
+const PAGE_PRESENT: u64 = 1 << 0;
+const PAGE_WRITABLE: u64 = 1 << 1;
+const PAGE_HUGE: u64 = 1 << 7;
+
+// カーネル仮想アドレスベース
+const KERNEL_VMA: u64 = 0xFFFF800000000000;
+
+// ページテーブル構造体（4KBアラインメント）
+#[repr(C, align(4096))]
+struct PageTable {
+    entries: [u64; 512],
+}
+
+impl PageTable {
+    const fn new() -> Self {
+        Self { entries: [0; 512] }
+    }
+}
+
+// グローバルページテーブル（静的に確保）
+static mut BOOT_PML4: PageTable = PageTable::new();
+static mut BOOT_PDP_LOW: PageTable = PageTable::new();
+static mut BOOT_PDP_HIGH: PageTable = PageTable::new();
+static mut BOOT_PD_LOW: [PageTable; 4] = [PageTable::new(), PageTable::new(), PageTable::new(), PageTable::new()];
+static mut BOOT_PD_HIGH: [PageTable; 4] = [PageTable::new(), PageTable::new(), PageTable::new(), PageTable::new()];
+
+/// ブートローダー用の初期ページテーブルをセットアップ
+unsafe fn setup_initial_page_tables() -> u64 {
+    let flags = PAGE_PRESENT | PAGE_WRITABLE;
+    let huge_flags = flags | PAGE_HUGE;
+
+    unsafe {
+        // PML4[0] -> PDP_LOW (低位アドレス: 0x0-0x7FFFFFFFFF)
+        BOOT_PML4.entries[0] = &raw const BOOT_PDP_LOW as u64 | flags;
+
+        // PML4[256] -> PDP_HIGH (高位アドレス: 0xFFFF800000000000-)
+        BOOT_PML4.entries[256] = &raw const BOOT_PDP_HIGH as u64 | flags;
+
+        // 低位: 最初の4GBをアイデンティティマッピング
+        for i in 0..4 {
+            BOOT_PDP_LOW.entries[i] = &raw const BOOT_PD_LOW[i] as u64 | flags;
+
+            for j in 0..512 {
+                let phys_addr = ((i * 512 + j) * 2 * 1024 * 1024) as u64;
+                BOOT_PD_LOW[i].entries[j] = phys_addr | huge_flags;
+            }
+        }
+
+        // 高位: 最初の4GBを0xFFFF800000000000+にマッピング
+        for i in 0..4 {
+            BOOT_PDP_HIGH.entries[i] = &raw const BOOT_PD_HIGH[i] as u64 | flags;
+
+            for j in 0..512 {
+                let phys_addr = ((i * 512 + j) * 2 * 1024 * 1024) as u64;
+                BOOT_PD_HIGH[i].entries[j] = phys_addr | huge_flags;
+            }
+        }
+
+        // PML4のアドレスを返す
+        &raw const BOOT_PML4 as u64
+    }
+}
+
+/// CR3にページテーブルをロードしてページングを有効化（既に有効なのでCR3のみ更新）
+unsafe fn load_page_tables(pml4_addr: u64) {
+    unsafe {
+        core::arch::asm!(
+            "mov cr3, {0}",
+            in(reg) pml4_addr,
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
 /// UEFI エントリポイント
 #[unsafe(no_mangle)]
 extern "efiapi" fn efi_main(
@@ -283,16 +358,28 @@ extern "efiapi" fn efi_main(
         }
     }
 
-    info!("Bootloader finished, jumping to kernel...");
+    info!("Bootloader finished, setting up page tables...");
+
+    // ページテーブルをセットアップ
+    let pml4_addr = unsafe { setup_initial_page_tables() };
+    info!("Page tables created at 0x{:X}", pml4_addr);
+
+    // CR3にページテーブルをロード
+    unsafe { load_page_tables(pml4_addr) };
+    info!("Page tables loaded, both low and high addresses are now mapped");
 
     // カーネルジャンプ直前にBOOT_INFOを再確認
     let boot_info_check = unsafe { &*(BOOT_INFO_ADDR as *const BootInfo) };
     info!("Pre-jump check: BOOT_INFO.memory_map_count = {}", boot_info_check.memory_map_count);
     info!("Pre-jump check: BOOT_INFO.framebuffer.base = 0x{:X}", boot_info_check.framebuffer.base);
 
+    // カーネルの高位仮想アドレスを計算（kernel_entryは物理アドレス）
+    let kernel_high_addr = kernel_entry + KERNEL_VMA;
+    info!("Jumping to kernel at high address: 0x{:X}", kernel_high_addr);
+
     // カーネルにジャンプ (efiapi calling convention to match kernel entry point)
     type KernelEntry = extern "efiapi" fn(&'static BootInfo) -> !;
-    let kernel_fn: KernelEntry = unsafe { core::mem::transmute(kernel_entry as *const ()) };
+    let kernel_fn: KernelEntry = unsafe { core::mem::transmute(kernel_high_addr as *const ()) };
     kernel_fn(boot_info_check);
 }
 
@@ -368,11 +455,19 @@ fn load_kernel_elf(_image_handle: EfiHandle, boot_services: *mut EfiBootServices
     }
 
     // プログラムヘッダーを処理してLOADセグメントをメモリにコピー
+    // 最初のLOADセグメントから仮想/物理アドレスのオフセットを計算
+    let mut kernel_virt_offset: Option<u64> = None;
+
     for i in 0..elf_header.e_phnum {
         let ph_offset = elf_header.e_phoff as usize + (i as usize * core::mem::size_of::<Elf64ProgramHeader>());
         let ph = unsafe { &*(file_buffer.as_ptr().add(ph_offset) as *const Elf64ProgramHeader) };
 
         if ph.p_type == PT_LOAD {
+            // 最初のLOADセグメントから仮想/物理アドレスのオフセットを記録
+            if kernel_virt_offset.is_none() && ph.p_vaddr != ph.p_paddr {
+                kernel_virt_offset = Some(ph.p_vaddr - ph.p_paddr);
+            }
+
             // ファイルからメモリにコピー
             unsafe {
                 let src = file_buffer.as_ptr().add(ph.p_offset as usize);
@@ -391,7 +486,15 @@ fn load_kernel_elf(_image_handle: EfiHandle, boot_services: *mut EfiBootServices
         }
     }
 
-    elf_header.e_entry
+    // エントリポイントを物理アドレスに変換
+    // カーネルが高位アドレスでリンクされている場合、仮想アドレスを物理アドレスに変換
+    let physical_entry = if let Some(offset) = kernel_virt_offset {
+        elf_header.e_entry - offset
+    } else {
+        elf_header.e_entry
+    };
+
+    physical_entry
 }
 
 /// 文字列をUTF-16に変換

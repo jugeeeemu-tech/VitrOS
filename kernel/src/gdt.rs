@@ -4,6 +4,16 @@
 //! 特権レベル（Ring 0/3）の管理のためにGDTは必須です。
 
 use core::arch::asm;
+use crate::paging::KERNEL_VIRTUAL_BASE;
+
+/// 現在高位アドレス空間で実行されているかチェック
+fn is_higher_half() -> bool {
+    let rip: u64;
+    unsafe {
+        asm!("lea {}, [rip]", out(reg) rip, options(nomem, nostack));
+    }
+    rip >= KERNEL_VIRTUAL_BASE
+}
 
 /// GDTエントリ（64ビット）
 #[repr(C, packed)]
@@ -113,9 +123,12 @@ pub mod selector {
 /// GDTを初期化してロード
 pub fn init() {
     unsafe {
+        // GDTのアドレスを取得（カーネルが高位アドレスでリンクされているため既に高位）
+        let gdt_addr = &raw const GDT as u64;
+
         let gdtr = Gdtr {
             limit: (core::mem::size_of::<Gdt>() - 1) as u16,
-            base: &raw const GDT as u64,
+            base: gdt_addr,
         };
 
         // LGDT命令でGDTをロード
