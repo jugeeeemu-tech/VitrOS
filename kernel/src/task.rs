@@ -2,8 +2,8 @@
 //!
 //! このモジュールはタスクの作成、管理、スケジューリングを担当します。
 
-use alloc::collections::BTreeMap;
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
@@ -28,7 +28,9 @@ pub enum TaskError {
 impl core::fmt::Display for TaskError {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
         match self {
-            TaskError::InvalidPriority => write!(f, "Invalid task priority (must be >= {})", priority::MIN),
+            TaskError::InvalidPriority => {
+                write!(f, "Invalid task priority (must be >= {})", priority::MIN)
+            }
             TaskError::StackAllocationFailed => write!(f, "Failed to allocate task stack"),
             TaskError::InvalidStackAddress => write!(f, "Invalid stack address"),
             TaskError::ContextInitFailed => write!(f, "Failed to initialize task context"),
@@ -97,11 +99,7 @@ fn pow_f32(base: f32, exp: i32) -> f32 {
     }
 
     // 負の指数の場合は逆数を返す
-    if exp < 0 {
-        1.0 / result
-    } else {
-        result
-    }
+    if exp < 0 { 1.0 / result } else { result }
 }
 
 /// 優先度から重みを計算
@@ -116,17 +114,20 @@ fn pow_f32(base: f32, exp: i32) -> f32 {
 /// # Returns
 /// スケジューリング用の重み
 fn priority_to_weight(priority: u8) -> u32 {
-    const BASE_WEIGHT: u32 = 1024;
-    const MULTIPLIER: f32 = 1.25;
+    const PRIO_TO_WEIGHT: [u32; 40] = [
+        88761, 71755, 56483, 46273, 36291, 29154, 23254, 18705, 14949, 11916, 9548, 7620, 6100,
+        4904, 3906, 3121, 2501, 1991, 1586, 1277, 1024, 820, 655, 526, 423, 335, 272, 215, 172,
+        137, 110, 87, 70, 56, 45, 36, 29, 23, 18, 15,
+    ];
 
-    // priority - DEFAULT の差を計算
-    let diff = priority as i32 - priority::DEFAULT as i32;
+    // 0-255 の優先度を 0-39 のインデックスに変換
+    // priority 0 (低) -> index 39 (重み15)
+    // priority 255 (高) -> index 0 (重み88761)
 
-    // weight = 1024 * 1.25^diff
-    let weight = (BASE_WEIGHT as f32 * pow_f32(MULTIPLIER, diff)) as u32;
+    // 単純に範囲を圧縮する
+    let index = 39 - (priority as usize * 40 / 256).min(39);
 
-    // 最小値は1（ゼロ除算を防ぐ）
-    weight.max(1)
+    PRIO_TO_WEIGHT[index]
 }
 
 /// タスクの状態
@@ -325,7 +326,11 @@ impl Task {
     /// * `TaskError::InvalidPriority` - 優先度がpriority::MINより小さい場合
     /// * `TaskError::StackAllocationFailed` - スタック割り当てに失敗した場合
     /// * `TaskError::ContextInitFailed` - コンテキスト初期化に失敗した場合
-    pub fn new(name: &'static str, priority: u8, entry_point: extern "C" fn() -> !) -> Result<Self, TaskError> {
+    pub fn new(
+        name: &'static str,
+        priority: u8,
+        entry_point: extern "C" fn() -> !,
+    ) -> Result<Self, TaskError> {
         // 優先度の検証：アイドルタスク以下の優先度は許可しない
         if priority < priority::MIN {
             return Err(TaskError::InvalidPriority);
@@ -361,7 +366,10 @@ impl Task {
     /// # Errors
     /// * `TaskError::StackAllocationFailed` - スタック割り当てに失敗した場合
     /// * `TaskError::ContextInitFailed` - コンテキスト初期化に失敗した場合
-    pub fn new_idle(name: &'static str, entry_point: extern "C" fn() -> !) -> Result<Self, TaskError> {
+    pub fn new_idle(
+        name: &'static str,
+        entry_point: extern "C" fn() -> !,
+    ) -> Result<Self, TaskError> {
         // スタックをヒープに割り当て
         let stack = Box::new(TaskStack::new());
         let stack_top = stack.top();
@@ -467,7 +475,7 @@ lazy_static! {
 
 /// タスク管理システムの初期化
 pub fn init() {
-    je4os_common::info!("Task system initialized");
+    vitros_common::info!("Task system initialized");
 }
 
 /// 新しいタスクをタスクキューに追加（エラーハンドリング版）
@@ -489,7 +497,7 @@ pub fn try_add_task(task: Task) -> Result<(), TaskError> {
     let boxed_task = Box::new(task);
     tree.insert((vruntime, task_id), boxed_task);
 
-    je4os_common::info!("Task added to queue: ID={}, name={}", task_id, name);
+    vitros_common::info!("Task added to queue: ID={}, name={}", task_id, name);
     Ok(())
 }
 
@@ -607,7 +615,7 @@ pub fn schedule() {
         old_ctx_ptr
     } else {
         // 現在のタスクがない場合（初回起動時）はstaticなダミーコンテキストを使用
-        unsafe { &raw mut DUMMY_CONTEXT as *mut Context }
+        &raw mut DUMMY_CONTEXT as *mut Context
     };
 
     // 新しいタスクを現在のタスクに設定
@@ -649,34 +657,25 @@ pub unsafe extern "C" fn switch_context(old_context: *mut Context, new_context: 
         "push r13",
         "push r14",
         "push r15",
-
         // RFLAGSを保存
         "pushfq",
-
         // fxsave用の領域を確保（512バイト、16バイトアライメント）
         "sub rsp, 512",
-        "and rsp, ~0xF",               // 16バイトアライメント
-
+        "and rsp, ~0xF", // 16バイトアライメント
         // FPU/SSE状態を保存
         "fxsave [rsp]",
-
         // 現在のrspをold_contextに保存
         // old_context->rsp = rsp
-        "mov [rdi], rsp",              // offset 0: rsp
-
+        "mov [rdi], rsp", // offset 0: rsp
         // ========== 新しいコンテキストを復元 ==========
         // new_context->rspを読み込み
-        "mov rsp, [rsi]",              // offset 0: rsp
-
+        "mov rsp, [rsi]", // offset 0: rsp
         // FPU/SSE状態を復元
         "fxrstor [rsp]",
-
         // fxsave領域をスキップ
         "add rsp, 512",
-
         // RFLAGSを復元
         "popfq",
-
         // callee-savedレジスタを復元（保存と逆順）
         "pop r15",
         "pop r14",
@@ -684,7 +683,6 @@ pub unsafe extern "C" fn switch_context(old_context: *mut Context, new_context: 
         "pop r12",
         "pop rbx",
         "pop rbp",
-
         // リターン（スタックトップの戻りアドレスに戻る）
         "ret",
     )

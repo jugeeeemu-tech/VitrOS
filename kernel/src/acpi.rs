@@ -4,14 +4,14 @@
 //! UEFI ブートローダーから RSDP アドレスを受け取り、XSDT/RSDT を解析します。
 
 use crate::paging::{KERNEL_VIRTUAL_BASE, phys_to_virt};
-use je4os_common::boot_info::BootInfo;
-use je4os_common::info;
+use vitros_common::boot_info::BootInfo;
+use vitros_common::info;
 
 /// RSDP (Root System Description Pointer) - ACPI 1.0
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
 struct Rsdp {
-    signature: [u8; 8],  // "RSD PTR "
+    signature: [u8; 8], // "RSD PTR "
     checksum: u8,
     oem_id: [u8; 6],
     revision: u8,
@@ -37,15 +37,15 @@ struct RsdpExtended {
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
 struct AcpiTableHeader {
-    signature: [u8; 4],      // テーブル識別子 (例: "APIC", "FACP")
-    length: u32,             // テーブル全体の長さ
-    revision: u8,            // テーブルリビジョン
-    checksum: u8,            // チェックサム
-    oem_id: [u8; 6],         // OEM ID
-    oem_table_id: [u8; 8],   // OEM テーブル ID
-    oem_revision: u32,       // OEM リビジョン
-    creator_id: u32,         // クリエータ ID
-    creator_revision: u32,   // クリエータリビジョン
+    signature: [u8; 4],    // テーブル識別子 (例: "APIC", "FACP")
+    length: u32,           // テーブル全体の長さ
+    revision: u8,          // テーブルリビジョン
+    checksum: u8,          // チェックサム
+    oem_id: [u8; 6],       // OEM ID
+    oem_table_id: [u8; 8], // OEM テーブル ID
+    oem_revision: u32,     // OEM リビジョン
+    creator_id: u32,       // クリエータ ID
+    creator_revision: u32, // クリエータリビジョン
 }
 
 impl AcpiTableHeader {
@@ -57,12 +57,8 @@ impl AcpiTableHeader {
     /// チェックサムを検証
     fn verify_checksum(&self) -> bool {
         let length = self.length;
-        let bytes = unsafe {
-            core::slice::from_raw_parts(
-                self as *const _ as *const u8,
-                length as usize
-            )
-        };
+        let bytes =
+            unsafe { core::slice::from_raw_parts(self as *const _ as *const u8, length as usize) };
 
         let sum: u8 = bytes.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
         sum == 0
@@ -97,7 +93,7 @@ struct MadtProcessorLocalApic {
     header: MadtEntryHeader,
     acpi_processor_id: u8,
     apic_id: u8,
-    flags: u32,  // bit 0: Processor Enabled
+    flags: u32, // bit 0: Processor Enabled
 }
 
 /// MADT エントリ: I/O APIC
@@ -150,10 +146,7 @@ impl Rsdp {
     /// チェックサムを検証
     fn verify_checksum(&self) -> bool {
         let bytes = unsafe {
-            core::slice::from_raw_parts(
-                self as *const _ as *const u8,
-                core::mem::size_of::<Rsdp>()
-            )
+            core::slice::from_raw_parts(self as *const _ as *const u8, core::mem::size_of::<Rsdp>())
         };
 
         let sum: u8 = bytes.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
@@ -179,11 +172,10 @@ pub fn init(boot_info: &BootInfo) {
     }
 
     // RSDP の物理アドレスを高位仮想アドレスに変換
-    let rsdp_virt_addr = phys_to_virt(boot_info.rsdp_address)
-        .unwrap_or_else(|_| {
-            info!("Failed to convert RSDP address, falling back to direct addition");
-            KERNEL_VIRTUAL_BASE + boot_info.rsdp_address
-        });
+    let rsdp_virt_addr = phys_to_virt(boot_info.rsdp_address).unwrap_or_else(|_| {
+        info!("Failed to convert RSDP address, falling back to direct addition");
+        KERNEL_VIRTUAL_BASE + boot_info.rsdp_address
+    });
     let rsdp = unsafe { &*(rsdp_virt_addr as *const Rsdp) };
 
     if !rsdp.is_valid_signature() {
@@ -412,7 +404,10 @@ fn parse_madt(madt_phys_addr: u64) {
         current_addr += entry_length as u64;
     }
 
-    info!("MADT Summary: {} CPU(s), {} I/O APIC(s)", cpu_count, io_apic_count);
+    info!(
+        "MADT Summary: {} CPU(s), {} I/O APIC(s)",
+        cpu_count, io_apic_count
+    );
 }
 
 /// MCFG (Memory Mapped Configuration) を解析

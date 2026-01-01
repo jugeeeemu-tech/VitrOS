@@ -3,9 +3,9 @@
 //! x86_64アーキテクチャでは、セグメンテーションはほぼ使用されませんが、
 //! 特権レベル（Ring 0/3）の管理とTSS（Interrupt Stack Table用）のためにGDTは必須です。
 
-use core::arch::asm;
 use crate::paging::KERNEL_VIRTUAL_BASE;
-use je4os_common::info;
+use core::arch::asm;
+use vitros_common::info;
 
 /// GDT操作のエラー型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -194,12 +194,12 @@ impl TssDescriptor {
 /// x86_64では、NULL + Code/Data×2 + TSS（16バイト）の構成
 #[repr(C, align(16))]
 struct Gdt {
-    null: GdtEntry,              // 0x00: NULL
-    kernel_code: GdtEntry,       // 0x08: カーネルコード (Ring 0)
-    kernel_data: GdtEntry,       // 0x10: カーネルデータ (Ring 0)
-    user_code: GdtEntry,         // 0x18: ユーザーコード (Ring 3)
-    user_data: GdtEntry,         // 0x20: ユーザーデータ (Ring 3)
-    tss: TssDescriptor,          // 0x28: TSS（16バイト）
+    null: GdtEntry,        // 0x00: NULL
+    kernel_code: GdtEntry, // 0x08: カーネルコード (Ring 0)
+    kernel_data: GdtEntry, // 0x10: カーネルデータ (Ring 0)
+    user_code: GdtEntry,   // 0x18: ユーザーコード (Ring 3)
+    user_data: GdtEntry,   // 0x20: ユーザーデータ (Ring 3)
+    tss: TssDescriptor,    // 0x28: TSS（16バイト）
 }
 
 impl Gdt {
@@ -272,14 +272,17 @@ pub fn init() -> Result<(), GdtError> {
         TSS.ist1 = double_fault_stack_top;
 
         info!("TSS initialized:");
-        info!("  IST1 (Double Fault stack): 0x{:016X}", double_fault_stack_top);
+        info!(
+            "  IST1 (Double Fault stack): 0x{:016X}",
+            double_fault_stack_top
+        );
 
         // GDTにTSSディスクリプタを設定
         let tss_addr = &raw const TSS as u64;
         let gdt_ptr = core::ptr::addr_of_mut!(GDT);
         core::ptr::write(
             core::ptr::addr_of_mut!((*gdt_ptr).tss),
-            TssDescriptor::new(tss_addr)
+            TssDescriptor::new(tss_addr),
         );
 
         info!("TSS descriptor set in GDT at 0x{:016X}", tss_addr);

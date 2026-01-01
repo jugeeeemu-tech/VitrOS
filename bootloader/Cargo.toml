@@ -1,7 +1,7 @@
 [package]
-name = "je4os-bootloader"
+name = "vitros-bootloader"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-je4os-common = { path = "../common" }
+vitros-common = { path = "../common" }

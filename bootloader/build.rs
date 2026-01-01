@@ -5,7 +5,9 @@ use std::path::Path;
 fn main() {
     // visualize-allocatorフィーチャーが有効な場合、マーカーファイルを作成
     let out_dir = env::var("OUT_DIR").unwrap();
-    let marker_path = Path::new(&out_dir).join("../../..").join("VISUALIZE_ENABLED");
+    let marker_path = Path::new(&out_dir)
+        .join("../../..")
+        .join("VISUALIZE_ENABLED");
 
     #[cfg(feature = "visualize-allocator")]
     {

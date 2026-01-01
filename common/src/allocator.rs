@@ -76,7 +76,7 @@ pub struct SlabAllocator {
     caches: [SlabCache; NUM_SIZE_CLASSES],
     // TODO: 大きなサイズ用のバンプアロケータ（解放不可）
     // 将来的にはバディアロケータまたはリンクリストアロケータに置き換える
-    // Issue: https://github.com/jugeeeemu-tech/je4OS/issues/1
+    // Issue: https://github.com/jugeeeemu-tech/vitrOS/issues/1
     #[cfg(feature = "visualize-allocator")]
     large_alloc_start: UnsafeCell<usize>,
     large_alloc_next: UnsafeCell<usize>,

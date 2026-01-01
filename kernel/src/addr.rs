@@ -2,7 +2,7 @@
 //!
 //! メモリアドレスに関する共通的な操作を提供します。
 
-use crate::paging::{phys_to_virt, virt_to_phys, PagingError};
+use crate::paging::{PagingError, phys_to_virt, virt_to_phys};
 
 /// アドレス操作のエラー型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

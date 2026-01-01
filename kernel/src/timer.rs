@@ -4,8 +4,8 @@
 //! 割り込みハンドラでは期限切れタイマーの検出のみを行い、
 //! 実際のコールバック実行はメインループで行うことで割り込み無効時間を最小化します。
 
-use alloc::collections::{BinaryHeap, VecDeque};
 use alloc::boxed::Box;
+use alloc::collections::{BinaryHeap, VecDeque};
 use core::cmp::Ordering;
 use core::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use lazy_static::lazy_static;

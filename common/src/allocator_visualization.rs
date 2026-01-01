@@ -9,6 +9,7 @@ use crate::allocator::{self, SlabAllocator};
 use crate::graphics::{FramebufferWriter, draw_rect, draw_string};
 use crate::info;
 use alloc::format;
+use core::arch::asm;
 use core::fmt::Write;
 
 // =============================================================================
@@ -251,7 +252,7 @@ pub fn run_visualization_tests(writer: &mut FramebufferWriter) {
     // テスト4: 256Bクラスを追加
     info!("\n=== Test 4: Vec<u64> (256B class) ===");
 
-    let vec4: alloc::vec::Vec<u64> = (0..25).collect();
+    let vec4: alloc::vec::Vec<u8> = (0..25).collect();
 
     draw_code_snippet(
         writer,
@@ -263,12 +264,31 @@ pub fn run_visualization_tests(writer: &mut FramebufferWriter) {
             "// -> 256B size class",
         ],
     );
-    draw_memory_grids_multi(writer, "All 4 sizes");
-    info!("Allocated Vec<u64> (25 elements = 200B -> 256B)");
+    draw_memory_grids_multi(writer, "8B+16B+64B+128B");
+    info!("Allocated Vec<u8> (25 elements = 200B -> 256B)");
     wait_cycles(150_000_000);
 
-    // テスト5: 64Bと256Bを解放
-    info!("\n=== Test 5: Free 64B and 256B ===");
+    // テスト5: 8Bクラスを追加
+    info!("\n=== Test 5: Vec<u8> (8B class) ===");
+
+    let vec5: alloc::vec::Vec<u8> = (0..8).collect();
+
+    draw_code_snippet(
+        writer,
+        &[
+            "let vec5: Vec<u8>",
+            "  = (0..8).collect();",
+            "",
+            "// 8 x u8 = 8B",
+            "// -> 8B size class",
+        ],
+    );
+    draw_memory_grids_multi(writer, "All 5 sizes");
+    info!("Allocated Vec<u64> (8 elements = 8B -> 8B)");
+    wait_cycles(150_000_000);
+
+    // テスト6: 64Bと256Bを解放
+    info!("\n=== Test 6: Free 64B and 256B ===");
 
     drop(vec2);
     drop(vec4);
@@ -280,21 +300,36 @@ pub fn run_visualization_tests(writer: &mut FramebufferWriter) {
             "drop(vec4);",
             "",
             "// Freed 64B and 256B",
-            "// 16B + 128B remain",
+            "// 8B + 16B + 128B remain",
         ],
     );
     draw_memory_grids_multi(writer, "After freeing 2");
     info!("Freed 64B and 256B blocks");
     wait_cycles(150_000_000);
 
-    // テスト6: 全て解放
-    info!("\n=== Test 6: Free all ===");
+    // テスト7: 全て解放
+    info!("\n=== Test 7: Free all ===");
 
     drop(vec1);
     drop(vec3);
+    drop(vec5);
 
-    draw_code_snippet(writer, &["drop(vec1);", "drop(vec3);", "", "// All freed!"]);
+    draw_code_snippet(
+        writer,
+        &[
+            "drop(vec1);",
+            "drop(vec3);",
+            "drop(vec5);",
+            "",
+            "// All freed!",
+        ],
+    );
     draw_memory_grids_multi(writer, "All freed");
     info!("All blocks freed");
     wait_cycles(150_000_000);
+    loop {
+        unsafe {
+            asm!("hlt");
+        }
+    }
 }

@@ -128,7 +128,15 @@ impl FramebufferWriter {
     pub fn clear_area(&mut self, width_chars: usize, bg_color: u32) {
         let width_pixels = width_chars * 8;
         let height_pixels = 10; // 1行分の高さ
-        draw_rect(self.fb_base, self.width, self.x, self.y, width_pixels, height_pixels, bg_color);
+        draw_rect(
+            self.fb_base,
+            self.width,
+            self.x,
+            self.y,
+            width_pixels,
+            height_pixels,
+            bg_color,
+        );
     }
 
     // 改行処理

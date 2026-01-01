@@ -139,8 +139,8 @@ pub struct EfiBootServices {
     ) -> EfiStatus,
     _pad3: [usize; 8], // 28-35: その他の関数
     pub handle_protocol: extern "efiapi" fn(
-        EfiHandle,               // Handle
-        *const EfiGuid,          // Protocol
+        EfiHandle,                   // Handle
+        *const EfiGuid,              // Protocol
         *mut *mut core::ffi::c_void, // Interface
     ) -> EfiStatus,
     _pad4: [usize; 1], // 37: その他の関数
@@ -209,18 +209,18 @@ pub const EFI_FILE_MODE_READ: u64 = 0x0000000000000001;
 pub struct EfiFileProtocol {
     pub revision: u64,
     pub open: extern "efiapi" fn(
-        *mut EfiFileProtocol,              // This
-        *mut *mut EfiFileProtocol,         // NewHandle
-        *const u16,                        // FileName
-        u64,                               // OpenMode
-        u64,                               // Attributes
+        *mut EfiFileProtocol,      // This
+        *mut *mut EfiFileProtocol, // NewHandle
+        *const u16,                // FileName
+        u64,                       // OpenMode
+        u64,                       // Attributes
     ) -> EfiStatus,
     pub close: extern "efiapi" fn(*mut EfiFileProtocol) -> EfiStatus,
     pub delete: usize,
     pub read: extern "efiapi" fn(
-        *mut EfiFileProtocol,              // This
-        *mut usize,                        // BufferSize
-        *mut core::ffi::c_void,            // Buffer
+        *mut EfiFileProtocol,   // This
+        *mut usize,             // BufferSize
+        *mut core::ffi::c_void, // Buffer
     ) -> EfiStatus,
     pub write: usize,
     pub get_position: usize,

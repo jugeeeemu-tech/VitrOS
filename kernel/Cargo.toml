@@ -1,12 +1,12 @@
 [package]
-name = "je4os-kernel"
+name = "vitros-kernel"
 version.workspace = true
 edition.workspace = true
 
 [features]
-visualize-allocator = ["je4os-common/visualize-allocator"]
+visualize-allocator = ["vitros-common/visualize-allocator"]
 
 [dependencies]
-je4os-common = { path = "../common" }
+vitros-common = { path = "../common" }
 lazy_static = { version = "1.4", features = ["spin_no_std"] }
 spin = "0.9"

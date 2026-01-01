@@ -6,8 +6,8 @@ use core::arch::asm;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use crate::pit;
 use crate::paging::KERNEL_VIRTUAL_BASE;
+use crate::pit;
 
 /// APIC操作のエラー型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,9 +64,7 @@ unsafe fn write_apic_register(offset: u32, value: u32) {
 /// Local APICレジスタからの読み込み
 unsafe fn read_apic_register(offset: u32) -> u32 {
     let addr = (APIC_BASE + offset as u64) as *const u32;
-    unsafe {
-        read_volatile(addr)
-    }
+    unsafe { read_volatile(addr) }
 }
 
 /// MSR (Model Specific Register) の読み込み

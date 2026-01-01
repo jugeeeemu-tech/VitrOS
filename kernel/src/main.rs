@@ -17,18 +17,18 @@ mod pit;
 mod task;
 mod timer;
 
-use je4os_common::boot_info::BootInfo;
-use je4os_common::graphics::FramebufferWriter;
-use je4os_common::{allocator, error, info, println, uefi};
 use alloc::boxed::Box;
 use core::arch::asm;
 use core::fmt::Write;
 use core::panic::PanicInfo;
+use vitros_common::boot_info::BootInfo;
+use vitros_common::graphics::FramebufferWriter;
+use vitros_common::{allocator, error, info, println, uefi};
 use lazy_static::lazy_static;
 use spin::Mutex;
 
 #[cfg(feature = "visualize-allocator")]
-use je4os_common::allocator_visualization;
+use vitros_common::allocator_visualization;
 
 // グローバルフレームバッファライター
 lazy_static! {
@@ -94,24 +94,26 @@ extern "C" fn task1() -> ! {
 
     let mut counter = 0u64;
     loop {
-        info!("[Task1] Counter: {}", counter);
+        // info!("[Task1] Counter: {}", counter);
 
         // 固定位置（X=400, Y=500）にカウンタを表示
-        {
-            let mut fb = GLOBAL_FRAMEBUFFER.lock();
-            if let Some(writer) = fb.as_mut() {
-                writer.set_position(400, 500);
-                writer.clear_area(30, 0x00000000); // 30文字分、黒色でクリア
+        if counter % 70000000 == 0 ||true {
+            {
+                let mut fb = GLOBAL_FRAMEBUFFER.lock();
+                if let Some(writer) = fb.as_mut() {
+                    writer.set_position(400, 500);
+                    writer.clear_area(30, 0x00000000); // 30文字分、黒色でクリア
+                }
             }
+            fb_writeln(&alloc::format!("[Task1 High] Count: {}", counter));
         }
-        fb_writeln(&alloc::format!("[Task1 High] Count: {}", counter));
 
         counter += 1;
 
         // 忙しいループで時間を消費
-        for _ in 0..1_000_000 {
-            core::hint::spin_loop();
-        }
+        // for _ in 0..1_000 {
+        //     core::hint::spin_loop();
+        // }
     }
 }
 
@@ -121,24 +123,25 @@ extern "C" fn task2() -> ! {
 
     let mut counter = 0u64;
     loop {
-        info!("[Task2] Counter: {}", counter);
+        // info!("[Task2] Counter: {}", counter);
 
         // 固定位置（X=400, Y=520）にカウンタを表示
-        {
-            let mut fb = GLOBAL_FRAMEBUFFER.lock();
-            if let Some(writer) = fb.as_mut() {
-                writer.set_position(400, 520);
-                writer.clear_area(30, 0x00000000); // 30文字分、黒色でクリア
+        if counter % 70000000 == 0 || true {
+            {
+                let mut fb = GLOBAL_FRAMEBUFFER.lock();
+                if let Some(writer) = fb.as_mut() {
+                    writer.set_position(400, 520);
+                    writer.clear_area(30, 0x00000000); // 30文字分、黒色でクリア
+                }
             }
+            fb_writeln(&alloc::format!("[Task2 Med ] Count: {}", counter));
         }
-        fb_writeln(&alloc::format!("[Task2 Med ] Count: {}", counter));
 
         counter += 1;
-
         // 忙しいループで時間を消費
-        for _ in 0..1_000_000 {
-            core::hint::spin_loop();
-        }
+        // for _ in 0..1_000 {
+        //     core::hint::spin_loop();
+        // }
     }
 }
 
@@ -148,24 +151,25 @@ extern "C" fn task3() -> ! {
 
     let mut counter = 0u64;
     loop {
-        info!("[Task3] Counter: {}", counter);
+        // info!("[Task3] Counter: {}", counter);
 
         // 固定位置（X=400, Y=540）にカウンタを表示
-        {
-            let mut fb = GLOBAL_FRAMEBUFFER.lock();
-            if let Some(writer) = fb.as_mut() {
-                writer.set_position(400, 540);
-                writer.clear_area(30, 0x00000000); // 30文字分、黒色でクリア
+        if counter % 70000000  == 0 || true {
+            {
+                let mut fb = GLOBAL_FRAMEBUFFER.lock();
+                if let Some(writer) = fb.as_mut() {
+                    writer.set_position(400, 540);
+                    writer.clear_area(30, 0x00000000); // 30文字分、黒色でクリア
+                }
             }
+            fb_writeln(&alloc::format!("[Task3 Low ] Count: {}", counter));
         }
-        fb_writeln(&alloc::format!("[Task3 Low ] Count: {}", counter));
 
         counter += 1;
-
         // 忙しいループで時間を消費
-        for _ in 0..1_000_000 {
-            core::hint::spin_loop();
-        }
+        // for _ in 0..1_000 {
+        //     core::hint::spin_loop();
+        // }
     }
 }
 
@@ -291,6 +295,27 @@ extern "C" fn kernel_main_inner(boot_info_ptr: &'static BootInfo) -> ! {
             allocator::init_heap(largest_start, heap_size);
         }
 
+        // 可視化テストを実行
+        #[cfg(feature = "visualize-allocator")]
+        {
+            info!("Starting allocator visualization");
+            // 可視化テストのために一時的にローカルライターを作成
+            let mut local_writer = {
+                let mut fb = GLOBAL_FRAMEBUFFER.lock();
+                if let Some(writer) = fb.take() {
+                    writer
+                } else {
+                    panic!("Global framebuffer not initialized!");
+                }
+            };
+            allocator_visualization::run_visualization_tests(&mut local_writer);
+            // 使用後にグローバルに戻す
+            {
+                let mut fb = GLOBAL_FRAMEBUFFER.lock();
+                *fb = Some(local_writer);
+            }
+        }
+
         info!("Heap initialized successfully");
 
         // タイマーシステムを初期化（ヒープが必要）
@@ -307,23 +332,28 @@ extern "C" fn kernel_main_inner(boot_info_ptr: &'static BootInfo) -> ! {
         info!("Creating tasks for preemptive multitasking...");
 
         // アイドルタスク（優先度：最低）
-        let idle = Box::new(task::Task::new_idle("Idle", idle_task)
-            .expect("Failed to create idle task"));
+        let idle =
+            Box::new(task::Task::new_idle("Idle", idle_task).expect("Failed to create idle task"));
         task::add_task(*idle);
 
         // ワーカータスク1（優先度：高）
-        let t1 = Box::new(task::Task::new("Task1", task::priority::DEFAULT + 10, task1)
-            .expect("Failed to create Task1"));
+        let t1 = Box::new(
+            task::Task::new("Task1", task::priority::DEFAULT + 10, task1)
+                .expect("Failed to create Task1"),
+        );
         task::add_task(*t1);
 
         // ワーカータスク2（優先度：中）
-        let t2 = Box::new(task::Task::new("Task2", task::priority::DEFAULT, task2)
-            .expect("Failed to create Task2"));
+        let t2 = Box::new(
+            task::Task::new("Task2", task::priority::DEFAULT, task2)
+                .expect("Failed to create Task2"),
+        );
         task::add_task(*t2);
 
         // ワーカータスク3（優先度：低）
-        let t3 = Box::new(task::Task::new("Task3", task::priority::MIN, task3)
-            .expect("Failed to create Task3"));
+        let t3 = Box::new(
+            task::Task::new("Task3", task::priority::MIN, task3).expect("Failed to create Task3"),
+        );
         task::add_task(*t3);
 
         info!("All tasks created. Setting up kernel main task...");
@@ -333,8 +363,10 @@ extern "C" fn kernel_main_inner(boot_info_ptr: &'static BootInfo) -> ! {
         // このタスクはold_contextとして最初のswitch_context()で保存される側なので、
         // 初期Contextの値（rip=task_wrapper, rdi=idle_task）は上書きされる
         // 保存されるripは「schedule()から戻るアドレス」になる
-        let kernel_main = Box::new(task::Task::new("KernelMain", task::priority::DEFAULT, idle_task)
-            .expect("Failed to create KernelMain task"));
+        let kernel_main = Box::new(
+            task::Task::new("KernelMain", task::priority::DEFAULT, idle_task)
+                .expect("Failed to create KernelMain task"),
+        );
         task::set_current_task(*kernel_main);
         info!("Kernel main task set as current");
 
@@ -362,9 +394,14 @@ extern "C" fn kernel_main_inner(boot_info_ptr: &'static BootInfo) -> ! {
 
         fb_writeln(&alloc::format!(
             "Framebuffer: 0x{:X}, {}x{}",
-            boot_info.framebuffer.base, boot_info.framebuffer.width, boot_info.framebuffer.height
+            boot_info.framebuffer.base,
+            boot_info.framebuffer.width,
+            boot_info.framebuffer.height
         ));
-        fb_writeln(&alloc::format!("Memory regions: {}", boot_info.memory_map_count));
+        fb_writeln(&alloc::format!(
+            "Memory regions: {}",
+            boot_info.memory_map_count
+        ));
         fb_writeln(&alloc::format!(
             "Largest usable memory: 0x{:X} - 0x{:X} ({} MB)",
             largest_start,
@@ -377,48 +414,36 @@ extern "C" fn kernel_main_inner(boot_info_ptr: &'static BootInfo) -> ! {
         info!("Registering test timers...");
 
         // 1秒後に実行されるタイマー
-        timer::register_timer(timer::seconds_to_ticks(1), Box::new(|| {
-            info!("Timer 1: 1 second elapsed!");
-            fb_writeln("Timer 1: 1 second elapsed!");
-        }));
+        timer::register_timer(
+            timer::seconds_to_ticks(1),
+            Box::new(|| {
+                info!("Timer 1: 1 second elapsed!");
+                fb_writeln("Timer 1: 1 second elapsed!");
+            }),
+        );
 
         // 2秒後に実行されるタイマー
-        timer::register_timer(timer::seconds_to_ticks(2), Box::new(|| {
-            info!("Timer 2: 2 seconds elapsed!");
-            fb_writeln("Timer 2: 2 seconds elapsed!");
-        }));
+        timer::register_timer(
+            timer::seconds_to_ticks(2),
+            Box::new(|| {
+                info!("Timer 2: 2 seconds elapsed!");
+                fb_writeln("Timer 2: 2 seconds elapsed!");
+            }),
+        );
 
         // 3秒後に実行されるタイマー
-        timer::register_timer(timer::seconds_to_ticks(3), Box::new(|| {
-            info!("Timer 3: 3 seconds elapsed!");
-            fb_writeln("Timer 3: 3 seconds elapsed!");
-        }));
+        timer::register_timer(
+            timer::seconds_to_ticks(3),
+            Box::new(|| {
+                info!("Timer 3: 3 seconds elapsed!");
+                fb_writeln("Timer 3: 3 seconds elapsed!");
+            }),
+        );
 
         info!("Test timers registered");
     } else {
         error!("No usable memory found!");
         fb_writeln("ERROR: No usable memory!");
-    }
-
-    // 可視化テストを実行
-    #[cfg(feature = "visualize-allocator")]
-    {
-        info!("Starting allocator visualization");
-        // 可視化テストのために一時的にローカルライターを作成
-        let mut local_writer = {
-            let mut fb = GLOBAL_FRAMEBUFFER.lock();
-            if let Some(writer) = fb.take() {
-                writer
-            } else {
-                panic!("Global framebuffer not initialized!");
-            }
-        };
-        allocator_visualization::run_visualization_tests(&mut local_writer);
-        // 使用後にグローバルに戻す
-        {
-            let mut fb = GLOBAL_FRAMEBUFFER.lock();
-            *fb = Some(local_writer);
-        }
     }
 
     #[cfg(not(feature = "visualize-allocator"))]

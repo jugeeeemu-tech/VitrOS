@@ -1,5 +1,5 @@
 [package]
-name = "je4os-common"
+name = "vitros-common"
 version.workspace = true
 edition.workspace = true
 

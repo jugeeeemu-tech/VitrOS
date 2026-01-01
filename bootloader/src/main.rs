@@ -3,12 +3,12 @@
 
 use core::fmt::Write;
 use core::panic::PanicInfo;
-use je4os_common::boot_info::{BootInfo, FramebufferInfo, MemoryRegion};
-use je4os_common::elf::{Elf64Header, Elf64ProgramHeader, PT_LOAD};
-use je4os_common::graphics::FramebufferWriter;
-use je4os_common::serial;
-use je4os_common::uefi::*;
-use je4os_common::{error, info, println};
+use vitros_common::boot_info::{BootInfo, FramebufferInfo, MemoryRegion};
+use vitros_common::elf::{Elf64Header, Elf64ProgramHeader, PT_LOAD};
+use vitros_common::graphics::FramebufferWriter;
+use vitros_common::serial;
+use vitros_common::uefi::*;
+use vitros_common::{error, info, println};
 
 // BOOT_INFOをカーネル直前の固定アドレスに配置
 // 0x90000 (576KB) - カーネル(0x100000=1MB)の手前で安全
@@ -69,8 +69,26 @@ impl PageTable {
 static mut BOOT_PML4: PageTable = PageTable::new();
 static mut BOOT_PDP_LOW: PageTable = PageTable::new();
 static mut BOOT_PDP_HIGH: PageTable = PageTable::new();
-static mut BOOT_PD_LOW: [PageTable; 8] = [PageTable::new(), PageTable::new(), PageTable::new(), PageTable::new(), PageTable::new(), PageTable::new(), PageTable::new(), PageTable::new()];
-static mut BOOT_PD_HIGH: [PageTable; 8] = [PageTable::new(), PageTable::new(), PageTable::new(), PageTable::new(), PageTable::new(), PageTable::new(), PageTable::new(), PageTable::new()];
+static mut BOOT_PD_LOW: [PageTable; 8] = [
+    PageTable::new(),
+    PageTable::new(),
+    PageTable::new(),
+    PageTable::new(),
+    PageTable::new(),
+    PageTable::new(),
+    PageTable::new(),
+    PageTable::new(),
+];
+static mut BOOT_PD_HIGH: [PageTable; 8] = [
+    PageTable::new(),
+    PageTable::new(),
+    PageTable::new(),
+    PageTable::new(),
+    PageTable::new(),
+    PageTable::new(),
+    PageTable::new(),
+    PageTable::new(),
+];
 
 /// ブートローダー用の初期ページテーブルをセットアップ
 unsafe fn setup_initial_page_tables() -> u64 {
@@ -128,7 +146,7 @@ extern "efiapi" fn efi_main(
 ) -> EfiStatus {
     // シリアルポートを初期化
     serial::init();
-    println!("=== je4OS Bootloader ===");
+    println!("=== VitrOS Bootloader ===");
     info!("Serial output initialized");
     info!("Locating Graphics Output Protocol...");
 
@@ -180,7 +198,7 @@ extern "efiapi" fn efi_main(
     // FramebufferWriter を作成
     let mut writer = FramebufferWriter::new(fb_base, width, height, 0xFFFFFFFF);
     writer.set_position(10, 10);
-    let _ = writeln!(writer, "je4OS - Memory Map");
+    let _ = writeln!(writer, "VitrOS - Memory Map");
 
     // メモリマップを取得
     let mut map_size: usize = 0;
@@ -303,10 +321,15 @@ extern "efiapi" fn efi_main(
         }
         boot_info.memory_map_count = entry_count.min(boot_info.memory_map.len());
         info!("BOOT_INFO at 0x{:X}", BOOT_INFO_ADDR);
-        info!("BOOT_INFO.memory_map_count = {}", boot_info.memory_map_count);
+        info!(
+            "BOOT_INFO.memory_map_count = {}",
+            boot_info.memory_map_count
+        );
         info!(
             "BOOT_INFO.memory_map[0]: start=0x{:X}, size=0x{:X}, type={}",
-            boot_info.memory_map[0].start, boot_info.memory_map[0].size, boot_info.memory_map[0].region_type
+            boot_info.memory_map[0].start,
+            boot_info.memory_map[0].size,
+            boot_info.memory_map[0].region_type
         );
     }
 
@@ -337,11 +360,14 @@ extern "efiapi" fn efi_main(
         );
     }
 
-    // 余裕を持たせる（メモリマップが増える可能性があるため）
-    map_size += descriptor_size * 2;
+    map_size += descriptor_size;
 
     if map_size > buffer.len() {
-        error!("Memory map too large! Required: {}, Available: {}", map_size, buffer.len());
+        error!(
+            "Memory map too large! Required: {}, Available: {}",
+            map_size,
+            buffer.len()
+        );
         loop {
             unsafe { core::arch::asm!("hlt") }
         }
@@ -399,12 +425,21 @@ extern "efiapi" fn efi_main(
 
     // カーネルジャンプ直前にBOOT_INFOを再確認
     let boot_info_check = unsafe { &*(BOOT_INFO_ADDR as *const BootInfo) };
-    info!("Pre-jump check: BOOT_INFO.memory_map_count = {}", boot_info_check.memory_map_count);
-    info!("Pre-jump check: BOOT_INFO.framebuffer.base = 0x{:X}", boot_info_check.framebuffer.base);
+    info!(
+        "Pre-jump check: BOOT_INFO.memory_map_count = {}",
+        boot_info_check.memory_map_count
+    );
+    info!(
+        "Pre-jump check: BOOT_INFO.framebuffer.base = 0x{:X}",
+        boot_info_check.framebuffer.base
+    );
 
     // カーネルの高位仮想アドレスを計算（kernel_entryは物理アドレス）
     let kernel_high_addr = kernel_entry + KERNEL_VMA;
-    info!("Jumping to kernel at high address: 0x{:X}", kernel_high_addr);
+    info!(
+        "Jumping to kernel at high address: 0x{:X}",
+        kernel_high_addr
+    );
 
     // カーネルにジャンプ (efiapi calling convention to match kernel entry point)
     type KernelEntry = extern "efiapi" fn(&'static BootInfo) -> !;
@@ -488,7 +523,8 @@ fn load_kernel_elf(_image_handle: EfiHandle, boot_services: *mut EfiBootServices
     let mut kernel_virt_offset: Option<u64> = None;
 
     for i in 0..elf_header.e_phnum {
-        let ph_offset = elf_header.e_phoff as usize + (i as usize * core::mem::size_of::<Elf64ProgramHeader>());
+        let ph_offset =
+            elf_header.e_phoff as usize + (i as usize * core::mem::size_of::<Elf64ProgramHeader>());
         let ph = unsafe { &*(file_buffer.as_ptr().add(ph_offset) as *const Elf64ProgramHeader) };
 
         if ph.p_type == PT_LOAD {

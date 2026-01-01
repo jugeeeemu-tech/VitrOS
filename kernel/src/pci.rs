@@ -3,11 +3,11 @@
 //! PCIデバイスを列挙し、設定空間にアクセスします。
 //! MMCONFIG (MCFG経由) を優先し、利用できない場合はレガシーI/Oポートを使用します。
 
-use core::arch::asm;
-use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{AtomicU64, Ordering};
-use je4os_common::info;
 use crate::paging::KERNEL_VIRTUAL_BASE;
+use core::arch::asm;
+use core::ptr::{read_volatile};
+use core::sync::atomic::{AtomicU64, Ordering};
+use vitros_common::info;
 
 /// PCI Configuration Address レジスタ (I/Oポート 0xCF8)
 const CONFIG_ADDRESS: u16 = 0xCF8;
@@ -138,20 +138,6 @@ fn pci_config_read_u32(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
     }
 }
 
-/// PCI Configuration Space から16ビット値を読み込む
-fn pci_config_read_u16(bus: u8, device: u8, function: u8, offset: u8) -> u16 {
-    let data = pci_config_read_u32(bus, device, function, offset & 0xFC);
-    let shift = (offset & 0x02) * 8;
-    ((data >> shift) & 0xFFFF) as u16
-}
-
-/// PCI Configuration Space から8ビット値を読み込む
-fn pci_config_read_u8(bus: u8, device: u8, function: u8, offset: u8) -> u8 {
-    let data = pci_config_read_u32(bus, device, function, offset & 0xFC);
-    let shift = (offset & 0x03) * 8;
-    ((data >> shift) & 0xFF) as u8
-}
-
 /// ACPIからMMCONFIG情報を設定
 ///
 /// # Arguments
@@ -188,7 +174,7 @@ fn is_mmconfig_available(bus: u8) -> bool {
     let start_bus = MMCONFIG_START_BUS.load(Ordering::SeqCst) as u8;
     let end_bus = MMCONFIG_END_BUS.load(Ordering::SeqCst) as u8;
 
-    bus >= start_bus && bus <= end_bus
+    start_bus <= bus && bus <= end_bus
 }
 
 /// MMCONFIG経由でPCI Configuration Spaceから32ビット値を読み込む

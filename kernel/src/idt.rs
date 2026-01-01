@@ -3,14 +3,14 @@
 //! x86_64アーキテクチャの割り込み処理を管理するIDTを実装します。
 
 use core::arch::asm;
+use vitros_common::{info, println};
 use lazy_static::lazy_static;
 use spin::Mutex;
-use je4os_common::{println, info};
 
 use crate::apic;
 use crate::gdt;
-use crate::timer;
 use crate::paging::KERNEL_VIRTUAL_BASE;
+use crate::timer;
 
 /// IDT操作のエラー型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,13 +43,13 @@ fn is_higher_half() -> bool {
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
 struct IdtEntry {
-    offset_low: u16,     // オフセット下位16ビット
-    selector: u16,       // コードセグメントセレクタ
-    ist: u8,             // Interrupt Stack Table (0 = 使用しない)
-    attributes: u8,      // タイプとアトリビュート
-    offset_middle: u16,  // オフセット中位16ビット
-    offset_high: u32,    // オフセット上位32ビット
-    reserved: u32,       // 予約領域（0）
+    offset_low: u16,    // オフセット下位16ビット
+    selector: u16,      // コードセグメントセレクタ
+    ist: u8,            // Interrupt Stack Table (0 = 使用しない)
+    attributes: u8,     // タイプとアトリビュート
+    offset_middle: u16, // オフセット中位16ビット
+    offset_high: u32,   // オフセット上位32ビット
+    reserved: u32,      // 予約領域（0）
 }
 
 impl IdtEntry {
@@ -138,9 +138,7 @@ lazy_static! {
 #[allow(dead_code)]
 #[unsafe(naked)]
 extern "C" fn default_handler() {
-    core::arch::naked_asm!(
-        "iretq"
-    )
+    core::arch::naked_asm!("iretq")
 }
 
 /// タイマー割り込みハンドラ
@@ -204,6 +202,7 @@ extern "C" fn timer_handler_inner() {
 
     // 現在のタスクのvruntimeを更新（CFS風スケジューリング）
     // タイマー周波数は100Hzなので、1tick = 10ms = 10,000,000ns
+    // const TIMER_PERIOD_NS: u64 = 10_000_000;
     const TIMER_PERIOD_NS: u64 = 10_000_000;
     crate::task::update_current_task_vruntime(TIMER_PERIOD_NS);
 
@@ -465,7 +464,9 @@ extern "C" fn double_fault_handler_inner(error_code: u64) {
     };
 
     // CR2がGuard Page範囲内であれば、スタックオーバーフローと判定
-    if fault_addr >= guard_page_addr && fault_addr < guard_page_addr + crate::paging::PAGE_SIZE as u64 {
+    if fault_addr >= guard_page_addr
+        && fault_addr < guard_page_addr + crate::paging::PAGE_SIZE as u64
+    {
         println!("\n\n");
         println!("========================================");
         println!("FATAL: STACK OVERFLOW DETECTED");
@@ -553,13 +554,16 @@ extern "C" fn general_protection_fault_handler_inner(error_code: u64) {
         println!("");
         println!("Error code details:");
         println!("  - External: {}", if external { "Yes" } else { "No" });
-        println!("  - Table: {}", match table {
-            0 => "GDT",
-            1 => "IDT",
-            2 => "LDT",
-            3 => "IDT",
-            _ => "Unknown",
-        });
+        println!(
+            "  - Table: {}",
+            match table {
+                0 => "GDT",
+                1 => "IDT",
+                2 => "LDT",
+                3 => "IDT",
+                _ => "Unknown",
+            }
+        );
         println!("  - Index: 0x{:X}", index);
     }
     println!("");
@@ -624,11 +628,42 @@ extern "C" fn page_fault_handler_inner(error_code: u64) {
     // エラーコードの詳細を解析
     println!("");
     println!("Error code details:");
-    println!("  - Present: {}", if error_code & 0x01 != 0 { "Yes (protection violation)" } else { "No (page not present)" });
-    println!("  - Write: {}", if error_code & 0x02 != 0 { "Yes (write)" } else { "No (read)" });
-    println!("  - User: {}", if error_code & 0x04 != 0 { "Yes (user mode)" } else { "No (kernel mode)" });
-    println!("  - Reserved: {}", if error_code & 0x08 != 0 { "Yes" } else { "No" });
-    println!("  - Instruction: {}", if error_code & 0x10 != 0 { "Yes (instruction fetch)" } else { "No (data access)" });
+    println!(
+        "  - Present: {}",
+        if error_code & 0x01 != 0 {
+            "Yes (protection violation)"
+        } else {
+            "No (page not present)"
+        }
+    );
+    println!(
+        "  - Write: {}",
+        if error_code & 0x02 != 0 {
+            "Yes (write)"
+        } else {
+            "No (read)"
+        }
+    );
+    println!(
+        "  - User: {}",
+        if error_code & 0x04 != 0 {
+            "Yes (user mode)"
+        } else {
+            "No (kernel mode)"
+        }
+    );
+    println!(
+        "  - Reserved: {}",
+        if error_code & 0x08 != 0 { "Yes" } else { "No" }
+    );
+    println!(
+        "  - Instruction: {}",
+        if error_code & 0x10 != 0 {
+            "Yes (instruction fetch)"
+        } else {
+            "No (data access)"
+        }
+    );
     println!("");
 
     loop {
@@ -664,17 +699,24 @@ fn set_idt_entry_with_ist(vector: u8, handler: usize, ist_index: u8) {
 /// IDTを初期化してロード
 pub fn init() -> Result<(), IdtError> {
     // 例外ハンドラを登録
-    set_idt_entry(0, divide_error_handler as usize);        // #DE: Divide Error
-    set_idt_entry(1, debug_exception_handler as usize);     // #DB: Debug Exception
-    set_idt_entry(3, breakpoint_handler as usize);          // #BP: Breakpoint
-    set_idt_entry(6, invalid_opcode_handler as usize);      // #UD: Invalid Opcode
+    set_idt_entry(0, divide_error_handler as usize); // #DE: Divide Error
+    set_idt_entry(1, debug_exception_handler as usize); // #DB: Debug Exception
+    set_idt_entry(3, breakpoint_handler as usize); // #BP: Breakpoint
+    set_idt_entry(6, invalid_opcode_handler as usize); // #UD: Invalid Opcode
     // Double FaultハンドラにはIST1を設定（専用スタック使用）
-    set_idt_entry_with_ist(8, double_fault_handler as usize, gdt::DOUBLE_FAULT_IST_INDEX); // #DF: Double Fault
+    set_idt_entry_with_ist(
+        8,
+        double_fault_handler as usize,
+        gdt::DOUBLE_FAULT_IST_INDEX,
+    ); // #DF: Double Fault
     set_idt_entry(13, general_protection_fault_handler as usize); // #GP: General Protection Fault
-    set_idt_entry(14, page_fault_handler as usize);         // #PF: Page Fault
+    set_idt_entry(14, page_fault_handler as usize); // #PF: Page Fault
 
     // タイマー割り込みハンドラを登録
-    set_idt_entry(apic::TIMER_INTERRUPT_VECTOR, timer_interrupt_handler as usize);
+    set_idt_entry(
+        apic::TIMER_INTERRUPT_VECTOR,
+        timer_interrupt_handler as usize,
+    );
 
     unsafe {
         // IDTのアドレスを取得（カーネルが高位アドレスでリンクされているため既に高位）
