@@ -170,9 +170,33 @@ pub fn check_timers() {
 pub fn process_pending_timers() {
     loop {
         // ペンディングキューから1つ取り出す
+        // 割り込みハンドラとのデッドロックを防ぐため、割り込みを無効化してからロック取得
         let timer = {
+            // 割り込みを無効化してRFLAGSを保存
+            let flags = unsafe {
+                let flags: u64;
+                core::arch::asm!(
+                    "pushfq",
+                    "pop {}",
+                    "cli",
+                    out(reg) flags,
+                    options(nomem, nostack)
+                );
+                flags
+            };
+
             let mut pending = PENDING_QUEUE.lock();
-            pending.pop_front()
+            let timer = pending.pop_front();
+            drop(pending);
+
+            // 割り込みを元の状態に復元
+            unsafe {
+                if flags & 0x200 != 0 {
+                    core::arch::asm!("sti", options(nomem, nostack));
+                }
+            }
+
+            timer
         };
 
         match timer {
