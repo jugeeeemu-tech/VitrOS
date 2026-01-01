@@ -1,3 +1,4 @@
 /target
-serial.log
 mnt/
+serial.log
+qemu_debug.log
