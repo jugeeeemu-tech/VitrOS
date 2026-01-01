@@ -8,27 +8,34 @@ extern crate alloc;
 
 mod acpi;
 mod addr;
+mod allocator;
 mod apic;
 mod gdt;
+mod graphics;
 mod idt;
+mod io;
 mod paging;
 mod pci;
 mod pit;
+mod serial;
 mod task;
 mod timer;
 
+#[cfg(feature = "visualize-allocator")]
+mod allocator_visualization;
+
+use crate::graphics::FramebufferWriter;
 use alloc::boxed::Box;
 use core::arch::asm;
 use core::fmt::Write;
 use core::panic::PanicInfo;
-use vitros_common::boot_info::BootInfo;
-use vitros_common::graphics::FramebufferWriter;
-use vitros_common::{allocator, error, info, println, uefi};
 use lazy_static::lazy_static;
 use spin::Mutex;
+use vitros_common::boot_info::BootInfo;
+use vitros_common::uefi;
 
 #[cfg(feature = "visualize-allocator")]
-use vitros_common::allocator_visualization;
+use crate::allocator_visualization;
 
 // グローバルフレームバッファライター
 lazy_static! {
@@ -97,7 +104,7 @@ extern "C" fn task1() -> ! {
         // info!("[Task1] Counter: {}", counter);
 
         // 固定位置（X=400, Y=500）にカウンタを表示
-        if counter % 70000000 == 0 ||true {
+        if counter % 70000000 == 0 || true {
             {
                 let mut fb = GLOBAL_FRAMEBUFFER.lock();
                 if let Some(writer) = fb.as_mut() {
@@ -154,7 +161,7 @@ extern "C" fn task3() -> ! {
         // info!("[Task3] Counter: {}", counter);
 
         // 固定位置（X=400, Y=540）にカウンタを表示
-        if counter % 70000000  == 0 || true {
+        if counter % 70000000 == 0 || true {
             {
                 let mut fb = GLOBAL_FRAMEBUFFER.lock();
                 if let Some(writer) = fb.as_mut() {

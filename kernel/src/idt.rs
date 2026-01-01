@@ -2,8 +2,8 @@
 //!
 //! x86_64アーキテクチャの割り込み処理を管理するIDTを実装します。
 
+use crate::{info, println};
 use core::arch::asm;
-use vitros_common::{info, println};
 use lazy_static::lazy_static;
 use spin::Mutex;
 

@@ -475,7 +475,7 @@ lazy_static! {
 
 /// タスク管理システムの初期化
 pub fn init() {
-    vitros_common::info!("Task system initialized");
+    crate::info!("Task system initialized");
 }
 
 /// 新しいタスクをタスクキューに追加（エラーハンドリング版）
@@ -497,7 +497,7 @@ pub fn try_add_task(task: Task) -> Result<(), TaskError> {
     let boxed_task = Box::new(task);
     tree.insert((vruntime, task_id), boxed_task);
 
-    vitros_common::info!("Task added to queue: ID={}, name={}", task_id, name);
+    crate::info!("Task added to queue: ID={}, name={}", task_id, name);
     Ok(())
 }
 

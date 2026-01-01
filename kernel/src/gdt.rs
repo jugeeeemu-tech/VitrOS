@@ -3,9 +3,9 @@
 //! x86_64アーキテクチャでは、セグメンテーションはほぼ使用されませんが、
 //! 特権レベル（Ring 0/3）の管理とTSS（Interrupt Stack Table用）のためにGDTは必須です。
 
+use crate::info;
 use crate::paging::KERNEL_VIRTUAL_BASE;
 use core::arch::asm;
-use vitros_common::info;
 
 /// GDT操作のエラー型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

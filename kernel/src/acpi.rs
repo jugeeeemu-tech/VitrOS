@@ -3,9 +3,9 @@
 //! ACPI テーブルを読み取り、システム設定情報を取得します。
 //! UEFI ブートローダーから RSDP アドレスを受け取り、XSDT/RSDT を解析します。
 
+use crate::info;
 use crate::paging::{KERNEL_VIRTUAL_BASE, phys_to_virt};
 use vitros_common::boot_info::BootInfo;
-use vitros_common::info;
 
 /// RSDP (Root System Description Pointer) - ACPI 1.0
 #[repr(C, packed)]

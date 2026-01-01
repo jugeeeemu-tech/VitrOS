@@ -392,7 +392,7 @@ pub fn init() -> Result<(), PagingError> {
             .set(guard_page_phys_addr, 0);
 
         // デバッグ: Guard Page設定を確認
-        use vitros_common::info;
+        use crate::info;
         info!("Guard Page setup:");
         info!("  Virtual address: 0x{:016X}", guard_page_virt_addr);
         info!("  Physical offset: 0x{:X}", physical_offset);

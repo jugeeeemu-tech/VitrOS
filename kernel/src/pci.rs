@@ -3,11 +3,11 @@
 //! PCIデバイスを列挙し、設定空間にアクセスします。
 //! MMCONFIG (MCFG経由) を優先し、利用できない場合はレガシーI/Oポートを使用します。
 
+use crate::info;
 use crate::paging::KERNEL_VIRTUAL_BASE;
 use core::arch::asm;
-use core::ptr::{read_volatile};
+use core::ptr::read_volatile;
 use core::sync::atomic::{AtomicU64, Ordering};
-use vitros_common::info;
 
 /// PCI Configuration Address レジスタ (I/Oポート 0xCF8)
 const CONFIG_ADDRESS: u16 = 0xCF8;
