@@ -437,9 +437,8 @@ extern "C" fn kernel_main_inner(boot_info_phys_addr: u64) -> ! {
     info!("Entering main loop");
     boot_complete();
 
-    // KernelMainタスクは他のタスクに制御を譲り続ける
-    // タイマーコールバックはタイマー割り込みの出口で処理される
+    // KernelMainタスクは自身をブロックして停止
     loop {
-        task::yield_now();
+        task::block_current_task();
     }
 }
