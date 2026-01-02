@@ -493,17 +493,22 @@ pub fn init() {
 ///
 /// # Errors
 /// * `TaskError::QueueFull` - タスクキューが満杯の場合（現在は常に成功）
+///
+/// # Note
+/// 割り込みを無効化してからロックを取得し、デッドロックを防ぎます。
 pub fn try_add_task(task: Task) -> Result<(), TaskError> {
-    let mut tree = TASK_QUEUE.lock();
-
     let task_id = task.id().as_u64();
     let vruntime = task.vruntime();
     // 名前を所有型として取得（借用を終わらせるため）
     let name = alloc::format!("{}", task.name());
 
-    // BTreeMapに追加: キーは(vruntime, task_id)
-    let boxed_task = Box::new(task);
-    tree.insert((vruntime, task_id), boxed_task);
+    without_interrupts(|| {
+        let mut tree = TASK_QUEUE.lock();
+
+        // BTreeMapに追加: キーは(vruntime, task_id)
+        let boxed_task = Box::new(task);
+        tree.insert((vruntime, task_id), boxed_task);
+    });
 
     crate::info!("Task added to queue: ID={}, name={}", task_id, name);
     Ok(())
@@ -534,9 +539,14 @@ pub fn yield_now() {
 ///
 /// # Arguments
 /// * `task` - 現在のタスクとして設定するタスク
+///
+/// # Note
+/// 割り込みを無効化してからロックを取得し、デッドロックを防ぎます。
 pub fn set_current_task(task: Task) {
-    let mut current = CURRENT_TASK.lock();
-    *current = Some(Box::new(task));
+    without_interrupts(|| {
+        let mut current = CURRENT_TASK.lock();
+        *current = Some(Box::new(task));
+    });
 }
 
 /// 現在実行中のタスクのvruntimeを更新
@@ -546,25 +556,22 @@ pub fn set_current_task(task: Task) {
 /// # Arguments
 /// * `delta` - 実際の実行時間（ナノ秒単位）
 pub fn update_current_task_vruntime(delta: u64) {
-    // 割り込みコンテキストからCURRENT_TASKロックを取得する際のデッドロック防止
-    // schedule()が既にロックを保持している場合、割り込みが発生すると
-    // ここでデッドロックする可能性があるため、割り込みを無効化してからロックを取得
-    let flags = unsafe {
-        let flags: u64;
-        core::arch::asm!("pushfq", "pop {}", "cli", out(reg) flags, options(nomem, nostack));
-        flags
-    };
-
-    let mut current = CURRENT_TASK.lock();
-    if let Some(task) = current.as_mut() {
-        task.update_vruntime(delta);
-    }
-    drop(current);
-
-    // 割り込み状態を復元
-    unsafe {
-        if flags & 0x200 != 0 {
-            core::arch::asm!("sti", options(nomem, nostack));
+    // TODO: 暫定対応 - より適切な解決策を検討する必要がある
+    // 現在の問題点:
+    // - タイマー割り込みハンドラから呼ばれるため、既にCURRENT_TASKがロックされている
+    //   状態で割り込みが発生するとデッドロックする
+    // - try_lock()でスキップすると、そのタスクのvruntimeが更新されず、
+    //   スケジューリングの公平性が損なわれる可能性がある
+    //
+    // 将来的な解決策の候補:
+    // 1. CURRENT_TASKにアクセスする全箇所で割り込みを禁止
+    // 2. vruntime更新をschedule()内で行う（割り込みハンドラではフラグのみ設定）
+    // 3. per-CPUデータを使用してロックフリーにする（Linux方式）
+    //
+    // See: https://github.com/jugeeeemu-tech/VitrOS/issues/4
+    if let Some(mut current) = CURRENT_TASK.try_lock() {
+        if let Some(task) = current.as_mut() {
+            task.update_vruntime(delta);
         }
     }
 }
@@ -596,22 +603,31 @@ pub fn check_resched_on_interrupt_exit() {
 ///
 /// # Returns
 /// 現在実行中のタスクのID。タスクが存在しない場合は新しいIDを生成
+///
+/// # Note
+/// 割り込みを無効化してからロックを取得し、デッドロックを防ぎます。
 pub fn current_task_id() -> TaskId {
-    let current = CURRENT_TASK.lock();
-    current.as_ref().map(|t| t.id()).unwrap_or_else(TaskId::new)
+    without_interrupts(|| {
+        let current = CURRENT_TASK.lock();
+        current.as_ref().map(|t| t.id()).unwrap_or_else(TaskId::new)
+    })
 }
 
 /// 現在のタスクをブロック状態にしてスケジュール
 ///
 /// この関数は同期プリミティブ（BlockingMutex等）から呼び出されます。
 /// 現在のタスクをBlocked状態に設定し、BLOCKED_TASKSに移動してスケジューラを呼び出します。
+///
+/// # Note
+/// 割り込みを無効化してからロックを取得し、デッドロックを防ぎます。
 pub fn block_current_task() {
-    {
+    without_interrupts(|| {
         let mut current = CURRENT_TASK.lock();
         if let Some(task) = current.as_mut() {
             task.set_state(TaskState::Blocked);
         }
-    }
+    });
+    // schedule()は内部で割り込みを無効化する
     schedule();
 }
 
@@ -621,20 +637,25 @@ pub fn block_current_task() {
 ///
 /// # Arguments
 /// * `task_id` - アンブロックするタスクのID
+///
+/// # Note
+/// 割り込みを無効化してからロックを取得し、デッドロックを防ぎます。
 pub fn unblock_task(task_id: TaskId) {
-    let mut blocked_tasks = BLOCKED_TASKS.lock();
+    without_interrupts(|| {
+        let mut blocked_tasks = BLOCKED_TASKS.lock();
 
-    if let Some(mut task) = blocked_tasks.remove(&task_id.as_u64()) {
-        // Ready状態に戻す
-        task.set_state(TaskState::Ready);
+        if let Some(mut task) = blocked_tasks.remove(&task_id.as_u64()) {
+            // Ready状態に戻す
+            task.set_state(TaskState::Ready);
 
-        // TASK_QUEUEに追加
-        let key = (task.vruntime(), task.id().as_u64());
-        drop(blocked_tasks); // ロックを早期に解放
+            // TASK_QUEUEに追加
+            let key = (task.vruntime(), task.id().as_u64());
+            drop(blocked_tasks); // ロックを早期に解放
 
-        let mut tree = TASK_QUEUE.lock();
-        tree.insert(key, task);
-    }
+            let mut tree = TASK_QUEUE.lock();
+            tree.insert(key, task);
+        }
+    });
 }
 
 /// 割り込みコンテキスト内かどうかを判定
@@ -654,6 +675,38 @@ pub fn is_interrupt_context() -> bool {
     (rflags & 0x200) == 0
 }
 
+/// 割り込みを無効化してクロージャを実行
+///
+/// クロージャ実行後、元の割り込み状態を復元します。
+/// 割り込みハンドラからアクセスされる可能性のあるロックを取得する際に使用します。
+///
+/// # Arguments
+/// * `f` - 割り込み無効状態で実行するクロージャ
+///
+/// # Returns
+/// クロージャの戻り値
+fn without_interrupts<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    let rflags: u64;
+    unsafe {
+        // RFLAGSを保存して割り込みを無効化
+        core::arch::asm!("pushfq; pop {}; cli", out(reg) rflags, options(nomem, nostack));
+    }
+
+    let result = f();
+
+    // 元々割り込みが有効だった場合のみ再有効化
+    if rflags & 0x200 != 0 {
+        unsafe {
+            core::arch::asm!("sti", options(nomem, nostack));
+        }
+    }
+
+    result
+}
+
 /// 次に実行するタスクを選択してコンテキストスイッチ
 ///
 /// CFS風のスケジューリングを行います。
@@ -662,7 +715,19 @@ pub fn is_interrupt_context() -> bool {
 /// - 現在のタスクがある場合は、それをツリーに戻します
 ///
 /// RFLAGSの保存・復元はswitch_context()内部で自動的に行われます。
+/// switch_context()でRFLAGSのIFフラグが強制セットされるため、
+/// タスク復帰時は必ず割り込み有効状態になります。
+///
+/// # Note
+/// この関数は割り込みを無効化してからロックを取得します。
+/// これにより、タイマー割り込みハンドラとのデッドロックを防ぎます。
 pub fn schedule() {
+    // 割り込みを無効化
+    // これにより、ロック保持中にタイマー割り込みが発生してデッドロックすることを防ぐ
+    unsafe {
+        core::arch::asm!("cli", options(nomem, nostack));
+    }
+
     let mut tree = TASK_QUEUE.lock();
     let mut current = CURRENT_TASK.lock();
 
@@ -670,6 +735,10 @@ pub fn schedule() {
     if tree.is_empty() {
         drop(tree);
         drop(current);
+        // 割り込みを再有効化
+        unsafe {
+            core::arch::asm!("sti", options(nomem, nostack));
+        }
         return;
     }
 
@@ -747,6 +816,10 @@ pub fn schedule() {
 /// # Arguments
 /// * `old_context` - 現在のコンテキストを保存する先（rspのみ）
 /// * `new_context` - 切り替え先のコンテキスト（rspのみ）
+///
+/// # Note
+/// 保存されるRFLAGSは割り込み有効フラグ(IF)が強制的にセットされます。
+/// これにより、タスク復帰時に必ず割り込み有効状態になることが保証されます。
 #[unsafe(naked)]
 pub unsafe extern "C" fn switch_context(old_context: *mut Context, new_context: *const Context) {
     core::arch::naked_asm!(
@@ -758,8 +831,10 @@ pub unsafe extern "C" fn switch_context(old_context: *mut Context, new_context: 
         "push r13",
         "push r14",
         "push r15",
-        // RFLAGSを保存
+        // RFLAGSを保存し、IFフラグを強制的にセット
+        // これにより、タスク復帰時に必ず割り込みが有効になる
         "pushfq",
+        "or qword ptr [rsp], 0x200", // IF (bit 9) を強制的に1にする
         // fxsave用の領域を確保し、16バイトアラインを保証
         // call命令で8バイトプッシュされているため、アラインメント調整が必要
         "mov r11, rsp", // アラインメント前のRSPを保存
@@ -778,7 +853,7 @@ pub unsafe extern "C" fn switch_context(old_context: *mut Context, new_context: 
         "fxrstor [rsp]",
         // アラインメント前のRSPを復元
         "mov rsp, [rsp + 504]",
-        // RFLAGSを復元
+        // RFLAGSを復元（IFは保存時に強制セット済みなので、割り込み有効で復帰）
         "popfq",
         // callee-savedレジスタを復元（保存と逆順）
         "pop r15",
