@@ -7,6 +7,7 @@ use spin::Mutex as SpinMutex;
 
 use super::buffer::{DrawCommand, SharedBuffer};
 use super::region::Region;
+use super::shadow_buffer::ShadowBuffer;
 
 /// Compositorの設定
 pub struct CompositorConfig {
@@ -28,6 +29,8 @@ pub struct Compositor {
     config: CompositorConfig,
     /// 登録されたバッファのリスト
     buffers: Vec<SharedBuffer>,
+    /// シャドウフレームバッファ（バックバッファ）
+    shadow_buffer: ShadowBuffer,
 }
 
 impl Compositor {
@@ -36,9 +39,11 @@ impl Compositor {
     /// # Arguments
     /// * `config` - Compositorの設定
     pub fn new(config: CompositorConfig) -> Self {
+        let shadow_buffer = ShadowBuffer::new(config.fb_width, config.fb_height);
         Self {
             config,
             buffers: Vec::new(),
+            shadow_buffer,
         }
     }
 
@@ -61,7 +66,9 @@ impl Compositor {
     ///
     /// 全バッファをポーリングし、dirty=trueのバッファのみ描画します。
     /// try_lock()を使用して、ロック中のバッファはスキップします。
+    /// シャドウバッファに描画後、ハードウェアフレームバッファに一括転送します。
     pub fn compose_frame(&mut self) {
+        // 各Writerのコマンドをシャドウバッファにレンダリング
         for buffer in &self.buffers {
             // try_lockを使用して、ロック中のバッファはスキップ
             if let Some(mut buf) = buffer.try_lock() {
@@ -72,22 +79,30 @@ impl Compositor {
                 }
             }
         }
+
+        // シャドウバッファをハードウェアフレームバッファに転送
+        unsafe {
+            self.shadow_buffer.blit_to(self.config.fb_base);
+        }
     }
 
-    /// コマンドをフレームバッファに描画
+    /// コマンドをシャドウバッファに描画
     ///
     /// # Arguments
     /// * `region` - 描画領域
     /// * `commands` - 描画コマンドのスライス
     fn render_commands(&self, region: &Region, commands: &[DrawCommand]) {
+        let shadow_base = self.shadow_buffer.base_addr();
+        let shadow_width = self.shadow_buffer.width();
+
         for cmd in commands {
             match cmd {
                 DrawCommand::Clear { color } => {
                     // 領域全体をクリア
                     unsafe {
                         super::draw_rect(
-                            self.config.fb_base,
-                            self.config.fb_width,
+                            shadow_base,
+                            shadow_width,
                             region.x as usize,
                             region.y as usize,
                             region.width as usize,
@@ -102,8 +117,8 @@ impl Compositor {
                     let global_y = region.y + y;
                     unsafe {
                         super::draw_char(
-                            self.config.fb_base,
-                            self.config.fb_width,
+                            shadow_base,
+                            shadow_width,
                             global_x as usize,
                             global_y as usize,
                             *ch,
@@ -116,8 +131,8 @@ impl Compositor {
                     let global_y = region.y + y;
                     unsafe {
                         super::draw_string(
-                            self.config.fb_base,
-                            self.config.fb_width,
+                            shadow_base,
+                            shadow_width,
                             global_x as usize,
                             global_y as usize,
                             text,
@@ -136,8 +151,8 @@ impl Compositor {
                     let global_y = region.y + y;
                     unsafe {
                         super::draw_rect(
-                            self.config.fb_base,
-                            self.config.fb_width,
+                            shadow_base,
+                            shadow_width,
                             global_x as usize,
                             global_y as usize,
                             *width as usize,

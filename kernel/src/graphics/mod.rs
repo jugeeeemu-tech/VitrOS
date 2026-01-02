@@ -3,6 +3,7 @@ mod font;
 pub mod buffer;
 pub mod compositor;
 pub mod region;
+pub mod shadow_buffer;
 pub mod writer;
 
 pub use font::FONT_8X8;
