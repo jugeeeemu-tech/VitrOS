@@ -1,13 +1,14 @@
 //! タイマー管理モジュール
 //!
 //! Linuxの hrtimer/timerfd に似た、タイマーキューとコールバック機構を提供します。
-//! 割り込みハンドラでは期限切れタイマーの検出のみを行い、
-//! 実際のコールバック実行はメインループで行うことで割り込み無効時間を最小化します。
+//! 割り込みハンドラでは期限切れタイマーの検出とsoftirqフラグのセットのみを行い、
+//! 実際のコールバック実行は割り込み復帰時のsoftirq処理で行うことで
+//! 割り込み無効時間を最小化します（Linux風 Bottom Half）。
 
 use alloc::boxed::Box;
 use alloc::collections::{BinaryHeap, VecDeque};
 use core::cmp::Ordering;
-use core::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use lazy_static::lazy_static;
 use spin::Mutex;
 
@@ -19,6 +20,12 @@ static TIMER_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// タイマー周波数（Hz）
 static TIMER_FREQUENCY_HZ: AtomicU64 = AtomicU64::new(0);
+
+/// softirq（遅延処理）が保留中かどうかを示すフラグ
+static SOFTIRQ_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// softirq処理中かどうかを示すフラグ（再入防止）
+static IN_SOFTIRQ: AtomicBool = AtomicBool::new(false);
 
 /// タイマーコールバック型
 pub type TimerCallback = Box<dyn FnOnce() + Send + 'static>;
@@ -145,23 +152,73 @@ pub fn register_timer(delay_ticks: u64, callback: TimerCallback) -> u64 {
 /// 期限切れタイマーを検出してペンディングキューに移動（割り込みハンドラから呼ばれる）
 ///
 /// この関数は割り込みコンテキストで実行されるため、最小限の処理のみを行います。
-/// 実際のコールバック実行は process_pending_timers() で行われます。
+/// 実際のコールバック実行は do_softirq() -> process_pending_timers() で行われます。
 pub fn check_timers() {
     let current = current_tick();
     let mut queue = TIMER_QUEUE.lock();
     let mut pending = PENDING_QUEUE.lock();
+    let mut has_pending = false;
 
     // 期限切れのタイマーをペンディングキューに移動
     while let Some(timer) = queue.peek() {
         if timer.expires_at <= current {
             if let Some(timer) = queue.pop() {
                 pending.push_back(timer);
+                has_pending = true;
             }
         } else {
             // まだ期限切れではない
             break;
         }
     }
+
+    // 期限切れタイマーがあればsoftirqをスケジュール
+    if has_pending {
+        raise_softirq();
+    }
+}
+
+/// softirqをスケジュール（割り込みハンドラから呼ばれる）
+///
+/// 期限切れタイマーがあることを示すフラグをセットします。
+/// 実際の処理は割り込み復帰時の do_softirq() で行われます。
+#[inline]
+pub fn raise_softirq() {
+    SOFTIRQ_PENDING.store(true, AtomicOrdering::Release);
+}
+
+/// softirqが保留中かどうかを確認
+#[inline]
+pub fn softirq_pending() -> bool {
+    SOFTIRQ_PENDING.load(AtomicOrdering::Acquire)
+}
+
+/// softirq処理を実行（割り込み復帰時に呼ばれる）
+///
+/// Linux風のbottom half処理。割り込み有効状態で呼ばれる必要があります。
+/// 再入は自動的に防止されます。
+///
+/// # Design
+/// - 割り込みハンドラで check_timers() がペンディングキューにタイマーを移動
+/// - 割り込み復帰時にこの関数が呼ばれ、コールバックを実行
+/// - 処理中に新しいタイマーが期限切れになっても、whileループで処理される
+pub fn do_softirq() {
+    // 再入チェック: 既にsoftirq処理中なら何もしない
+    // これにより、do_softirq()実行中にタイマー割り込みが発生しても
+    // 再度do_softirq()が呼ばれることを防ぐ
+    if IN_SOFTIRQ.swap(true, AtomicOrdering::AcqRel) {
+        return;
+    }
+
+    // softirqフラグをクリアして処理開始
+    // 処理中に新しいタイマーが期限切れになった場合、
+    // check_timers()がフラグを再セットするのでループで対応
+    while SOFTIRQ_PENDING.swap(false, AtomicOrdering::AcqRel) {
+        process_pending_timers();
+    }
+
+    // 再入フラグをクリア
+    IN_SOFTIRQ.store(false, AtomicOrdering::Release);
 }
 
 /// ペンディングキューのタイマーを処理（メインループから呼ばれる）

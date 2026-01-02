@@ -687,18 +687,36 @@ pub fn set_need_resched() {
     NEED_RESCHED.store(true, Ordering::Release);
 }
 
-/// 割り込み復帰時にスケジューリングをチェック
+/// 割り込み復帰時にスケジューリングとsoftirq処理をチェック
 ///
-/// need_reschedフラグがセットされていれば、スケジューラを呼び出します。
+/// 1. need_reschedフラグがセットされていれば、スケジューラを呼び出します。
+/// 2. softirqフラグがセットされていれば、タイマーコールバックを処理します。
+///
 /// この関数は割り込みハンドラの復帰処理から呼び出されます。
 ///
-/// 注意: schedule()は割り込み無効の状態で実行されます。
-/// 割り込みはコンテキストスイッチ後に再有効化されます。
+/// # Design (Linux風 softirq)
+/// - schedule()は割り込み無効の状態で実行されます
+/// - schedule()後、switch_context()でIFフラグが強制セットされ割り込みが有効になります
+/// - softirq処理は割り込み有効状態で実行され、コールバック内でブロック可能です
+/// - 処理中に新たな割り込みが発生しても、do_softirq()の再入は防止されます
 pub fn check_resched_on_interrupt_exit() {
+    // 1. スケジューリングチェック
     if NEED_RESCHED.swap(false, Ordering::Acquire) {
         // 割り込みは無効のままschedule()を呼び出す
         // これにより、schedule()実行中に再度タイマー割り込みが入ることを防ぐ
         schedule();
+    }
+
+    // 2. softirq処理（タイマーコールバック実行）
+    // - schedule()が呼ばれた場合: switch_context()でIF強制セット済み
+    // - schedule()が呼ばれなかった場合: まだ割り込み無効
+    // どちらの場合も sti で有効化してから処理（既に有効でも無害）
+    if crate::timer::softirq_pending() {
+        unsafe {
+            core::arch::asm!("sti", options(nomem, nostack));
+        }
+        crate::timer::do_softirq();
+        // iretqで元のRFLAGSが復元されるのでcliは不要
     }
 }
 
