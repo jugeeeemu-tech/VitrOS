@@ -121,17 +121,20 @@ impl ShadowBuffer {
     /// ハードウェアフレームバッファに転送（blit）
     ///
     /// dirty rectがある場合はその領域のみ転送し、
-    /// なければ何も転送しません。
+    /// なければ何も転送しません。転送後、dirty rectはクリアされます。
+    ///
+    /// # Returns
+    /// 転送が行われた場合は`true`、dirty rectがなく転送されなかった場合は`false`
     ///
     /// # Safety
     /// - `hw_fb_base`は有効なフレームバッファアドレスであること
     /// - `hw_fb_base`は4バイト境界にアライメントされていること
     /// - 転送先には`self.buffer.len() * 4`バイト以上の書き込み可能な領域があること
     /// - 呼び出し元は転送先メモリへの排他的アクセス権を持つこと
-    pub unsafe fn blit_to(&mut self, hw_fb_base: u64) {
+    pub unsafe fn blit_to(&mut self, hw_fb_base: u64) -> bool {
         let dirty = match self.take_dirty_rect() {
             Some(r) => r,
-            None => return, // 変更なし、転送不要
+            None => return false, // 変更なし、転送不要
         };
 
         let dst_base = hw_fb_base as *mut u32;
@@ -150,5 +153,7 @@ impl ShadowBuffer {
                 core::ptr::copy_nonoverlapping(src, dst, count);
             }
         }
+
+        true // 転送が行われた
     }
 }

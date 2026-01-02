@@ -20,6 +20,7 @@ use super::region::Region;
 use super::shadow_buffer::ShadowBuffer;
 
 /// Compositorの設定
+#[derive(Clone)]
 pub struct CompositorConfig {
     /// フレームバッファのベースアドレス
     pub fb_base: u64,
@@ -33,14 +34,14 @@ pub struct CompositorConfig {
 
 /// Compositor（シングルトン）
 ///
-/// 全てのWriterバッファをポーリングして、フレームバッファに合成します。
+/// 全てのWriterバッファを管理します。
+/// シャドウバッファはcompositor_task()内でローカルに所有し、
+/// トリプルバッファリングを実現します。
 pub struct Compositor {
     /// 設定
     config: CompositorConfig,
-    /// 登録されたバッファのリスト
-    buffers: Vec<SharedBuffer>,
-    /// シャドウフレームバッファ（バックバッファ）
-    shadow_buffer: ShadowBuffer,
+    /// 登録されたバッファのリスト（Copy-on-Write方式でスナップショット取得可能）
+    buffers: Arc<Vec<SharedBuffer>>,
 }
 
 impl Compositor {
@@ -49,15 +50,16 @@ impl Compositor {
     /// # Arguments
     /// * `config` - Compositorの設定
     pub fn new(config: CompositorConfig) -> Self {
-        let shadow_buffer = ShadowBuffer::new(config.fb_width, config.fb_height);
         Self {
             config,
-            buffers: Vec::new(),
-            shadow_buffer,
+            buffers: Arc::new(Vec::new()),
         }
     }
 
     /// 新しいWriterを登録し、そのバッファへの参照を返す
+    ///
+    /// Copy-on-Write方式: 新しいVecを作成してバッファを追加し、Arcを置き換えます。
+    /// これにより、既存のスナップショットは影響を受けません。
     ///
     /// # Arguments
     /// * `region` - Writer用の描画領域
@@ -68,128 +70,115 @@ impl Compositor {
         let buffer = Arc::new(crate::sync::BlockingMutex::new(
             super::buffer::WriterBuffer::new(region),
         ));
-        self.buffers.push(Arc::clone(&buffer));
+
+        // Copy-on-Write: 新しいVecを作成して追加
+        let mut new_buffers = Vec::clone(&self.buffers);
+        new_buffers.push(Arc::clone(&buffer));
+        self.buffers = Arc::new(new_buffers);
+
         buffer
     }
 
-    /// 1フレームを合成
+    /// バッファリストのスナップショットを取得
     ///
-    /// 全バッファをポーリングし、dirty=trueのバッファのみ描画します。
-    /// try_lock()を使用して、ロック中のバッファはスキップします。
-    /// シャドウバッファに描画後、ハードウェアフレームバッファに一括転送します。
-    pub fn compose_frame(&mut self) {
-        // まず全バッファからコマンドを収集（借用の分離）
-        let mut collected: Vec<(Region, Vec<DrawCommand>)> = Vec::new();
-        for buffer in &self.buffers {
-            // try_lockを使用して、ロック中のバッファはスキップ
-            if let Some(mut buf) = buffer.try_lock() {
-                if buf.is_dirty() {
-                    let region = buf.region();
-                    let commands = buf.take_commands();
-                    collected.push((region, commands));
-                }
-            }
-        }
-
-        // 収集したコマンドをシャドウバッファにレンダリング
-        for (region, commands) in &collected {
-            self.render_commands(region, commands);
-        }
-
-        // シャドウバッファをハードウェアフレームバッファに転送
-        unsafe {
-            self.shadow_buffer.blit_to(self.config.fb_base);
-        }
-
-        // フレームカウントをインクリメント
-        FRAME_COUNT.fetch_add(1, Ordering::Relaxed);
+    /// Arcのクローンを返すため、非常に高速です。
+    /// スナップショット取得後にregister_writer()が呼ばれても、
+    /// スナップショットは影響を受けません（Copy-on-Write）。
+    pub fn get_buffers_snapshot(&self) -> Arc<Vec<SharedBuffer>> {
+        Arc::clone(&self.buffers)
     }
 
-    /// コマンドをシャドウバッファに描画
-    ///
-    /// # Arguments
-    /// * `region` - 描画領域
-    /// * `commands` - 描画コマンドのスライス
-    fn render_commands(&mut self, region: &Region, commands: &[DrawCommand]) {
-        let shadow_base = self.shadow_buffer.base_addr();
-        let shadow_width = self.shadow_buffer.width();
+    /// フレームバッファ設定を取得
+    pub fn get_config(&self) -> &CompositorConfig {
+        &self.config
+    }
+}
 
-        for cmd in commands {
-            match cmd {
-                DrawCommand::Clear { color } => {
-                    // 領域全体をクリア
-                    unsafe {
-                        super::draw_rect(
-                            shadow_base,
-                            shadow_width,
-                            region.x as usize,
-                            region.y as usize,
-                            region.width as usize,
-                            region.height as usize,
-                            *color,
-                        );
-                    }
-                    self.shadow_buffer.mark_dirty(region);
+/// コマンドをシャドウバッファに描画（Compositorから独立した関数）
+///
+/// compositor_task()内でローカルに所有するシャドウバッファに描画します。
+/// これにより、割り込み有効状態で描画処理を実行できます。
+///
+/// # Arguments
+/// * `shadow_buffer` - 描画先のシャドウバッファ
+/// * `region` - 描画領域
+/// * `commands` - 描画コマンドのスライス
+fn render_commands_to(shadow_buffer: &mut ShadowBuffer, region: &Region, commands: &[DrawCommand]) {
+    let shadow_base = shadow_buffer.base_addr();
+    let shadow_width = shadow_buffer.width();
+
+    for cmd in commands {
+        match cmd {
+            DrawCommand::Clear { color } => {
+                // 領域全体をクリア
+                unsafe {
+                    super::draw_rect(
+                        shadow_base,
+                        shadow_width,
+                        region.x as usize,
+                        region.y as usize,
+                        region.width as usize,
+                        region.height as usize,
+                        *color,
+                    );
                 }
-                DrawCommand::DrawChar { x, y, ch, color } => {
-                    // ローカル座標をグローバル座標に変換
-                    let global_x = region.x + x;
-                    let global_y = region.y + y;
-                    unsafe {
-                        super::draw_char(
-                            shadow_base,
-                            shadow_width,
-                            global_x as usize,
-                            global_y as usize,
-                            *ch,
-                            *color,
-                        );
-                    }
-                    // 8x8文字のdirty rect
-                    self.shadow_buffer
-                        .mark_dirty(&Region::new(global_x, global_y, 8, 8));
+                shadow_buffer.mark_dirty(region);
+            }
+            DrawCommand::DrawChar { x, y, ch, color } => {
+                // ローカル座標をグローバル座標に変換
+                let global_x = region.x + x;
+                let global_y = region.y + y;
+                unsafe {
+                    super::draw_char(
+                        shadow_base,
+                        shadow_width,
+                        global_x as usize,
+                        global_y as usize,
+                        *ch,
+                        *color,
+                    );
                 }
-                DrawCommand::DrawString { x, y, text, color } => {
-                    let global_x = region.x + x;
-                    let global_y = region.y + y;
-                    unsafe {
-                        super::draw_string(
-                            shadow_base,
-                            shadow_width,
-                            global_x as usize,
-                            global_y as usize,
-                            text,
-                            *color,
-                        );
-                    }
-                    // 文字列全体のdirty rect（幅 = 文字数 * 8）
-                    let text_width = (text.len() as u32) * 8;
-                    self.shadow_buffer
-                        .mark_dirty(&Region::new(global_x, global_y, text_width, 8));
+                // 8x8文字のdirty rect
+                shadow_buffer.mark_dirty(&Region::new(global_x, global_y, 8, 8));
+            }
+            DrawCommand::DrawString { x, y, text, color } => {
+                let global_x = region.x + x;
+                let global_y = region.y + y;
+                unsafe {
+                    super::draw_string(
+                        shadow_base,
+                        shadow_width,
+                        global_x as usize,
+                        global_y as usize,
+                        text,
+                        *color,
+                    );
                 }
-                DrawCommand::FillRect {
-                    x,
-                    y,
-                    width,
-                    height,
-                    color,
-                } => {
-                    let global_x = region.x + x;
-                    let global_y = region.y + y;
-                    unsafe {
-                        super::draw_rect(
-                            shadow_base,
-                            shadow_width,
-                            global_x as usize,
-                            global_y as usize,
-                            *width as usize,
-                            *height as usize,
-                            *color,
-                        );
-                    }
-                    self.shadow_buffer
-                        .mark_dirty(&Region::new(global_x, global_y, *width, *height));
+                // 文字列全体のdirty rect（幅 = 文字数 * 8）
+                let text_width = (text.len() as u32) * 8;
+                shadow_buffer.mark_dirty(&Region::new(global_x, global_y, text_width, 8));
+            }
+            DrawCommand::FillRect {
+                x,
+                y,
+                width,
+                height,
+                color,
+            } => {
+                let global_x = region.x + x;
+                let global_y = region.y + y;
+                unsafe {
+                    super::draw_rect(
+                        shadow_base,
+                        shadow_width,
+                        global_x as usize,
+                        global_y as usize,
+                        *width as usize,
+                        *height as usize,
+                        *color,
+                    );
                 }
+                shadow_buffer.mark_dirty(&Region::new(global_x, global_y, *width, *height));
             }
         }
     }
@@ -275,13 +264,55 @@ pub fn register_writer(region: Region) -> Option<SharedBuffer> {
 
 /// Compositorタスクのエントリポイント
 ///
-/// 無限ループでフレームを合成し続けます。
+/// ダブルバッファリング方式でフレームを合成します。
+/// - HWフレームバッファ: モニター表示中
+/// - シャドウバッファ: レンダリング先 → HWへ転送
+///
+/// 割り込み無効時間を最小化（スナップショット取得時のみ）し、
+/// レンダリングとblitは割り込み有効状態で実行します。
 pub extern "C" fn compositor_task() -> ! {
-    crate::info!("[Compositor] Started");
+    crate::info!("[Compositor] Started (double buffering)");
+
+    // 初期化: 設定を取得（短いクリティカルセクション）
+    let config = {
+        let flags = unsafe {
+            let flags: u64;
+            core::arch::asm!(
+                "pushfq",
+                "pop {}",
+                "cli",
+                out(reg) flags,
+                options(nomem, nostack)
+            );
+            flags
+        };
+
+        let cfg = {
+            let comp = COMPOSITOR.lock();
+            comp.as_ref().map(|c| c.get_config().clone())
+        };
+
+        unsafe {
+            if flags & 0x200 != 0 {
+                core::arch::asm!("sti", options(nomem, nostack));
+            }
+        }
+
+        cfg.expect("Compositor not initialized")
+    };
+
+    // シャドウバッファをタスクローカルで所有（ダブルバッファリング）
+    let mut shadow_buffer = ShadowBuffer::new(config.fb_width, config.fb_height);
+
+    crate::info!(
+        "[Compositor] Shadow buffer initialized: {}x{}",
+        config.fb_width,
+        config.fb_height
+    );
 
     loop {
-        // フレームを合成（割り込み無効でロック取得）
-        {
+        // Phase 1: バッファリストのスナップショット取得（割り込み無効、数μs）
+        let buffers_snapshot = {
             let flags = unsafe {
                 let flags: u64;
                 core::arch::asm!(
@@ -294,20 +325,48 @@ pub extern "C" fn compositor_task() -> ! {
                 flags
             };
 
-            {
-                let mut comp = COMPOSITOR.lock();
-                if let Some(compositor) = comp.as_mut() {
-                    compositor.compose_frame();
-                }
-            }
+            let snapshot = {
+                let comp = COMPOSITOR.lock();
+                comp.as_ref().map(|c| c.get_buffers_snapshot())
+            };
 
-            // 割り込みを元の状態に復元
             unsafe {
                 if flags & 0x200 != 0 {
                     core::arch::asm!("sti", options(nomem, nostack));
                 }
             }
+
+            match snapshot {
+                Some(s) => s,
+                None => {
+                    crate::sched::sleep_ms(16);
+                    continue;
+                }
+            }
+        };
+
+        // Phase 2: コマンド収集（割り込み有効）
+        let mut collected: Vec<(Region, Vec<DrawCommand>)> = Vec::new();
+        for buffer in buffers_snapshot.iter() {
+            if let Some(mut buf) = buffer.try_lock() {
+                if buf.is_dirty() {
+                    let region = buf.region();
+                    let commands = buf.take_commands();
+                    collected.push((region, commands));
+                }
+            }
         }
+
+        // Phase 3: シャドウバッファにレンダリング（割り込み有効）
+        for (region, commands) in &collected {
+            render_commands_to(&mut shadow_buffer, region, commands);
+        }
+
+        // Phase 4: シャドウバッファをハードウェアFBに転送（割り込み有効）
+        // dirty_rectがある場合のみ転送され、転送後にdirty_rectはクリアされる
+        let blitted = unsafe { shadow_buffer.blit_to(config.fb_base) };
+
+        FRAME_COUNT.fetch_add(1, Ordering::Relaxed);
 
         // 次のリフレッシュまで待機（約60fps = 16ms間隔）
         crate::sched::sleep_ms(16);

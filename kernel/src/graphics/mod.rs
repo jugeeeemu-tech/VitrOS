@@ -81,23 +81,32 @@ pub unsafe fn draw_rect(
     h: usize,
     color: u32,
 ) {
-    let fb = fb_base as *mut u32;
-    for dy in 0..h {
-        for dx in 0..w {
-            // オーバーフローと境界チェック
-            if let (Some(pixel_x), Some(pixel_y)) = (x.checked_add(dx), y.checked_add(dy))
-                && pixel_x < width as usize
-            {
-                let offset = pixel_y
-                    .checked_mul(width as usize)
-                    .and_then(|y_offset| y_offset.checked_add(pixel_x));
+    // 空の矩形は何もしない
+    if w == 0 || h == 0 {
+        return;
+    }
 
-                if let Some(off) = offset {
-                    unsafe {
-                        *fb.add(off) = color;
-                    }
-                }
-            }
+    let fb = fb_base as *mut u32;
+    let stride = width as usize;
+
+    // 描画範囲を画面境界でクリップ
+    let x_end = x.saturating_add(w).min(stride);
+    if x >= x_end {
+        return; // 完全に画面外
+    }
+    let clipped_w = x_end - x;
+
+    // 行単位で塗りつぶし（高速化）
+    for dy in 0..h {
+        let pixel_y = y.saturating_add(dy);
+        // Y座標のオーバーフローチェックは省略（通常の画面サイズでは発生しない）
+
+        let row_start = pixel_y * stride + x;
+        // SAFETY: 呼び出し側が描画範囲の有効性を保証
+        unsafe {
+            let row_ptr = fb.add(row_start);
+            let row_slice = core::slice::from_raw_parts_mut(row_ptr, clipped_w);
+            row_slice.fill(color);
         }
     }
 }
