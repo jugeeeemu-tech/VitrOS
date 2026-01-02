@@ -28,7 +28,11 @@ impl core::fmt::Display for TaskError {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
         match self {
             TaskError::InvalidPriority => {
-                write!(f, "Invalid task priority (must be >= {})", priority::MIN)
+                write!(
+                    f,
+                    "Invalid rt_priority for Realtime task (must be >= {})",
+                    rt_priority::MIN
+                )
             }
             TaskError::StackAllocationFailed => write!(f, "Failed to allocate task stack"),
             TaskError::InvalidStackAddress => write!(f, "Invalid stack address"),
@@ -56,18 +60,36 @@ impl TaskId {
     }
 }
 
-/// タスク優先度の定数
-pub mod priority {
-    /// アイドルタスクの優先度（最低）
-    pub const IDLE: u8 = 0;
-    /// 通常タスクの最低優先度
+/// Nice値の型（Linuxスタイル）
+///
+/// -20（最高優先度）〜 +19（最低優先度）の範囲で、
+/// Normalクラスのタスクの相対的な優先度を表現します。
+/// nice値が低いほど、より多くのCPU時間が割り当てられます。
+pub type Nice = i8;
+
+/// Nice値の定数
+pub mod nice {
+    /// 最高優先度（通常はroot権限が必要）
+    pub const MIN: i8 = -20;
+    /// デフォルト優先度
+    pub const DEFAULT: i8 = 0;
+    /// 最低優先度
+    pub const MAX: i8 = 19;
+}
+
+/// Realtimeクラス用の優先度型
+///
+/// 1（最低）〜 99（最高）の範囲で、Realtimeクラスのタスクの優先度を表現します。
+pub type RtPriority = u8;
+
+/// Realtime優先度の定数
+pub mod rt_priority {
+    /// 最低優先度
     pub const MIN: u8 = 1;
     /// デフォルト優先度
-    pub const DEFAULT: u8 = 10;
+    pub const DEFAULT: u8 = 50;
     /// 最高優先度
-    pub const MAX: u8 = 255;
-    /// リアルタイムクラスの下限（この値以上はリアルタイムクラス）
-    pub const RT_MIN: u8 = 100;
+    pub const MAX: u8 = 99;
 }
 
 /// スケジューリングクラス
@@ -87,47 +109,36 @@ pub enum SchedulingClass {
     Idle = 0,
 }
 
-/// 優先度からスケジューリングクラスを判定
+/// Nice値から重みを計算（Linuxスタイル）
+///
+/// nice値が低い（優先度が高い）タスクほど大きな重みを持ち、vruntimeの増加が遅くなります。
+/// - nice 0（デフォルト）の重みは1024
+/// - nice値が1下がる（優先度上昇）ごとに約1.25倍の重みを持つ
+/// - nice値が1上がる（優先度低下）ごとに約0.8倍の重みになる
 ///
 /// # Arguments
-/// * `priority` - タスクの優先度 (0-255)
-///
-/// # Returns
-/// 対応するスケジューリングクラス
-pub fn priority_to_class(priority: u8) -> SchedulingClass {
-    if priority == priority::IDLE {
-        SchedulingClass::Idle
-    } else if priority >= priority::RT_MIN {
-        SchedulingClass::Realtime
-    } else {
-        SchedulingClass::Normal
-    }
-}
-
-/// 優先度から重みを計算
-///
-/// 優先度が高いタスクほど大きな重みを持ち、vruntimeの増加が遅くなります。
-/// - 基準優先度（DEFAULT=10）の重みは1024
-/// - 優先度が1上がるごとに約1.25倍の重みを持つ
-///
-/// # Arguments
-/// * `priority` - タスクの優先度（0-255）
+/// * `nice` - Nice値（-20〜+19）
 ///
 /// # Returns
 /// スケジューリング用の重み
-pub fn priority_to_weight(priority: u8) -> u32 {
+///
+/// # Note
+/// 範囲外のnice値はクランプされます。
+pub fn nice_to_weight(nice: Nice) -> u32 {
+    // Linux kernel の sched_prio_to_weight テーブルと同等
+    // インデックス0 = nice -20（最高優先度）、インデックス39 = nice +19（最低優先度）
     const PRIO_TO_WEIGHT: [u32; 40] = [
         88761, 71755, 56483, 46273, 36291, 29154, 23254, 18705, 14949, 11916, 9548, 7620, 6100,
         4904, 3906, 3121, 2501, 1991, 1586, 1277, 1024, 820, 655, 526, 423, 335, 272, 215, 172,
         137, 110, 87, 70, 56, 45, 36, 29, 23, 18, 15,
     ];
 
-    // 0-255 の優先度を 0-39 のインデックスに変換
-    // priority 0 (低) -> index 39 (重み15)
-    // priority 255 (高) -> index 0 (重み88761)
-
-    // 単純に範囲を圧縮する
-    let index = 39 - (priority as usize * 40 / 256).min(39);
+    // nice値を0-39のインデックスに変換（圧縮なし、直接対応）
+    // nice -20 -> index 0 (重み88761)
+    // nice 0   -> index 20 (重み1024)
+    // nice +19 -> index 39 (重み15)
+    let clamped = nice.clamp(nice::MIN, nice::MAX);
+    let index = (clamped - nice::MIN) as usize; // -20 -> 0, +19 -> 39
 
     PRIO_TO_WEIGHT[index]
 }
@@ -179,11 +190,15 @@ pub struct Task {
     id: TaskId,
     /// タスク名（デバッグ用）
     name: &'static str,
-    /// タスク優先度（0-255、数値が大きいほど優先度が高い）
-    priority: u8,
     /// スケジューリングクラス（Realtime, Normal, Idle）
     sched_class: SchedulingClass,
-    /// スケジューリング用の重み（優先度から計算、Normalクラスで使用）
+    /// Normalクラス用のnice値（-20〜+19）
+    /// nice値が低いほど、より多くのCPU時間が割り当てられる
+    nice: Nice,
+    /// Realtimeクラス用の優先度（1-99）
+    /// rt_priorityが高いほど、優先的に実行される
+    rt_priority: RtPriority,
+    /// スケジューリング用の重み（nice値から計算、Normalクラスで使用）
     /// 値が大きいほど、vruntimeの増加が遅くなり、より頻繁に実行される
     weight: u32,
     /// 仮想実行時間（CFS風スケジューリング、Normalクラスで使用）
@@ -198,24 +213,66 @@ pub struct Task {
 }
 
 impl Task {
-    /// 新しいタスクを作成
+    /// Normalクラスのタスクを作成
     ///
     /// # Arguments
     /// * `name` - タスク名
-    /// * `priority` - タスク優先度（priority::MIN以上、priority::MAX以下）
+    /// * `nice` - Nice値（-20〜+19、小さいほど高優先度）
     /// * `entry_point` - エントリポイント関数のアドレス
     ///
     /// # Errors
-    /// * `TaskError::InvalidPriority` - 優先度がpriority::MINより小さい場合
     /// * `TaskError::StackAllocationFailed` - スタック割り当てに失敗した場合
     /// * `TaskError::ContextInitFailed` - コンテキスト初期化に失敗した場合
+    ///
+    /// # Note
+    /// nice値は自動的に有効範囲（-20〜+19）にクランプされます。
     pub fn new(
         name: &'static str,
-        priority: u8,
+        nice: Nice,
         entry_point: extern "C" fn() -> !,
     ) -> Result<Self, TaskError> {
-        // 優先度の検証：アイドルタスク以下の優先度は許可しない
-        if priority < priority::MIN {
+        // スタックをヒープに割り当て
+        let stack = Box::new(TaskStack::new());
+        let stack_top = stack.top();
+
+        let context = Context::new(entry_point as u64, stack_top)?;
+
+        // nice値から重みを計算
+        let clamped_nice = nice.clamp(nice::MIN, nice::MAX);
+        let weight = nice_to_weight(clamped_nice);
+
+        Ok(Self {
+            id: TaskId::new(),
+            name,
+            sched_class: SchedulingClass::Normal,
+            nice: clamped_nice,
+            rt_priority: 0, // Normalクラスでは使用しない
+            weight,
+            vruntime: 0, // 初期値は0
+            context,
+            state: TaskState::Ready,
+            stack,
+        })
+    }
+
+    /// Realtimeクラスのタスクを作成
+    ///
+    /// # Arguments
+    /// * `name` - タスク名
+    /// * `rt_priority` - Realtime優先度（1-99、大きいほど高優先度）
+    /// * `entry_point` - エントリポイント関数のアドレス
+    ///
+    /// # Errors
+    /// * `TaskError::InvalidPriority` - rt_priorityが0の場合
+    /// * `TaskError::StackAllocationFailed` - スタック割り当てに失敗した場合
+    /// * `TaskError::ContextInitFailed` - コンテキスト初期化に失敗した場合
+    pub fn new_realtime(
+        name: &'static str,
+        rt_priority: RtPriority,
+        entry_point: extern "C" fn() -> !,
+    ) -> Result<Self, TaskError> {
+        // rt_priority 0は無効（Normalクラスと区別するため）
+        if rt_priority < rt_priority::MIN {
             return Err(TaskError::InvalidPriority);
         }
 
@@ -225,24 +282,22 @@ impl Task {
 
         let context = Context::new(entry_point as u64, stack_top)?;
 
-        // 優先度から重みとスケジューリングクラスを計算
-        let weight = priority_to_weight(priority);
-        let sched_class = priority_to_class(priority);
-
+        // Realtimeクラスではweightとvruntimeは使用しない
         Ok(Self {
             id: TaskId::new(),
             name,
-            priority,
-            sched_class,
-            weight,
-            vruntime: 0, // 初期値は0
+            sched_class: SchedulingClass::Realtime,
+            nice: 0, // Realtimeクラスでは使用しない
+            rt_priority: rt_priority.min(rt_priority::MAX),
+            weight: 0,   // Realtimeクラスでは使用しない
+            vruntime: 0, // Realtimeクラスでは使用しない
             context,
             state: TaskState::Ready,
             stack,
         })
     }
 
-    /// アイドルタスク専用の作成関数（優先度チェックをスキップ）
+    /// アイドルタスク専用の作成関数
     ///
     /// # Arguments
     /// * `name` - タスク名
@@ -261,16 +316,14 @@ impl Task {
 
         let context = Context::new(entry_point as u64, stack_top)?;
 
-        // アイドルタスクの重みを計算
-        let weight = priority_to_weight(priority::IDLE);
-
         Ok(Self {
             id: TaskId::new(),
             name,
-            priority: priority::IDLE,
-            sched_class: SchedulingClass::Idle, // アイドルタスクは常にIdleクラス
-            weight,
-            vruntime: 0, // 初期値は0
+            sched_class: SchedulingClass::Idle,
+            nice: nice::MAX, // Idleは最低優先度相当
+            rt_priority: 0,
+            weight: nice_to_weight(nice::MAX), // 参考値
+            vruntime: 0,
             context,
             state: TaskState::Ready,
             stack,
@@ -287,9 +340,14 @@ impl Task {
         self.name
     }
 
-    /// タスク優先度を取得
-    pub fn priority(&self) -> u8 {
-        self.priority
+    /// Nice値を取得（Normalクラス用）
+    pub fn nice(&self) -> Nice {
+        self.nice
+    }
+
+    /// Realtime優先度を取得（Realtimeクラス用）
+    pub fn rt_priority(&self) -> RtPriority {
+        self.rt_priority
     }
 
     /// スケジューリングクラスを取得

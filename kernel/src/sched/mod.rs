@@ -14,12 +14,15 @@ mod scheduler;
 mod task;
 
 // 公開API: タスク関連
+pub use task::Nice;
+pub use task::RtPriority;
 pub use task::SchedulingClass;
 pub use task::Task;
 pub use task::TaskError;
 pub use task::TaskId;
 pub use task::TaskState;
-pub use task::priority;
+pub use task::nice;
+pub use task::rt_priority;
 
 // 公開API: コンテキスト関連
 pub use context::Context;

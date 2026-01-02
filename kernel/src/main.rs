@@ -330,39 +330,39 @@ extern "C" fn kernel_main_inner(boot_info_phys_addr: u64) -> ! {
         // =================================================================
         info!("Creating tasks for preemptive multitasking...");
 
-        // Compositorタスク（優先度：最高）
+        // Compositorタスク（Realtimeクラス、最高優先度）
         let compositor = Box::new(
-            task::Task::new(
+            task::Task::new_realtime(
                 "Compositor",
-                task::priority::MAX,
+                task::rt_priority::MAX,
                 graphics::compositor::compositor_task,
             )
             .expect("Failed to create Compositor task"),
         );
         task::add_task(*compositor);
 
-        // アイドルタスク（優先度：最低）
+        // アイドルタスク（Idleクラス）
         let idle =
             Box::new(task::Task::new_idle("Idle", idle_task).expect("Failed to create idle task"));
         task::add_task(*idle);
 
-        // ワーカータスク1（優先度：高）
+        // ワーカータスク1（Normalクラス、nice -5 = やや高い優先度）
         let t1 = Box::new(
-            task::Task::new("Task1", task::priority::DEFAULT + 10, task1)
+            task::Task::new("Task1", task::nice::DEFAULT - 5, task1)
                 .expect("Failed to create Task1"),
         );
         task::add_task(*t1);
 
-        // ワーカータスク2（優先度：中）
+        // ワーカータスク2（Normalクラス、nice 0 = 標準優先度）
         let t2 = Box::new(
-            task::Task::new("Task2", task::priority::DEFAULT, task2)
+            task::Task::new("Task2", task::nice::DEFAULT, task2)
                 .expect("Failed to create Task2"),
         );
         task::add_task(*t2);
 
-        // ワーカータスク3（優先度：低）
+        // ワーカータスク3（Normalクラス、nice +19 = 最低優先度）
         let t3 = Box::new(
-            task::Task::new("Task3", task::priority::MIN, task3).expect("Failed to create Task3"),
+            task::Task::new("Task3", task::nice::MAX, task3).expect("Failed to create Task3"),
         );
         task::add_task(*t3);
 
@@ -374,7 +374,7 @@ extern "C" fn kernel_main_inner(boot_info_phys_addr: u64) -> ! {
         // 初期Contextの値（rip=task_wrapper, rdi=idle_task）は上書きされる
         // 保存されるripは「schedule()から戻るアドレス」になる
         let kernel_main = Box::new(
-            task::Task::new("KernelMain", task::priority::DEFAULT, idle_task)
+            task::Task::new("KernelMain", task::nice::DEFAULT, idle_task)
                 .expect("Failed to create KernelMain task"),
         );
         task::set_current_task(*kernel_main);

@@ -13,7 +13,7 @@ use crate::io::without_interrupts;
 
 use super::blocking::BLOCKED_TASKS;
 use super::context::{Context, switch_context};
-use super::task::{SchedulingClass, Task, TaskError, TaskId, TaskState, priority};
+use super::task::{SchedulingClass, Task, TaskError, TaskId, TaskState, rt_priority};
 
 /// スケジューリングが必要かどうかを示すフラグ
 /// 割り込みハンドラがこのフラグをセットし、割り込み復帰時にチェックされる
@@ -66,7 +66,7 @@ pub fn init() {
 fn enqueue_task_single(task: Box<Task>) {
     match task.sched_class() {
         SchedulingClass::Realtime => {
-            let key = (priority::MAX - task.priority(), task.id().as_u64());
+            let key = (rt_priority::MAX - task.rt_priority(), task.id().as_u64());
             let mut rt_queue = RT_QUEUE.lock();
             rt_queue.insert(key, task);
         }
@@ -87,7 +87,7 @@ pub(super) fn enqueue_to_appropriate_queue(task: Box<Task>, sched_class: Schedul
     match sched_class {
         SchedulingClass::Realtime => {
             let mut rt = RT_QUEUE.lock();
-            let key = (255 - task.priority(), task.id().as_u64());
+            let key = (rt_priority::MAX - task.rt_priority(), task.id().as_u64());
             rt.insert(key, task);
         }
         SchedulingClass::Normal => {
@@ -126,7 +126,7 @@ pub fn try_add_task(task: Task) -> Result<(), TaskError> {
         match sched_class {
             SchedulingClass::Realtime => {
                 let mut rt = RT_QUEUE.lock();
-                let key = (255 - boxed_task.priority(), task_id);
+                let key = (rt_priority::MAX - boxed_task.rt_priority(), task_id);
                 rt.insert(key, boxed_task);
             }
             SchedulingClass::Normal => {
