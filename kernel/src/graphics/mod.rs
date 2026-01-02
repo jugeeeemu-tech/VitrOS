@@ -1,6 +1,13 @@
 mod font;
 
+pub mod buffer;
+pub mod compositor;
+pub mod region;
+pub mod writer;
+
 pub use font::FONT_8X8;
+pub use region::Region;
+pub use writer::TaskWriter;
 
 // フレームバッファに文字を描画
 //
