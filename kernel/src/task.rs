@@ -4,6 +4,7 @@
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
+use alloc::collections::BTreeSet;
 use alloc::collections::VecDeque;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use lazy_static::lazy_static;
@@ -540,6 +541,13 @@ lazy_static! {
     /// ブロック中のタスク (TaskId -> Task)
     /// ブロッキング同期プリミティブで待機中のタスクを管理
     static ref BLOCKED_TASKS: Mutex<BTreeMap<u64, Box<Task>>> = Mutex::new(BTreeMap::new());
+
+    /// 起床保留中のタスクID集合
+    ///
+    /// Lost Wakeup問題を防ぐために使用。
+    /// unblock_task()が呼ばれた時にタスクがまだBLOCKED_TASKSにいない場合、
+    /// このセットにIDを追加し、block_current_task()でチェックする。
+    static ref WAKEUP_PENDING: Mutex<BTreeSet<u64>> = Mutex::new(BTreeSet::new());
 }
 
 /// タスク管理システムの初期化
@@ -739,22 +747,56 @@ pub fn current_task_id() -> TaskId {
 /// この関数は同期プリミティブ（BlockingMutex等）から呼び出されます。
 /// 現在のタスクをBlocked状態に設定し、BLOCKED_TASKSに移動してスケジューラを呼び出します。
 ///
+/// # Lost Wakeup防止
+/// ブロック前にWAKEUP_PENDINGをチェックし、既に起床シグナルが
+/// 発行されていればブロックをスキップします。これにより、
+/// WaitQueue::wait()とwake_one()の間の競合状態を防ぎます。
+///
+/// # アトミック性保証
+/// WAKEUP_PENDINGのチェックとBlocked状態設定を同一のクリティカルセクション内で
+/// 実行し、その間に起床シグナルが失われることを防ぎます。
+/// ロック順序: WAKEUP_PENDING → CURRENT_TASK（デッドロック防止）
+///
 /// # Note
 /// 割り込みを無効化してからロックを取得し、デッドロックを防ぎます。
 pub fn block_current_task() {
-    without_interrupts(|| {
+    // Lost Wakeup防止: WAKEUP_PENDINGチェックとBlocked設定をアトミックに実行
+    let should_block = without_interrupts(|| {
+        // ロック順序: WAKEUP_PENDING → CURRENT_TASK
+        // この順序を維持することでデッドロックを防ぐ
+        let mut wakeup_pending = WAKEUP_PENDING.lock();
         let mut current = CURRENT_TASK.lock();
+
         if let Some(task) = current.as_mut() {
+            let id = task.id().as_u64();
+
+            // WAKEUP_PENDINGをチェック（両方のロックを保持したまま）
+            if wakeup_pending.remove(&id) {
+                // 既に起床シグナルが発行されている（Lost Wakeup検出）
+                // ブロックせずに即座にリターン
+                return false;
+            }
+
+            // WAKEUP_PENDINGにないので、通常通りBlocked状態に設定
+            // （まだ両方のロックを保持している）
             task.set_state(TaskState::Blocked);
+            true
+        } else {
+            false
         }
     });
-    // schedule()は内部で割り込みを無効化する
-    schedule();
+
+    if should_block {
+        // schedule()は内部で割り込みを無効化する
+        schedule();
+    }
 }
 
 /// 指定タスクをアンブロック（Ready状態に戻す）
 ///
 /// BLOCKED_TASKSから取り出して、スケジューリングクラスに応じたキューに追加します。
+/// タスクがまだBLOCKED_TASKSに登録されていない場合（Lost Wakeup防止）、
+/// WAKEUP_PENDINGセットに追加し、block_current_task()で検出できるようにします。
 ///
 /// # Arguments
 /// * `task_id` - アンブロックするタスクのID
@@ -788,6 +830,13 @@ pub fn unblock_task(task_id: TaskId) {
                     idle.push_back(task);
                 }
             }
+        } else {
+            // タスクがBLOCKED_TASKSにない場合、まだblock_current_task()が
+            // 完了していない可能性がある（Lost Wakeup問題）。
+            // WAKEUP_PENDINGに追加して、block_current_task()で検出できるようにする。
+            drop(blocked_tasks);
+            let mut wakeup_pending = WAKEUP_PENDING.lock();
+            wakeup_pending.insert(task_id.as_u64());
         }
     });
 }
