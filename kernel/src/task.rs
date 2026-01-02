@@ -462,6 +462,11 @@ impl Task {
 /// 割り込みハンドラがこのフラグをセットし、割り込み復帰時にチェックされる
 static NEED_RESCHED: AtomicBool = AtomicBool::new(false);
 
+/// 現在のタスクの蓄積実行時間（ナノ秒）
+/// タイマー割り込みで加算され、schedule()でvruntimeに反映される
+/// これにより、ロックを取得せずに実行時間を記録できる
+static ACCUMULATED_RUNTIME: AtomicU64 = AtomicU64::new(0);
+
 /// 初回起動時に使用するダミーコンテキスト
 /// 現在のタスクが存在しない場合、このコンテキストに「保存」する（実際には捨てられる）
 static mut DUMMY_CONTEXT: Context = Context { rsp: 0 };
@@ -549,31 +554,20 @@ pub fn set_current_task(task: Task) {
     });
 }
 
-/// 現在実行中のタスクのvruntimeを更新
+/// 現在実行中のタスクの実行時間を蓄積
 ///
 /// タイマー割り込みハンドラから呼び出されます。
+/// 実際のvruntime更新はschedule()内で行われます。
 ///
 /// # Arguments
 /// * `delta` - 実際の実行時間（ナノ秒単位）
+///
+/// # Design
+/// ロックを取得せずにアトミック変数に蓄積することで、
+/// デッドロックを回避しつつ、確実に実行時間を記録します。
+/// schedule()が呼ばれた時に、蓄積された時間がvruntimeに反映されます。
 pub fn update_current_task_vruntime(delta: u64) {
-    // TODO: 暫定対応 - より適切な解決策を検討する必要がある
-    // 現在の問題点:
-    // - タイマー割り込みハンドラから呼ばれるため、既にCURRENT_TASKがロックされている
-    //   状態で割り込みが発生するとデッドロックする
-    // - try_lock()でスキップすると、そのタスクのvruntimeが更新されず、
-    //   スケジューリングの公平性が損なわれる可能性がある
-    //
-    // 将来的な解決策の候補:
-    // 1. CURRENT_TASKにアクセスする全箇所で割り込みを禁止
-    // 2. vruntime更新をschedule()内で行う（割り込みハンドラではフラグのみ設定）
-    // 3. per-CPUデータを使用してロックフリーにする（Linux方式）
-    //
-    // See: https://github.com/jugeeeemu-tech/VitrOS/issues/4
-    if let Some(mut current) = CURRENT_TASK.try_lock() {
-        if let Some(task) = current.as_mut() {
-            task.update_vruntime(delta);
-        }
-    }
+    ACCUMULATED_RUNTIME.fetch_add(delta, Ordering::Relaxed);
 }
 
 /// スケジューリングが必要であることを示すフラグをセット
@@ -752,6 +746,12 @@ pub fn schedule() {
 
     // 古いタスクのコンテキストを保存する準備
     let old_context_ptr = if let Some(mut old_task) = current.take() {
+        // 蓄積された実行時間でvruntimeを更新（確実に反映）
+        let accumulated = ACCUMULATED_RUNTIME.swap(0, Ordering::Relaxed);
+        if accumulated > 0 {
+            old_task.update_vruntime(accumulated);
+        }
+
         // 実行中だった場合は準備完了状態に変更
         if old_task.state() == TaskState::Running {
             old_task.set_state(TaskState::Ready);
