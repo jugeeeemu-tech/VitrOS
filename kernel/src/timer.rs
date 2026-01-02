@@ -289,3 +289,8 @@ pub fn seconds_to_ticks(seconds: u64) -> u64 {
     let frequency = TIMER_FREQUENCY_HZ.load(AtomicOrdering::SeqCst);
     seconds * frequency
 }
+
+/// タイマー周波数を取得（Hz）
+pub fn frequency_hz() -> u64 {
+    TIMER_FREQUENCY_HZ.load(AtomicOrdering::SeqCst)
+}

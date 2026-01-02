@@ -2,8 +2,18 @@
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex as SpinMutex;
+
+/// フレームカウント（Compositorが描画したフレーム数）
+static FRAME_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// 画面幅
+static SCREEN_WIDTH: AtomicU32 = AtomicU32::new(0);
+
+/// 画面高さ
+static SCREEN_HEIGHT: AtomicU32 = AtomicU32::new(0);
 
 use super::buffer::{DrawCommand, SharedBuffer};
 use super::region::Region;
@@ -90,6 +100,9 @@ impl Compositor {
         unsafe {
             self.shadow_buffer.blit_to(self.config.fb_base);
         }
+
+        // フレームカウントをインクリメント
+        FRAME_COUNT.fetch_add(1, Ordering::Relaxed);
     }
 
     /// コマンドをシャドウバッファに描画
@@ -194,8 +207,30 @@ lazy_static! {
 /// # Arguments
 /// * `config` - Compositorの設定
 pub fn init_compositor(config: CompositorConfig) {
+    // 画面サイズをグローバル変数に保存
+    SCREEN_WIDTH.store(config.fb_width, Ordering::Relaxed);
+    SCREEN_HEIGHT.store(config.fb_height, Ordering::Relaxed);
+
     let mut comp = COMPOSITOR.lock();
     *comp = Some(Compositor::new(config));
+}
+
+/// フレームカウントを取得
+///
+/// Compositorが描画したフレーム数を返します。
+pub fn frame_count() -> u64 {
+    FRAME_COUNT.load(Ordering::Relaxed)
+}
+
+/// 画面サイズを取得
+///
+/// # Returns
+/// (幅, 高さ) のタプル
+pub fn screen_size() -> (u32, u32) {
+    (
+        SCREEN_WIDTH.load(Ordering::Relaxed),
+        SCREEN_HEIGHT.load(Ordering::Relaxed),
+    )
 }
 
 /// 新しいWriterを登録（タスク作成時に呼ばれる）

@@ -10,6 +10,7 @@ mod acpi;
 mod addr;
 mod allocator;
 mod apic;
+mod debug_overlay;
 mod gdt;
 mod graphics;
 mod idt;
@@ -355,8 +356,7 @@ extern "C" fn kernel_main_inner(boot_info_phys_addr: u64) -> ! {
 
         // ワーカータスク2（Normalクラス、nice 0 = 標準優先度）
         let t2 = Box::new(
-            task::Task::new("Task2", task::nice::DEFAULT, task2)
-                .expect("Failed to create Task2"),
+            task::Task::new("Task2", task::nice::DEFAULT, task2).expect("Failed to create Task2"),
         );
         task::add_task(*t2);
 
@@ -365,6 +365,17 @@ extern "C" fn kernel_main_inner(boot_info_phys_addr: u64) -> ! {
             task::Task::new("Task3", task::nice::MAX, task3).expect("Failed to create Task3"),
         );
         task::add_task(*t3);
+
+        // デバッグオーバーレイタスク（Normalクラス、標準優先度）
+        let debug = Box::new(
+            task::Task::new(
+                "DebugOverlay",
+                task::nice::DEFAULT,
+                debug_overlay::debug_overlay_task,
+            )
+            .expect("Failed to create DebugOverlay task"),
+        );
+        task::add_task(*debug);
 
         info!("All tasks created. Setting up kernel main task...");
 
