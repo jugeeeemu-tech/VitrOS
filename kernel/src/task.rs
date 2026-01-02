@@ -564,6 +564,7 @@ pub fn init() {
 /// * `rt_queue` - リアルタイムキューのロック済みガード
 /// * `cfs_queue` - CFSキューのロック済みガード
 /// * `idle_queue` - アイドルキューのロック済みガード
+#[allow(dead_code)] // 複数タスクを連続エンキューする場合に使用予定
 fn enqueue_task(
     task: Box<Task>,
     rt_queue: &mut BTreeMap<(u8, u64), Box<Task>>,
@@ -583,6 +584,35 @@ fn enqueue_task(
         }
         SchedulingClass::Idle => {
             // アイドルキュー: FIFO
+            idle_queue.push_back(task);
+        }
+    }
+}
+
+/// タスクを適切なキューに追加（単一キューロック版）
+///
+/// schedule()の最適化用。必要なキューのみをロックしてエンキューします。
+/// これにより、ロック保持時間を最小化します。
+///
+/// # Safety Contract
+/// この関数は割り込み無効状態（cli実行後）でのみ呼び出すこと。
+/// schedule()の内部ヘルパーとして設計されており、割り込み有効状態で
+/// 呼び出すとデッドロックの可能性があります。
+#[inline]
+fn enqueue_task_single(task: Box<Task>) {
+    match task.sched_class() {
+        SchedulingClass::Realtime => {
+            let key = (priority::MAX - task.priority(), task.id().as_u64());
+            let mut rt_queue = RT_QUEUE.lock();
+            rt_queue.insert(key, task);
+        }
+        SchedulingClass::Normal => {
+            let key = (task.vruntime(), task.id().as_u64());
+            let mut cfs_queue = CFS_QUEUE.lock();
+            cfs_queue.insert(key, task);
+        }
+        SchedulingClass::Idle => {
+            let mut idle_queue = IDLE_QUEUE.lock();
             idle_queue.push_back(task);
         }
     }
@@ -901,44 +931,60 @@ where
 /// switch_context()でRFLAGSのIFフラグが強制セットされるため、
 /// タスク復帰時は必ず割り込み有効状態になります。
 ///
+/// # ロック順序（段階的取得）
+/// 1. RT_QUEUE → 即解放
+/// 2. CFS_QUEUE → 即解放
+/// 3. IDLE_QUEUE → 即解放
+/// 4. CURRENT_TASK → 処理後解放
+/// 5. BLOCKED_TASKS または 各キュー（単一）
+///
+/// # 前提条件
+/// この関数は内部で cli を実行するため、割り込み有効状態で呼び出すこと。
+/// シングルコア環境を前提としており、cli による割り込み無効化が
+/// フェーズ間のレース条件を防いでいます。
+///
 /// # Note
 /// この関数は割り込みを無効化してからロックを取得します。
 /// これにより、タイマー割り込みハンドラとのデッドロックを防ぎます。
 pub fn schedule() {
-    // 割り込みを無効化
-    // これにより、ロック保持中にタイマー割り込みが発生してデッドロックすることを防ぐ
+    // SAFETY: cli はRFLAGSの割り込みフラグを無効化するのみで、メモリ安全性に影響しない。
+    // カーネルモードで実行されることが前提であり、ユーザーモードからの呼び出しはCPUが拒否する。
+    // 割り込み無効化により、フェーズ間でのレース条件を防ぎ、データ整合性を保証する。
     unsafe {
         core::arch::asm!("cli", options(nomem, nostack));
     }
 
-    // 3つのキューをロック（固定順序でデッドロック防止）
-    let mut rt_queue = RT_QUEUE.lock();
-    let mut cfs_queue = CFS_QUEUE.lock();
-    let mut idle_queue = IDLE_QUEUE.lock();
-    let mut current = CURRENT_TASK.lock();
-
-    // 次に実行するタスクを選択（優先順位: Realtime > Normal > Idle）
-    let next_task = if let Some(entry) = rt_queue.pop_first() {
-        // 1. リアルタイムキューから取得（優先度が最も高いタスク）
-        Some(entry.1)
-    } else if let Some(entry) = cfs_queue.pop_first() {
-        // 2. CFSキューから取得（vruntimeが最も小さいタスク）
-        Some(entry.1)
-    } else if let Some(task) = idle_queue.pop_front() {
-        // 3. アイドルキューから取得（FIFO）
-        Some(task)
-    } else {
-        // 実行可能なタスクがない
-        None
+    // ===== フェーズ1: 次タスクの選択（段階的ロック取得） =====
+    // 優先度順にキューをチェックし、見つかったらすぐにロック解放
+    // これにより、複数のキューを同時にロックする必要がなくなる
+    let next_task = {
+        // 1. リアルタイムキューをチェック（最優先）
+        let mut rt_queue = RT_QUEUE.lock();
+        if let Some(entry) = rt_queue.pop_first() {
+            drop(rt_queue);
+            Some(entry.1)
+        } else {
+            drop(rt_queue);
+            // 2. CFSキューをチェック
+            let mut cfs_queue = CFS_QUEUE.lock();
+            if let Some(entry) = cfs_queue.pop_first() {
+                drop(cfs_queue);
+                Some(entry.1)
+            } else {
+                drop(cfs_queue);
+                // 3. アイドルキューをチェック
+                let mut idle_queue = IDLE_QUEUE.lock();
+                let task = idle_queue.pop_front();
+                drop(idle_queue);
+                task
+            }
+        }
     };
 
-    // タスクがない場合は何もしない
+    // タスクがない場合は早期リターン
     let Some(mut next_task) = next_task else {
-        drop(rt_queue);
-        drop(cfs_queue);
-        drop(idle_queue);
-        drop(current);
-        // 割り込みを再有効化
+        // SAFETY: sti は割り込みフラグを有効化するのみで、メモリ安全性に影響しない。
+        // cli で無効化した割り込みを復元する。
         unsafe {
             core::arch::asm!("sti", options(nomem, nostack));
         }
@@ -946,69 +992,63 @@ pub fn schedule() {
     };
 
     next_task.set_state(TaskState::Running);
-
     let new_context_ptr = next_task.context() as *const Context;
 
-    // 古いタスクのコンテキストを保存する準備
-    let old_context_ptr = if let Some(mut old_task) = current.take() {
-        // 蓄積された実行時間でvruntimeを更新（Normalクラスのみ有効）
-        // accumulatedが0でも最小値(1)を加算して、同じタスクが連続選択されることを防ぐ
-        let accumulated = ACCUMULATED_RUNTIME.swap(0, Ordering::Relaxed);
-        if old_task.sched_class() == SchedulingClass::Normal {
-            let delta = if accumulated > 0 { accumulated } else { 1 };
-            old_task.update_vruntime(delta);
-        }
-
-        // 実行中だった場合は準備完了状態に変更
-        if old_task.state() == TaskState::Running {
-            old_task.set_state(TaskState::Ready);
-        }
-
-        // 古いタスクのコンテキストへのポインタを取得
-        // （Box内のTaskは移動しても同じアドレスに留まる）
-        let old_ctx_ptr = old_task.context_mut() as *mut Context;
-
-        // タスクの状態に応じて適切な場所に戻す
-        match old_task.state() {
-            TaskState::Terminated => {
-                // 終了したタスクは破棄
+    // ===== フェーズ2: 現在のタスクの処理（CURRENT_TASKのみロック） =====
+    let old_context_ptr = {
+        let mut current = CURRENT_TASK.lock();
+        if let Some(mut old_task) = current.take() {
+            // 蓄積された実行時間でvruntimeを更新（Normalクラスのみ有効）
+            // accumulatedが0でも最小値(1)を加算して、同じタスクが連続選択されることを防ぐ
+            let accumulated = ACCUMULATED_RUNTIME.swap(0, Ordering::Relaxed);
+            if old_task.sched_class() == SchedulingClass::Normal {
+                let delta = if accumulated > 0 { accumulated } else { 1 };
+                old_task.update_vruntime(delta);
             }
-            TaskState::Blocked => {
-                // ブロック中のタスクはBLOCKED_TASKSに移動
-                let task_id = old_task.id().as_u64();
-                // キューのロックを一時解放
-                drop(rt_queue);
-                drop(cfs_queue);
-                drop(idle_queue);
-                let mut blocked = BLOCKED_TASKS.lock();
-                blocked.insert(task_id, old_task);
-                drop(blocked);
-                // 再度ロック取得
-                rt_queue = RT_QUEUE.lock();
-                cfs_queue = CFS_QUEUE.lock();
-                idle_queue = IDLE_QUEUE.lock();
-            }
-            _ => {
-                // Ready状態のタスクはクラスに応じたキューに戻す
-                enqueue_task(old_task, &mut rt_queue, &mut cfs_queue, &mut idle_queue);
-            }
-        }
 
-        old_ctx_ptr
-    } else {
-        // 現在のタスクがない場合（初回起動時）はstaticなダミーコンテキストを使用
-        &raw mut DUMMY_CONTEXT as *mut Context
+            // 実行中だった場合は準備完了状態に変更
+            if old_task.state() == TaskState::Running {
+                old_task.set_state(TaskState::Ready);
+            }
+
+            // 古いタスクのコンテキストへのポインタを取得
+            // （Box内のTaskは移動しても同じアドレスに留まる）
+            let old_ctx_ptr = old_task.context_mut() as *mut Context;
+            let state = old_task.state();
+
+            // 新しいタスクを現在のタスクに設定
+            *current = Some(next_task);
+            drop(current); // CURRENT_TASKのロック解放
+
+            // ===== フェーズ3: 古いタスクを適切な場所に移動（単一キューロック） =====
+            // 各キューを個別にロックすることで、ロック競合を最小化
+            match state {
+                TaskState::Terminated => {
+                    // 終了したタスクは破棄
+                }
+                TaskState::Blocked => {
+                    // ブロック中のタスクはBLOCKED_TASKSに移動
+                    let task_id = old_task.id().as_u64();
+                    let mut blocked = BLOCKED_TASKS.lock();
+                    blocked.insert(task_id, old_task);
+                    // blockedのロックはスコープ終了で自動解放
+                }
+                _ => {
+                    // Ready状態のタスクは適切なキューにエンキュー（単一キューロック版）
+                    enqueue_task_single(old_task);
+                }
+            }
+
+            old_ctx_ptr
+        } else {
+            // 現在のタスクがない場合（初回起動時）
+            // 新しいタスクを現在のタスクに設定
+            *current = Some(next_task);
+            drop(current);
+            // staticなダミーコンテキストを使用
+            &raw mut DUMMY_CONTEXT as *mut Context
+        }
     };
-
-    // 新しいタスクを現在のタスクに設定
-    *current = Some(next_task);
-
-    // ロックを解放してからコンテキストスイッチ
-    // （コンテキストスイッチ中にロックを保持していると、戻ってきた時に問題が起きる）
-    drop(rt_queue);
-    drop(cfs_queue);
-    drop(idle_queue);
-    drop(current);
 
     // コンテキストスイッチを実行
     // old_context_ptrに現在の状態を保存し、new_context_ptrの状態を復元
