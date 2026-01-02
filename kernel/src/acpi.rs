@@ -126,6 +126,29 @@ struct Mcfg {
     // この後に Configuration Space Base Address Allocation Structures が続く
 }
 
+/// HPET (High Precision Event Timer) テーブル
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy)]
+struct HpetTable {
+    header: AcpiTableHeader,
+    event_timer_block_id: u32,
+    base_address: HpetAddress,
+    hpet_number: u8,
+    minimum_tick: u16,
+    page_protection: u8,
+}
+
+/// HPET Base Address (ACPI Generic Address Structure)
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy)]
+struct HpetAddress {
+    address_space_id: u8, // 0 = Memory
+    register_bit_width: u8,
+    register_bit_offset: u8,
+    reserved: u8,
+    address: u64,
+}
+
 /// MCFG Configuration Space Base Address Allocation Structure
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
@@ -262,6 +285,10 @@ fn parse_xsdt(xsdt_phys_addr: u64) {
         else if table_header.signature_str() == "MCFG" {
             parse_mcfg(table_phys_addr);
         }
+        // HPET テーブルを見つけたら解析
+        else if table_header.signature_str() == "HPET" {
+            parse_hpet(table_phys_addr);
+        }
     }
 }
 
@@ -314,6 +341,10 @@ fn parse_rsdt(rsdt_phys_addr: u64) {
         // MCFG テーブルを見つけたら解析
         else if table_header.signature_str() == "MCFG" {
             parse_mcfg(table_phys_addr);
+        }
+        // HPET テーブルを見つけたら解析
+        else if table_header.signature_str() == "HPET" {
+            parse_hpet(table_phys_addr);
         }
     }
 }
@@ -464,4 +495,41 @@ fn parse_mcfg(mcfg_phys_addr: u64) {
         current_addr += entry_size as u64;
         index += 1;
     }
+}
+
+/// HPET (High Precision Event Timer) テーブルを解析
+fn parse_hpet(hpet_phys_addr: u64) {
+    if hpet_phys_addr == 0 {
+        return;
+    }
+
+    // 物理アドレスを高位仮想アドレスに変換
+    let hpet_virt_addr = KERNEL_VIRTUAL_BASE + hpet_phys_addr;
+    let hpet = unsafe { &*(hpet_virt_addr as *const HpetTable) };
+
+    // チェックサムを検証
+    if !hpet.header.verify_checksum() {
+        info!("HPET checksum verification failed");
+        return;
+    }
+
+    // packed struct のフィールドはローカル変数にコピー
+    let base_address = hpet.base_address.address;
+    let address_space = hpet.base_address.address_space_id;
+
+    info!("HPET found:");
+    info!("  Base Address: 0x{:016X}", base_address);
+    info!(
+        "  Address Space: {}",
+        if address_space == 0 { "Memory" } else { "I/O" }
+    );
+
+    // メモリ空間のみサポート
+    if address_space != 0 {
+        info!("  HPET in I/O space not supported");
+        return;
+    }
+
+    // HPETモジュールを初期化
+    crate::hpet::init(base_address);
 }

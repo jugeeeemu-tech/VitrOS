@@ -6,6 +6,7 @@ use core::arch::asm;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicU32, Ordering};
 
+use crate::hpet;
 use crate::paging::KERNEL_VIRTUAL_BASE;
 use crate::pit;
 
@@ -155,32 +156,25 @@ pub const TIMER_INTERRUPT_VECTOR: u8 = 32;
 /// 分周比を考慮した実効周波数
 static APIC_TIMER_FREQUENCY: AtomicU32 = AtomicU32::new(0);
 
-/// APIC Timerをキャリブレーション
+/// HPETを使って1回のAPIC Timer測定を実行
 ///
-/// PITを使ってAPIC Timerの実際の周波数を測定します。
-/// この関数は割り込みが無効な状態で呼び出す必要があります。
-///
-/// # Errors
-/// * `ApicError::CalibrationFailed` - キャリブレーションに失敗した場合（周波数が0など）
-pub fn calibrate_timer() -> Result<(), ApicError> {
-    // SAFETY: APICレジスタへのアクセスは、enable_apic()でAPICが有効化された後に
-    // 行われる。PITによる10ms待機は割り込み無効状態で実行されることが前提。
-    // すべてのレジスタオフセットはIntel SDMで定義された有効な値。
+/// # Safety
+/// APICが有効化されていること、HPETが初期化済みであること
+unsafe fn measure_apic_ticks_hpet(ms: u64) -> u32 {
     unsafe {
         // Timer Divide Configuration Register を設定
         // 0x3 = Divide by 16
         write_apic_register(registers::TIMER_DIVIDE_CONFIG, 0x3);
 
         // Timer LVT Register を設定（マスク状態）
-        // bit 16: Mask (1 = Masked)
         let masked = 1 << 16;
         write_apic_register(registers::TIMER_LVT, masked);
 
         // APIC Timerを最大値で開始（One-shot mode）
         write_apic_register(registers::TIMER_INITIAL_COUNT, 0xFFFFFFFF);
 
-        // PITで10ms待つ
-        pit::sleep_ms(10);
+        // HPETで指定ミリ秒待つ（高精度）
+        hpet::delay_ms(ms);
 
         // 現在のカウント値を読み取る
         let current_count = read_apic_register(registers::TIMER_CURRENT_COUNT);
@@ -188,28 +182,109 @@ pub fn calibrate_timer() -> Result<(), ApicError> {
         // タイマーを停止
         write_apic_register(registers::TIMER_INITIAL_COUNT, 0);
 
-        // 10msでカウントダウンした量を計算
-        let ticks_in_10ms = 0xFFFFFFFF - current_count;
+        // カウントダウンした量を返す
+        0xFFFFFFFF - current_count
+    }
+}
 
-        // 1秒間のtick数を計算（10ms * 100 = 1秒）
-        let ticks_per_second = ticks_in_10ms * 100;
+/// PITを使って1回のAPIC Timer測定を実行
+///
+/// # Safety
+/// APICが有効化されていること
+unsafe fn measure_apic_ticks_pit(ms: u32) -> u32 {
+    unsafe {
+        // Timer Divide Configuration Register を設定
+        // 0x3 = Divide by 16
+        write_apic_register(registers::TIMER_DIVIDE_CONFIG, 0x3);
 
-        // バス周波数を保存（分周比16を考慮した実効周波数）
-        APIC_TIMER_FREQUENCY.store(ticks_per_second, Ordering::SeqCst);
+        // Timer LVT Register を設定（マスク状態）
+        let masked = 1 << 16;
+        write_apic_register(registers::TIMER_LVT, masked);
 
-        // 周波数が0の場合はエラー
-        if ticks_per_second == 0 {
-            return Err(ApicError::CalibrationFailed);
-        }
+        // APIC Timerを最大値で開始（One-shot mode）
+        write_apic_register(registers::TIMER_INITIAL_COUNT, 0xFFFFFFFF);
+
+        // PITで指定ミリ秒待つ
+        pit::sleep_ms(ms);
+
+        // 現在のカウント値を読み取る
+        let current_count = read_apic_register(registers::TIMER_CURRENT_COUNT);
+
+        // タイマーを停止
+        write_apic_register(registers::TIMER_INITIAL_COUNT, 0);
+
+        // カウントダウンした量を返す
+        0xFFFFFFFF - current_count
+    }
+}
+
+/// APIC Timerをキャリブレーション
+///
+/// HPET（利用可能な場合）またはPITを使ってAPIC Timerの周波数を測定します。
+/// HPETは高精度なので1回測定、PITは5回測定して中央値を採用します。
+/// この関数は割り込みが無効な状態で呼び出す必要があります。
+///
+/// # Errors
+/// * `ApicError::CalibrationFailed` - キャリブレーションに失敗した場合（周波数が0など）
+pub fn calibrate_timer() -> Result<(), ApicError> {
+    let ticks_per_second = if hpet::is_available() {
+        // HPETが利用可能: 高精度なので1回測定で十分
+        const CALIBRATION_MS: u64 = 50;
+
+        crate::info!("Calibrating APIC Timer using HPET...");
+
+        // SAFETY: enable_apic()呼び出し後であることが前提
+        let ticks = unsafe { measure_apic_ticks_hpet(CALIBRATION_MS) };
+        let ticks_per_second = ticks * (1000 / CALIBRATION_MS as u32);
 
         crate::info!(
-            "APIC Timer calibrated: {} Hz ({} ticks in 10ms)",
+            "APIC Timer calibrated (HPET): {} Hz ({} ticks in {}ms)",
             ticks_per_second,
-            ticks_in_10ms
+            ticks,
+            CALIBRATION_MS
         );
 
-        Ok(())
+        ticks_per_second
+    } else {
+        // PITを使用: 精度向上のため5回測定して中央値
+        const MEASUREMENTS: usize = 5;
+        const CALIBRATION_MS: u32 = 50;
+
+        crate::info!("Calibrating APIC Timer using PIT ({} measurements)...", MEASUREMENTS);
+
+        let mut measurements = [0u32; MEASUREMENTS];
+
+        for measurement in measurements.iter_mut() {
+            // SAFETY: enable_apic()呼び出し後であることが前提
+            *measurement = unsafe { measure_apic_ticks_pit(CALIBRATION_MS) };
+        }
+
+        // ソートして中央値を取る（外れ値の影響を排除）
+        measurements.sort_unstable();
+        let median_ticks = measurements[MEASUREMENTS / 2];
+        let multiplier = 1000 / CALIBRATION_MS;
+        let ticks_per_second = median_ticks * multiplier;
+
+        crate::info!(
+            "APIC Timer calibrated (PIT): {} Hz (median: {} ticks in {}ms)",
+            ticks_per_second,
+            median_ticks,
+            CALIBRATION_MS
+        );
+        crate::info!("  measurements: {:?}", measurements.map(|t| t * multiplier));
+
+        ticks_per_second
+    };
+
+    // バス周波数を保存（分周比16を考慮した実効周波数）
+    APIC_TIMER_FREQUENCY.store(ticks_per_second, Ordering::SeqCst);
+
+    // 周波数が0の場合はエラー
+    if ticks_per_second == 0 {
+        return Err(ApicError::CalibrationFailed);
     }
+
+    Ok(())
 }
 
 /// Local APIC Timerを初期化

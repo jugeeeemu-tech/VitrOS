@@ -13,6 +13,7 @@ mod apic;
 mod debug_overlay;
 mod gdt;
 mod graphics;
+mod hpet;
 mod idt;
 mod io;
 mod paging;
