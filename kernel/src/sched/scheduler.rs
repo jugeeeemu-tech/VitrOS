@@ -223,6 +223,11 @@ pub fn set_need_resched() {
 /// - softirq処理は割り込み有効状態で実行され、コールバック内でブロック可能です
 /// - schedule()は割り込み無効の状態で実行されます
 /// - 処理中に新たな割り込みが発生しても、do_softirq()の再入は防止されます
+///
+/// # Note: Heavy Callback Latency
+/// do_softirq()でコールバックが逐次実行されるため、重いコールバックがあると
+/// schedule()の呼び出しが遅延し、sleep_msの精度が悪化する可能性がある。
+/// 詳細は timer.rs の process_pending_timers() のTODOコメントを参照。
 pub fn check_resched_on_interrupt_exit() {
     // 1. softirq処理（タイマーコールバック実行）
     // schedule()の前に実行することで、unblockされたタスクが即座にスケジューリング対象になる
