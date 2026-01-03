@@ -199,7 +199,7 @@ pub fn run_visualization_tests(writer: &mut FramebufferWriter) {
     // 初期状態を表示
     draw_code_snippet(writer, &["// Initial state", "// No allocations yet"]);
     draw_memory_grids_multi(writer, "Initial State");
-    crate::sched::sleep_ms(1000);
+    crate::hpet::delay_ms(5000);
 
     // テスト1: 16Bクラス
     info!("\n=== Test 1: Vec<u8> (16B class) ===");
@@ -218,7 +218,7 @@ pub fn run_visualization_tests(writer: &mut FramebufferWriter) {
     );
     draw_memory_grids_multi(writer, "After 16B alloc");
     info!("Allocated Vec<u8> (12 elements = 12B -> 16B)");
-    crate::sched::sleep_ms(1000);
+    crate::hpet::delay_ms(5000);
 
     // テスト2: 64Bクラス
     info!("\n=== Test 2: Vec<u8> (64B class) ===");
@@ -237,7 +237,7 @@ pub fn run_visualization_tests(writer: &mut FramebufferWriter) {
     );
     draw_memory_grids_multi(writer, "After 16B + 64B");
     info!("Allocated Vec<u8> (50 elements = 50B -> 64B)");
-    crate::sched::sleep_ms(1000);
+    crate::hpet::delay_ms(5000);
 
     // テスト3: 128Bクラス
     info!("\n=== Test 3: Vec<u64> (128B class) ===");
@@ -256,7 +256,7 @@ pub fn run_visualization_tests(writer: &mut FramebufferWriter) {
     );
     draw_memory_grids_multi(writer, "16B+64B+128B");
     info!("Allocated Vec<u64> (10 elements = 80B -> 128B)");
-    crate::sched::sleep_ms(1000);
+    crate::hpet::delay_ms(5000);
 
     // テスト4: 256Bクラスを追加
     info!("\n=== Test 4: Vec<u64> (256B class) ===");
@@ -275,7 +275,7 @@ pub fn run_visualization_tests(writer: &mut FramebufferWriter) {
     );
     draw_memory_grids_multi(writer, "8B+16B+64B+128B");
     info!("Allocated Vec<u8> (25 elements = 200B -> 256B)");
-    crate::sched::sleep_ms(1000);
+    crate::hpet::delay_ms(5000);
 
     // テスト5: 8Bクラスを追加
     info!("\n=== Test 5: Vec<u8> (8B class) ===");
@@ -294,7 +294,7 @@ pub fn run_visualization_tests(writer: &mut FramebufferWriter) {
     );
     draw_memory_grids_multi(writer, "All 5 sizes");
     info!("Allocated Vec<u64> (8 elements = 8B -> 8B)");
-    crate::sched::sleep_ms(1000);
+    crate::hpet::delay_ms(5000);
 
     // テスト6: 64Bと256Bを解放
     info!("\n=== Test 6: Free 64B and 256B ===");
@@ -314,7 +314,7 @@ pub fn run_visualization_tests(writer: &mut FramebufferWriter) {
     );
     draw_memory_grids_multi(writer, "After freeing 2");
     info!("Freed 64B and 256B blocks");
-    crate::sched::sleep_ms(1000);
+    crate::hpet::delay_ms(5000);
 
     // テスト7: 全て解放
     info!("\n=== Test 7: Free all ===");
@@ -335,7 +335,7 @@ pub fn run_visualization_tests(writer: &mut FramebufferWriter) {
     );
     draw_memory_grids_multi(writer, "All freed");
     info!("All blocks freed");
-    crate::sched::sleep_ms(1000);
+    crate::hpet::delay_ms(5000);
     loop {
         unsafe {
             asm!("hlt");

@@ -38,9 +38,6 @@ use core::panic::PanicInfo;
 use vitros_common::boot_info::BootInfo;
 use vitros_common::uefi;
 
-#[cfg(feature = "visualize-allocator")]
-use crate::allocator_visualization;
-
 // カーネル仮想アドレスベース（ブートローダと同じ値）
 const KERNEL_VMA: u64 = 0xFFFF800000000000;
 
