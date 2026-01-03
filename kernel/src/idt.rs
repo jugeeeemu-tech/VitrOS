@@ -12,6 +12,86 @@ use crate::gdt;
 use crate::paging::KERNEL_VIRTUAL_BASE;
 use crate::timer;
 
+// =============================================================================
+// 例外ハンドラ生成マクロ
+// =============================================================================
+
+/// エラーコードなしの例外ハンドラを生成するマクロ
+///
+/// レジスタの保存/復元とiretqを含むnaked関数を生成します。
+macro_rules! exception_handler {
+    ($name:ident, $inner:ident) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            core::arch::naked_asm!(
+                // caller-savedレジスタを保存
+                "push rax",
+                "push rcx",
+                "push rdx",
+                "push rsi",
+                "push rdi",
+                "push r8",
+                "push r9",
+                "push r10",
+                "push r11",
+                // 実際のハンドラを呼び出し
+                "call {handler_inner}",
+                // レジスタを復元
+                "pop r11",
+                "pop r10",
+                "pop r9",
+                "pop r8",
+                "pop rdi",
+                "pop rsi",
+                "pop rdx",
+                "pop rcx",
+                "pop rax",
+                // 割り込みから復帰
+                "iretq",
+                handler_inner = sym $inner,
+            )
+        }
+    };
+}
+
+/// エラーコード付きの例外ハンドラを生成するマクロ
+///
+/// エラーコードをRDI（第1引数）に移動し、レジスタの保存/復元とiretqを含むnaked関数を生成します。
+macro_rules! exception_handler_with_error_code {
+    ($name:ident, $inner:ident) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            core::arch::naked_asm!(
+                // エラーコードをRDIレジスタに移動（System V ABIの第1引数）
+                "pop rdi",
+                // caller-savedレジスタを保存（rdiはエラーコードが入っているので保存しない）
+                "push rax",
+                "push rcx",
+                "push rdx",
+                "push rsi",
+                "push r8",
+                "push r9",
+                "push r10",
+                "push r11",
+                // 実際のハンドラを呼び出し（RDIにエラーコード）
+                "call {handler_inner}",
+                // レジスタを復元
+                "pop r11",
+                "pop r10",
+                "pop r9",
+                "pop r8",
+                "pop rsi",
+                "pop rdx",
+                "pop rcx",
+                "pop rax",
+                // 割り込みから復帰
+                "iretq",
+                handler_inner = sym $inner,
+            )
+        }
+    };
+}
+
 /// IDT操作のエラー型
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -221,40 +301,7 @@ extern "C" fn timer_handler_inner() {
 
 /// Divide Error (#DE, ベクタ0) ハンドラ
 /// ゼロ除算または除算結果がオーバーフローした場合に発生
-#[unsafe(naked)]
-extern "C" fn divide_error_handler() {
-    core::arch::naked_asm!(
-        // レジスタを保存
-        "push rax",
-        "push rcx",
-        "push rdx",
-        "push rsi",
-        "push rdi",
-        "push r8",
-        "push r9",
-        "push r10",
-        "push r11",
-
-        // 実際のハンドラを呼び出し
-        "call {handler_inner}",
-
-        // レジスタを復元
-        "pop r11",
-        "pop r10",
-        "pop r9",
-        "pop r8",
-        "pop rdi",
-        "pop rsi",
-        "pop rdx",
-        "pop rcx",
-        "pop rax",
-
-        // 割り込みから復帰
-        "iretq",
-
-        handler_inner = sym divide_error_handler_inner,
-    )
-}
+exception_handler!(divide_error_handler, divide_error_handler_inner);
 
 extern "C" fn divide_error_handler_inner() {
     println!("\n\n");
@@ -272,36 +319,7 @@ extern "C" fn divide_error_handler_inner() {
 
 /// Debug Exception (#DB, ベクタ1) ハンドラ
 /// デバッグレジスタによるブレークポイントやシングルステップで発生
-#[unsafe(naked)]
-extern "C" fn debug_exception_handler() {
-    core::arch::naked_asm!(
-        "push rax",
-        "push rcx",
-        "push rdx",
-        "push rsi",
-        "push rdi",
-        "push r8",
-        "push r9",
-        "push r10",
-        "push r11",
-
-        "call {handler_inner}",
-
-        "pop r11",
-        "pop r10",
-        "pop r9",
-        "pop r8",
-        "pop rdi",
-        "pop rsi",
-        "pop rdx",
-        "pop rcx",
-        "pop rax",
-
-        "iretq",
-
-        handler_inner = sym debug_exception_handler_inner,
-    )
-}
+exception_handler!(debug_exception_handler, debug_exception_handler_inner);
 
 extern "C" fn debug_exception_handler_inner() {
     println!("\n\n");
@@ -318,36 +336,7 @@ extern "C" fn debug_exception_handler_inner() {
 
 /// Breakpoint (#BP, ベクタ3) ハンドラ
 /// INT3命令（0xCC）によって発生
-#[unsafe(naked)]
-extern "C" fn breakpoint_handler() {
-    core::arch::naked_asm!(
-        "push rax",
-        "push rcx",
-        "push rdx",
-        "push rsi",
-        "push rdi",
-        "push r8",
-        "push r9",
-        "push r10",
-        "push r11",
-
-        "call {handler_inner}",
-
-        "pop r11",
-        "pop r10",
-        "pop r9",
-        "pop r8",
-        "pop rdi",
-        "pop rsi",
-        "pop rdx",
-        "pop rcx",
-        "pop rax",
-
-        "iretq",
-
-        handler_inner = sym breakpoint_handler_inner,
-    )
-}
+exception_handler!(breakpoint_handler, breakpoint_handler_inner);
 
 extern "C" fn breakpoint_handler_inner() {
     println!("\n\n");
@@ -363,36 +352,7 @@ extern "C" fn breakpoint_handler_inner() {
 
 /// Invalid Opcode (#UD, ベクタ6) ハンドラ
 /// 無効な命令やサポートされていない命令を実行しようとした場合に発生
-#[unsafe(naked)]
-extern "C" fn invalid_opcode_handler() {
-    core::arch::naked_asm!(
-        "push rax",
-        "push rcx",
-        "push rdx",
-        "push rsi",
-        "push rdi",
-        "push r8",
-        "push r9",
-        "push r10",
-        "push r11",
-
-        "call {handler_inner}",
-
-        "pop r11",
-        "pop r10",
-        "pop r9",
-        "pop r8",
-        "pop rdi",
-        "pop rsi",
-        "pop rdx",
-        "pop rcx",
-        "pop rax",
-
-        "iretq",
-
-        handler_inner = sym invalid_opcode_handler_inner,
-    )
-}
+exception_handler!(invalid_opcode_handler, invalid_opcode_handler_inner);
 
 extern "C" fn invalid_opcode_handler_inner() {
     println!("\n\n");
@@ -413,42 +373,7 @@ extern "C" fn invalid_opcode_handler_inner() {
 
 /// Double Fault (#DF, ベクタ8) ハンドラ
 /// 例外ハンドラ内で別の例外が発生した場合に発生（重大なエラー）
-#[unsafe(naked)]
-extern "C" fn double_fault_handler() {
-    core::arch::naked_asm!(
-        // エラーコードをRDIレジスタに移動（System V ABIの第1引数）
-        "pop rdi",
-
-        // レジスタを保存
-        "push rax",
-        "push rcx",
-        "push rdx",
-        "push rsi",
-        // rdi は既にエラーコードが入っているので保存しない
-        "push r8",
-        "push r9",
-        "push r10",
-        "push r11",
-
-        // 実際のハンドラを呼び出し（RDIにエラーコード）
-        "call {handler_inner}",
-
-        // レジスタを復元（復帰しないが形式上）
-        "pop r11",
-        "pop r10",
-        "pop r9",
-        "pop r8",
-        "pop rsi",
-        "pop rdx",
-        "pop rcx",
-        "pop rax",
-
-        // Double Faultは通常復帰できないが、念のためiretq
-        "iretq",
-
-        handler_inner = sym double_fault_handler_inner,
-    )
-}
+exception_handler_with_error_code!(double_fault_handler, double_fault_handler_inner);
 
 extern "C" fn double_fault_handler_inner(error_code: u64) {
     // CR2レジスタから最後のPage Fault違反アドレスを取得
@@ -503,40 +428,10 @@ extern "C" fn double_fault_handler_inner(error_code: u64) {
 
 /// General Protection Fault (#GP, ベクタ13) ハンドラ
 /// セグメント違反、特権レベル違反、無効なメモリアクセスなどで発生
-#[unsafe(naked)]
-extern "C" fn general_protection_fault_handler() {
-    core::arch::naked_asm!(
-        // エラーコードをRDIレジスタに移動
-        "pop rdi",
-
-        // レジスタを保存
-        "push rax",
-        "push rcx",
-        "push rdx",
-        "push rsi",
-        "push r8",
-        "push r9",
-        "push r10",
-        "push r11",
-
-        // 実際のハンドラを呼び出し
-        "call {handler_inner}",
-
-        // レジスタを復元
-        "pop r11",
-        "pop r10",
-        "pop r9",
-        "pop r8",
-        "pop rsi",
-        "pop rdx",
-        "pop rcx",
-        "pop rax",
-
-        "iretq",
-
-        handler_inner = sym general_protection_fault_handler_inner,
-    )
-}
+exception_handler_with_error_code!(
+    general_protection_fault_handler,
+    general_protection_fault_handler_inner
+);
 
 extern "C" fn general_protection_fault_handler_inner(error_code: u64) {
     println!("\n\n");
@@ -576,40 +471,7 @@ extern "C" fn general_protection_fault_handler_inner(error_code: u64) {
 
 /// Page Fault (#PF, ベクタ14) ハンドラ
 /// 無効なページアクセス、権限違反、ページ未マップなどで発生
-#[unsafe(naked)]
-extern "C" fn page_fault_handler() {
-    core::arch::naked_asm!(
-        // エラーコードをRDIレジスタに移動（System V ABIの第1引数）
-        "pop rdi",
-
-        // レジスタを保存
-        "push rax",
-        "push rcx",
-        "push rdx",
-        "push rsi",
-        "push r8",
-        "push r9",
-        "push r10",
-        "push r11",
-
-        // 実際のハンドラを呼び出し（RDIにエラーコード）
-        "call {handler_inner}",
-
-        // レジスタを復元
-        "pop r11",
-        "pop r10",
-        "pop r9",
-        "pop r8",
-        "pop rsi",
-        "pop rdx",
-        "pop rcx",
-        "pop rax",
-
-        "iretq",
-
-        handler_inner = sym page_fault_handler_inner,
-    )
-}
+exception_handler_with_error_code!(page_fault_handler, page_fault_handler_inner);
 
 extern "C" fn page_fault_handler_inner(error_code: u64) {
     // CR2レジスタから違反アドレスを取得

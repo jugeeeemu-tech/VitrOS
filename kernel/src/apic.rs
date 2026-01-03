@@ -157,11 +157,17 @@ pub const TIMER_INTERRUPT_VECTOR: u8 = 32;
 /// 分周比を考慮した実効周波数
 static APIC_TIMER_FREQUENCY: AtomicU32 = AtomicU32::new(0);
 
-/// HPETを使って1回のAPIC Timer測定を実行
+/// APIC Timer測定の共通実装
+///
+/// クロージャで渡されたdelay関数を使用してAPIC Timerのティック数を測定します。
 ///
 /// # Safety
-/// APICが有効化されていること、HPETが初期化済みであること
-unsafe fn measure_apic_ticks_hpet(ms: u64) -> u32 {
+/// - APICが有効化されていること（enable_apic()呼び出し後）
+/// - delay_fnが適切な時間待機を行うこと
+unsafe fn measure_apic_ticks<F>(delay_fn: F) -> u32
+where
+    F: FnOnce(),
+{
     unsafe {
         // Timer Divide Configuration Register を設定
         // 0x3 = Divide by 16
@@ -174,8 +180,8 @@ unsafe fn measure_apic_ticks_hpet(ms: u64) -> u32 {
         // APIC Timerを最大値で開始（One-shot mode）
         write_apic_register(registers::TIMER_INITIAL_COUNT, 0xFFFFFFFF);
 
-        // HPETで指定ミリ秒待つ（高精度）
-        hpet::delay_ms(ms);
+        // 指定されたdelay関数を呼び出し
+        delay_fn();
 
         // 現在のカウント値を読み取る
         let current_count = read_apic_register(registers::TIMER_CURRENT_COUNT);
@@ -188,35 +194,20 @@ unsafe fn measure_apic_ticks_hpet(ms: u64) -> u32 {
     }
 }
 
+/// HPETを使って1回のAPIC Timer測定を実行
+///
+/// # Safety
+/// APICが有効化されていること、HPETが初期化済みであること
+unsafe fn measure_apic_ticks_hpet(ms: u64) -> u32 {
+    unsafe { measure_apic_ticks(|| hpet::delay_ms(ms)) }
+}
+
 /// PITを使って1回のAPIC Timer測定を実行
 ///
 /// # Safety
 /// APICが有効化されていること
 unsafe fn measure_apic_ticks_pit(ms: u32) -> u32 {
-    unsafe {
-        // Timer Divide Configuration Register を設定
-        // 0x3 = Divide by 16
-        write_apic_register(registers::TIMER_DIVIDE_CONFIG, 0x3);
-
-        // Timer LVT Register を設定（マスク状態）
-        let masked = 1 << 16;
-        write_apic_register(registers::TIMER_LVT, masked);
-
-        // APIC Timerを最大値で開始（One-shot mode）
-        write_apic_register(registers::TIMER_INITIAL_COUNT, 0xFFFFFFFF);
-
-        // PITで指定ミリ秒待つ
-        pit::sleep_ms(ms);
-
-        // 現在のカウント値を読み取る
-        let current_count = read_apic_register(registers::TIMER_CURRENT_COUNT);
-
-        // タイマーを停止
-        write_apic_register(registers::TIMER_INITIAL_COUNT, 0);
-
-        // カウントダウンした量を返す
-        0xFFFFFFFF - current_count
-    }
+    unsafe { measure_apic_ticks(|| pit::sleep_ms(ms)) }
 }
 
 /// APIC Timerをキャリブレーション
