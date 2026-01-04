@@ -34,9 +34,29 @@ const COLOR_ARROW: u32 = 0xFFFF00;
 const COLOR_COMPOSITOR_BORDER: u32 = 0xAA60AA;
 
 // =============================================================================
+// アニメーション速度定数
+// =============================================================================
+
+/// パイプ内コマンドの移動速度（1フレームあたりの進行率）
+///
+/// 1.0 = 全長、0.06 = 約17フレーム（270ms）で通過
+const ANIM_SPEED_PIPE_COMMAND: f32 = 0.06;
+
+/// Blitアニメーションの速度（1フレームあたりの進行率）
+///
+/// 0.08 = 約12フレーム（200ms）で完了
+const ANIM_SPEED_BLIT: f32 = 0.08;
+
+/// バッファコピーアニメーションの速度（1フレームあたりの進行率）
+///
+/// 0.12 = 約8フレーム（130ms）で完了
+const ANIM_SPEED_BUFFER_COPY: f32 = 0.12;
+
+// =============================================================================
 // グローバル可視化状態（Compositor連携用）
 // =============================================================================
 
+use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex as SpinMutex;
 
 /// パイプラインフェーズ
@@ -304,7 +324,7 @@ impl MiniVisualizationState {
         for slot in self.flowing_commands.iter_mut() {
             if let Some(cmd) = slot {
                 if !cmd.arrived {
-                    cmd.position -= 0.06; // 1フレームで6%進む（約17フレーム=270msで通過）
+                    cmd.position -= ANIM_SPEED_PIPE_COMMAND;
                     if cmd.position <= 0.0 {
                         cmd.position = 0.0;
                         cmd.arrived = true; // 終点に到達、Compositorが取り出すまで待機
@@ -316,7 +336,7 @@ impl MiniVisualizationState {
 
         // Blitアニメーションを進める（Shadow → FB、progress: 0.0→1.0）
         if let Some(ref mut blit_anim) = self.blit_animation {
-            blit_anim.progress += 0.08; // 約12フレーム=200msで完了
+            blit_anim.progress += ANIM_SPEED_BLIT; // 約12フレーム=200msで完了
             if blit_anim.progress >= 1.0 {
                 blit_anim.progress = 1.0;
                 // アニメーション完了 - 実際のblitを実行
@@ -327,16 +347,20 @@ impl MiniVisualizationState {
                 }
                 // アニメーション終了、次のフレームで削除
                 self.blit_animation = None;
+                // AtomicBoolをクリア（待機側に完了を通知）
+                BLIT_ANIM_IN_PROGRESS.store(false, Ordering::Release);
             }
         }
 
         // バッファコピーアニメーションを進める（Task → Compositor、progress: 0.0→1.0）
         if let Some(ref mut copy_anim) = self.buffer_copy_animation {
-            copy_anim.progress += 0.12; // 約8フレーム=130msで完了（速め）
+            copy_anim.progress += ANIM_SPEED_BUFFER_COPY; // 約8フレーム=130msで完了（速め）
             if copy_anim.progress >= 1.0 {
                 copy_anim.progress = 1.0;
                 // アニメーション完了
                 self.buffer_copy_animation = None;
+                // AtomicBoolをクリア（待機側に完了を通知）
+                BUFFER_COPY_ANIM_IN_PROGRESS.store(false, Ordering::Release);
             }
         }
     }
@@ -347,6 +371,18 @@ lazy_static::lazy_static! {
     pub static ref MINI_VIS_STATE: SpinMutex<Option<MiniVisualizationState>> =
         SpinMutex::new(None);
 }
+
+/// バッファコピーアニメーション完了フラグ
+///
+/// ロック競合を避けるためAtomicBoolで管理。
+/// true = アニメーション進行中、false = 完了
+static BUFFER_COPY_ANIM_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
+/// Blitアニメーション完了フラグ
+///
+/// ロック競合を避けるためAtomicBoolで管理。
+/// true = アニメーション進行中、false = 完了
+static BLIT_ANIM_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 /// 可視化状態を初期化
 pub fn init_visualization_state() {
@@ -398,6 +434,9 @@ pub fn update_buffer_count(count: usize) {
 /// * `buffer_idx` - バッファインデックス
 /// * `commands_count` - コマンド数
 pub fn start_buffer_processing(buffer_idx: usize, commands_count: usize) {
+    // アニメーション開始前にフラグを設定（ロック競合回避）
+    BUFFER_COPY_ANIM_IN_PROGRESS.store(true, Ordering::Release);
+
     if let Some(ref mut vis_state) = *MINI_VIS_STATE.lock() {
         if buffer_idx < 4 {
             vis_state.buffer_queues[buffer_idx].anim_start_tick = vis_state.animation_tick;
@@ -410,18 +449,11 @@ pub fn start_buffer_processing(buffer_idx: usize, commands_count: usize) {
 }
 
 /// バッファコピーアニメーションが完了するまで待機
+///
+/// AtomicBoolを使用してロック競合を回避し、デッドロックリスクを低減。
 pub fn wait_for_buffer_copy_animation() {
-    loop {
-        let copy_done = {
-            if let Some(ref vis_state) = *MINI_VIS_STATE.lock() {
-                vis_state.buffer_copy_animation.is_none()
-            } else {
-                true
-            }
-        };
-        if copy_done {
-            break;
-        }
+    // AtomicBoolでアニメーション完了をポーリング（ロック取得なし）
+    while BUFFER_COPY_ANIM_IN_PROGRESS.load(Ordering::Acquire) {
         crate::sched::sleep_ms(16);
     }
 }
@@ -505,22 +537,19 @@ pub fn start_blit_animation() {
     if let Some(ref mut vis_state) = *MINI_VIS_STATE.lock() {
         vis_state.phase = PipelinePhase::Blit;
         vis_state.start_blit_animation_from_cumulative();
+        // アニメーション開始フラグを設定（ロック競合回避）
+        if vis_state.blit_animation.is_some() {
+            BLIT_ANIM_IN_PROGRESS.store(true, Ordering::Release);
+        }
     }
 }
 
 /// Blitアニメーションが完了するまで待機
+///
+/// AtomicBoolを使用してロック競合を回避し、デッドロックリスクを低減。
 pub fn wait_for_blit_animation() {
-    loop {
-        let blit_done = {
-            if let Some(ref vis_state) = *MINI_VIS_STATE.lock() {
-                vis_state.blit_animation.is_none()
-            } else {
-                true
-            }
-        };
-        if blit_done {
-            break;
-        }
+    // AtomicBoolでアニメーション完了をポーリング（ロック取得なし）
+    while BLIT_ANIM_IN_PROGRESS.load(Ordering::Acquire) {
         crate::sched::sleep_ms(16);
     }
 }
@@ -833,15 +862,45 @@ impl MiniBuffer {
     }
 
     /// バッファの内容をフレームバッファに描画
-    pub fn blit_to_fb(&self, fb_base: u64, fb_width: u32, dest_x: usize, dest_y: usize) {
+    ///
+    /// # Arguments
+    /// * `fb_base` - フレームバッファのベースアドレス
+    /// * `fb_width` - フレームバッファの幅（ピクセル）
+    /// * `fb_height` - フレームバッファの高さ（ピクセル）
+    /// * `dest_x` - 描画先のX座標
+    /// * `dest_y` - 描画先のY座標
+    pub fn blit_to_fb(
+        &self,
+        fb_base: u64,
+        fb_width: u32,
+        fb_height: u32,
+        dest_x: usize,
+        dest_y: usize,
+    ) {
         let fb = fb_base as *mut u32;
         let stride = fb_width as usize;
+        let fb_h = fb_height as usize;
 
         for y in 0..self.height {
+            let dest_row = dest_y + y;
+            // 境界チェック: 描画先がフレームバッファの高さを超えたら終了
+            if dest_row >= fb_h {
+                break;
+            }
+
             let src_offset = y * self.width;
-            let dest_offset = (dest_y + y) * stride + dest_x;
+            let dest_offset = dest_row * stride + dest_x;
+
             for x in 0..self.width {
-                // SAFETY: 呼び出し元が描画範囲の有効性を保証
+                let dest_col = dest_x + x;
+                // 境界チェック: 描画先がフレームバッファの幅を超えたら終了
+                if dest_col >= stride {
+                    break;
+                }
+
+                // SAFETY: dest_row < fb_height かつ dest_col < fb_width であることを
+                // 上記の境界チェックで保証している。fb_baseは呼び出し元が有効な
+                // フレームバッファアドレスを渡す責任を持つ。
                 unsafe {
                     *fb.add(dest_offset + x) = self.buffer[src_offset + x];
                 }
@@ -1116,6 +1175,8 @@ pub extern "C" fn visualization_ui_task() -> ! {
         };
 
         // バックバッファをクリア
+        // SAFETY: back_baseは上で確保したback_buffer配列を指しており、
+        // screen_width * screen_height のサイズが保証されている。
         unsafe {
             draw_rect(
                 back_base,
@@ -1129,6 +1190,8 @@ pub extern "C" fn visualization_ui_task() -> ! {
         }
 
         // タイトル（バックバッファに描画）
+        // SAFETY: back_baseは有効なバッファアドレス、TITLE_X/Y定数は
+        // 1024x768想定のレイアウトで境界内に収まる。
         unsafe {
             draw_string(
                 back_base,
@@ -1144,6 +1207,7 @@ pub extern "C" fn visualization_ui_task() -> ! {
         draw_panel_with_mini(
             back_base,
             screen_width,
+            screen_height,
             FB_PANEL_X,
             FB_PANEL_Y,
             "Frame Buffer",
@@ -1156,6 +1220,7 @@ pub extern "C" fn visualization_ui_task() -> ! {
         draw_panel_with_mini(
             back_base,
             screen_width,
+            screen_height,
             SHADOW_PANEL_X,
             SHADOW_PANEL_Y,
             "Shadow Buffer",
@@ -1189,6 +1254,7 @@ pub extern "C" fn visualization_ui_task() -> ! {
             buffer_count,
             phase
         );
+        // SAFETY: back_baseは有効なバッファ、STEP_INFO_X/Yはレイアウト定数で境界内
         unsafe {
             draw_string(
                 back_base,
@@ -1208,6 +1274,7 @@ pub extern "C" fn visualization_ui_task() -> ! {
                 info.region_x,
                 info.region_y
             );
+            // SAFETY: back_baseは有効なバッファ、座標はレイアウト定数で境界内
             unsafe {
                 draw_string(
                     back_base,
@@ -1234,6 +1301,9 @@ pub extern "C" fn visualization_ui_task() -> ! {
         }
 
         // バックバッファをフレームバッファに一括転送（チラツキ軽減）
+        // SAFETY: fb_baseはCompositorから取得した有効なフレームバッファアドレス、
+        // back_bufferはscreen_width * screen_heightのサイズで確保されており、
+        // 両者のサイズは同一。
         unsafe {
             let fb = fb_base as *mut u32;
             let back = back_buffer.as_ptr();
@@ -1252,6 +1322,7 @@ pub extern "C" fn visualization_ui_task() -> ! {
 fn draw_panel_with_mini(
     fb_base: u64,
     fb_width: u32,
+    fb_height: u32,
     x: usize,
     y: usize,
     label: &str,
@@ -1269,6 +1340,8 @@ fn draw_panel_with_mini(
     let panel_width = mini.width + 20;
     let panel_height = mini.height + 30;
 
+    // SAFETY: fb_baseは有効なフレームバッファアドレスであり、
+    // 描画関数内で境界チェックが行われる。
     unsafe {
         draw_rect_outline(fb_base, fb_width, x, y, panel_width, panel_height, color);
     }
@@ -1276,13 +1349,14 @@ fn draw_panel_with_mini(
     // ラベル（中央寄せ）
     let label_width = label.len() * 8;
     let label_x = x + (panel_width - label_width) / 2;
+    // SAFETY: fb_baseは有効なフレームバッファアドレス
     unsafe {
         draw_string(fb_base, fb_width, label_x, y + 5, label, COLOR_TEXT);
     }
 
     // ミニバッファを表示（パネル内に中央配置）
     let mini_x = x + (panel_width - mini.width) / 2;
-    mini.blit_to_fb(fb_base, fb_width, mini_x, y + 22);
+    mini.blit_to_fb(fb_base, fb_width, fb_height, mini_x, y + 22);
 }
 
 fn draw_compositor_indicator(
@@ -1302,6 +1376,9 @@ fn draw_compositor_indicator(
         COLOR_COMPOSITOR_BORDER
     };
 
+    // SAFETY: fb_baseは呼び出し元から渡される有効なバッファアドレス。
+    // 描画座標はCOMPOSITOR_X/Y等のレイアウト定数から計算され、
+    // 1024x768の想定画面サイズ内に収まるよう設計されている。
     unsafe {
         // 外枠
         draw_rect_outline(
@@ -1504,6 +1581,8 @@ fn draw_flow_arrows(fb_base: u64, fb_width: u32, current_phase: PipelinePhase) {
     } else {
         COLOR_ARROW
     };
+    // SAFETY: fb_baseは有効なバッファアドレス。座標はレイアウト定数から計算され、
+    // 1024x768の画面サイズ内に収まる。
     unsafe {
         // 垂直線
         draw_rect(
@@ -1536,6 +1615,8 @@ fn draw_flow_arrows(fb_base: u64, fb_width: u32, current_phase: PipelinePhase) {
     } else {
         COLOR_ARROW
     };
+    // SAFETY: fb_baseは有効なバッファアドレス。座標はレイアウト定数から計算され、
+    // 1024x768の画面サイズ内に収まる。
     unsafe {
         // 水平線
         draw_rect(
@@ -1590,6 +1671,8 @@ fn draw_blit_animation(fb_base: u64, fb_width: u32, blit_anim: &BlitAnimation) {
 
     // dirty region矩形を描画（半透明風にアウトラインのみ）
     let color = 0xFFFF00; // 黄色（ハイライト）
+    // SAFETY: fb_baseは有効なバッファアドレス。座標はパネル位置(レイアウト定数)
+    // とdirty region(ミニバッファサイズ内)から計算され、画面サイズ内に収まる。
     unsafe {
         draw_rect_outline(
             fb_base,
@@ -1650,6 +1733,8 @@ fn draw_pipe_queue(
         };
 
         // パイプ本体（水平線、タスクボックス右端からCompositor手前まで）
+        // SAFETY: fb_baseは有効なバッファアドレス。座標はレイアウト定数から計算され、
+        // 1024x768の画面サイズ内に収まる。
         unsafe {
             draw_rect(
                 fb_base,
@@ -1663,6 +1748,7 @@ fn draw_pipe_queue(
         }
 
         // 矢印（パイプ終端、右端 → Compositor方向）
+        // SAFETY: fb_baseは有効なバッファアドレス、座標はレイアウト定数で境界内
         unsafe {
             draw_char(
                 fb_base,
@@ -1708,6 +1794,7 @@ fn draw_pipe_queue(
             };
 
             // コマンドブロック
+            // SAFETY: fb_baseは有効なバッファ、cmd_xはパイプ範囲内で計算される
             unsafe {
                 draw_rect(
                     fb_base,
@@ -1722,6 +1809,7 @@ fn draw_pipe_queue(
 
             // 頭文字
             let ch = cmd.cmd_type.as_bytes().first().copied().unwrap_or(b'?');
+            // SAFETY: fb_baseは有効なバッファ、座標はコマンドブロック内
             unsafe {
                 draw_char(fb_base, fb_width, cmd_x + 6, cmd_y + 3, ch, 0x000000);
             }
@@ -1733,6 +1821,7 @@ fn draw_pipe_queue(
         let merge_x = PIPE_END_X + 12;
         let merge_y_start = TASK_BOX_Y_START + TASK_BOX_HEIGHT / 2;
         let merge_y_end = TASK_BOX_Y_START + (count - 1) * TASK_BOX_SPACING + TASK_BOX_HEIGHT / 2;
+        // SAFETY: fb_baseは有効なバッファ、座標はレイアウト定数から計算され境界内
         unsafe {
             draw_rect(
                 fb_base,
@@ -1769,6 +1858,8 @@ fn draw_task_boxes_with_queues(
         let task_names = ["Task 1", "Task 2", "Task 3"];
         for (i, name) in task_names.iter().enumerate() {
             let y = TASK_BOX_Y_START + i * TASK_BOX_SPACING;
+            // SAFETY: fb_baseは有効なバッファアドレス。座標はレイアウト定数から計算され、
+            // 1024x768の画面サイズ内に収まる。
             unsafe {
                 // タスク外枠
                 draw_rect_outline(
@@ -1823,6 +1914,8 @@ fn draw_task_boxes_with_queues(
                 0x404040
             };
 
+            // SAFETY: fb_baseは有効なバッファアドレス。座標はレイアウト定数から計算され、
+            // 1024x768の画面サイズ内に収まる。
             unsafe {
                 // タスク外枠
                 draw_rect_outline(
@@ -1945,6 +2038,8 @@ fn draw_buffer_copy_animation(
     // 色（移動中は明るいシアン）
     let color = 0x40FFFF;
 
+    // SAFETY: fb_baseは有効なバッファアドレス。座標はタスクボックスとCompositor間の
+    // 補間で計算され、両者ともレイアウト定数で1024x768の画面サイズ内に収まる。
     unsafe {
         // バッファ枠を描画
         draw_rect_outline(
