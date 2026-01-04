@@ -49,8 +49,21 @@ if [ "$QEMU_DEBUG_LOG" = "1" ]; then
     QEMU_LOG_OPTS="-d int,cpu_reset -D qemu_debug.log"
 fi
 
+# KVMオプション（利用可能な場合は自動的に有効化、DISABLE_KVM=1で無効化）
+KVM_OPTS=""
+if [ "$DISABLE_KVM" != "1" ] && [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+    echo "  KVM acceleration enabled"
+    KVM_OPTS="-enable-kvm -cpu host"
+else
+    if [ "$DISABLE_KVM" = "1" ]; then
+        echo "  KVM disabled by user"
+    else
+        echo "  KVM not available (no /dev/kvm or permission denied)"
+    fi
+fi
+
 qemu-system-x86_64 \
-    -machine q35 \
+    -machine q35,accel=kvm:tcg \
     -m 4G \
     -no-reboot \
     -no-shutdown \
@@ -60,5 +73,6 @@ qemu-system-x86_64 \
     -chardev stdio,id=char_com1,mux=on,logfile=serial.log \
     -serial chardev:char_com1 \
     -mon chardev=char_com1 \
+    $KVM_OPTS \
     $GDB_OPTS \
     $QEMU_LOG_OPTS

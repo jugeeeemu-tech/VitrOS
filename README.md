@@ -18,6 +18,22 @@ rustup toolchain install nightly
 rustup component add rust-src --toolchain nightly
 ```
 
+## セットアップ
+
+### KVM の有効化（推奨）
+
+KVM を有効にすると QEMU のパフォーマンスが大幅に向上します。
+
+```bash
+# kvm グループに追加
+sudo usermod -aG kvm $USER
+
+# WSL2 の場合は再起動が必要
+wsl --shutdown  # PowerShell から実行
+```
+
+再ログイン後、`groups` コマンドで `kvm` が含まれていることを確認してください。
+
 ## ビルド & 実行
 
 ```bash
