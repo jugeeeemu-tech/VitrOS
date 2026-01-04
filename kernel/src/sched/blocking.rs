@@ -23,7 +23,8 @@ lazy_static! {
     /// Lost Wakeup問題を防ぐために使用。
     /// unblock_task()が呼ばれた時にタスクがまだBLOCKED_TASKSにいない場合、
     /// このセットにIDを追加し、block_current_task()でチェックする。
-    static ref WAKEUP_PENDING: Mutex<BTreeSet<u64>> = Mutex::new(BTreeSet::new());
+    /// schedule()でもBLOCKED_TASKSへの追加前にチェックされる。
+    pub(super) static ref WAKEUP_PENDING: Mutex<BTreeSet<u64>> = Mutex::new(BTreeSet::new());
 }
 
 /// 割り込みコンテキスト内かどうかを判定

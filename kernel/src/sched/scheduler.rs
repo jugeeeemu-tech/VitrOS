@@ -11,7 +11,7 @@ use spin::Mutex;
 
 use crate::io::without_interrupts;
 
-use super::blocking::BLOCKED_TASKS;
+use super::blocking::{BLOCKED_TASKS, WAKEUP_PENDING};
 use super::context::{Context, switch_context};
 use super::task::{SchedulingClass, Task, TaskError, TaskId, TaskState, rt_priority};
 
@@ -384,10 +384,27 @@ pub fn schedule() {
                 }
                 TaskState::Blocked => {
                     // ブロック中のタスクはBLOCKED_TASKSに移動
+                    // ただし、既にWAKEUP_PENDINGに追加されている場合（Lost Wakeup）は
+                    // Ready状態に戻してキューに追加
                     let task_id = old_task.id().as_u64();
+
+                    // ロック順序: BLOCKED_TASKS → WAKEUP_PENDING (unblock_task()と同じ順序)
                     let mut blocked = BLOCKED_TASKS.lock();
-                    blocked.insert(task_id, old_task);
-                    // blockedのロックはスコープ終了で自動解放
+                    let mut wakeup_pending = WAKEUP_PENDING.lock();
+
+                    if wakeup_pending.remove(&task_id) {
+                        // Lost Wakeup検出: 既にunblock_task()が呼ばれている
+                        // BLOCKED_TASKSに追加せず、Ready状態に戻してキューに追加
+                        drop(wakeup_pending);
+                        drop(blocked);
+                        old_task.set_state(TaskState::Ready);
+                        enqueue_task_single(old_task);
+                    } else {
+                        // 通常通りBLOCKED_TASKSに追加
+                        drop(wakeup_pending);
+                        blocked.insert(task_id, old_task);
+                        // blockedのロックはスコープ終了で自動解放
+                    }
                 }
                 _ => {
                     // Ready状態のタスクは適切なキューにエンキュー（単一キューロック版）
