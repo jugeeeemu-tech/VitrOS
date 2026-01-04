@@ -239,8 +239,20 @@ extern "C" fn kernel_main_inner(boot_info_phys_addr: u64) -> ! {
     info!("Calibrating APIC Timer...");
     apic::calibrate_timer().expect("Failed to calibrate APIC Timer");
 
+    // MTRR/PAT設定をダンプ（デバッグ用）
+    paging::dump_mtrr();
+
     // ローカルフレームバッファを初期化
     // 物理アドレスを高位仮想アドレスに変換
+    //
+    // TODO: フレームバッファにWrite-Combining (WC)を設定してパフォーマンス向上
+    // 現状: 0x80000000〜がMTRR=UC → 描画が遅い
+    // 改善案:
+    //   - MTRR0-6: 0x81000000〜0xFFFFFFFFを7分割でUC設定
+    //   - MTRR7: 768GB地点のUC維持
+    //   - PAT[1]=WCに書き換え、フレームバッファのPTEでPWT=1,PCD=0設定
+    //   - 結果: フレームバッファ=WC、他MMIO=UC
+    // See: https://github.com/jugeeeemu-tech/VitrOS/issues/7
     let fb_virt_base = paging::phys_to_virt(boot_info.framebuffer.base)
         .expect("Failed to convert framebuffer address");
     let mut fb_writer = FramebufferWriter::new(
