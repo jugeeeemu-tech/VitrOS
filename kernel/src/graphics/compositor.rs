@@ -379,7 +379,9 @@ pub extern "C" fn compositor_task() -> ! {
         // Phase 2+3: 各バッファから直接レンダリング（アロケーションフリー）
         // ロックを取得したままレンダリングし、終わったらクリア
 
-        // 可視化モード: 可視化処理を実行（処理された場合は通常処理をスキップ）
+        // TODO: オブザーバーパターン導入で可視化ロジックを分離する
+        // ジェネリクス + ZSTでゼロコスト抽象化を実現
+        // Issue: https://github.com/jugeeeemu-tech/VitrOS/issues/16
         #[cfg(feature = "visualize-pipeline")]
         if crate::pipeline_visualization::process_frame_if_visualization(
             &buffers_snapshot,

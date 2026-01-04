@@ -175,6 +175,9 @@ impl SlabAllocator {
 // 可視化機能専用のメソッド
 // cargo build --features visualize でビルドした場合のみ有効
 // =============================================================================
+// TODO: オブザーバーパターン導入で可視化ロジックを分離する
+// アロケータ本体から可視化専用コードを削除し、AllocatorObserverトレイトで実装
+// Issue: https://github.com/jugeeeemu-tech/VitrOS/issues/16
 #[cfg(feature = "visualize-allocator")]
 impl SlabAllocator {
     // デバッグ: サイズクラスごとの空きブロック数をカウント
