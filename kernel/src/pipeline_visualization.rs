@@ -5,11 +5,10 @@
 
 extern crate alloc;
 
-use crate::graphics::{FramebufferWriter, draw_char, draw_rect, draw_rect_outline, draw_string};
-use crate::info;
-use alloc::string::String;
+use crate::graphics::buffer::DrawCommand;
+use crate::graphics::region::Region;
+use crate::graphics::{draw_char, draw_rect, draw_rect_outline, draw_string};
 use alloc::vec::Vec;
-use core::arch::asm;
 
 // =============================================================================
 // 色定義
@@ -356,6 +355,266 @@ pub fn init_visualization_state() {
     crate::info!("Pipeline visualization state initialized");
 }
 
+/// 可視化モードを開始
+///
+/// VisualizationUIタスクを登録し、スケジューラを開始する。
+/// この関数は戻らない。
+pub fn start_visualization() -> ! {
+    use crate::sched::{self, nice};
+    use alloc::boxed::Box;
+
+    init_visualization_state();
+
+    let vis_ui = Box::new(
+        sched::Task::new("VisualizationUI", nice::MIN, visualization_ui_task)
+            .expect("Failed to create VisualizationUI task"),
+    );
+    sched::add_task(*vis_ui);
+
+    crate::info!("Pipeline visualization mode - starting scheduler");
+    sched::schedule();
+    unreachable!();
+}
+
+// =============================================================================
+// Compositor連携用ヘルパー関数
+// =============================================================================
+
+/// 可視化モードが有効かどうかを判定
+pub fn is_visualization_mode() -> bool {
+    MINI_VIS_STATE.lock().is_some()
+}
+
+/// バッファ数を更新
+pub fn update_buffer_count(count: usize) {
+    if let Some(ref mut vis_state) = *MINI_VIS_STATE.lock() {
+        vis_state.buffer_count = count.min(4);
+    }
+}
+
+/// バッファ処理開始時の可視化状態を更新
+///
+/// # Arguments
+/// * `buffer_idx` - バッファインデックス
+/// * `commands_count` - コマンド数
+pub fn start_buffer_processing(buffer_idx: usize, commands_count: usize) {
+    if let Some(ref mut vis_state) = *MINI_VIS_STATE.lock() {
+        if buffer_idx < 4 {
+            vis_state.buffer_queues[buffer_idx].anim_start_tick = vis_state.animation_tick;
+            vis_state.buffer_queues[buffer_idx].is_processing = true;
+            vis_state.buffer_queues[buffer_idx].total_commands = commands_count;
+            vis_state.buffer_queues[buffer_idx].processed_count = 0;
+            vis_state.start_buffer_copy_animation(buffer_idx, commands_count);
+        }
+    }
+}
+
+/// バッファコピーアニメーションが完了するまで待機
+pub fn wait_for_buffer_copy_animation() {
+    loop {
+        let copy_done = {
+            if let Some(ref vis_state) = *MINI_VIS_STATE.lock() {
+                vis_state.buffer_copy_animation.is_none()
+            } else {
+                true
+            }
+        };
+        if copy_done {
+            break;
+        }
+        crate::sched::sleep_ms(16);
+    }
+}
+
+/// バッファコピー完了後の可視化状態を更新
+///
+/// command_types → compositor_commands にコピー後、command_typesをクリア
+pub fn complete_buffer_copy(buffer_idx: usize) {
+    if let Some(ref mut vis_state) = *MINI_VIS_STATE.lock() {
+        if buffer_idx < 4 {
+            vis_state.buffer_queues[buffer_idx].compositor_commands =
+                vis_state.buffer_queues[buffer_idx].command_types;
+            vis_state.buffer_queues[buffer_idx].pending_commands = 0;
+            vis_state.buffer_queues[buffer_idx].command_types = [None; 5];
+        }
+    }
+}
+
+/// コマンド処理の可視化状態を更新
+///
+/// # Arguments
+/// * `buffer_idx` - バッファインデックス
+/// * `cmd_idx` - 処理中のコマンドインデックス
+/// * `region` - 描画領域
+/// * `cmd` - 描画コマンド
+/// * `screen_width` - 画面幅
+/// * `screen_height` - 画面高さ
+///
+/// # Returns
+/// コマンドタイプ文字列
+pub fn process_command_visualization(
+    buffer_idx: usize,
+    cmd_idx: usize,
+    region: &Region,
+    cmd: &DrawCommand,
+    screen_width: u32,
+    screen_height: u32,
+) -> &'static str {
+    let cmd_type: &'static str = match cmd {
+        DrawCommand::Clear { .. } => "Clear",
+        DrawCommand::FillRect { .. } => "FillRect",
+        DrawCommand::DrawString { .. } => "DrawString",
+        DrawCommand::DrawChar { .. } => "DrawChar",
+    };
+
+    if let Some(ref mut vis_state) = *MINI_VIS_STATE.lock() {
+        vis_state.phase = PipelinePhase::Rendering;
+        let (dx, dy, dw, dh) =
+            vis_state
+                .mini_shadow
+                .render_command(region, cmd, screen_width, screen_height);
+        vis_state.expand_dirty(dx, dy, dw, dh);
+        vis_state.current_command = Some(CommandInfo {
+            command_type: cmd_type,
+            region_x: region.x,
+            region_y: region.y,
+        });
+        vis_state.command_count += 1;
+        if buffer_idx < 4 {
+            vis_state.buffer_queues[buffer_idx].processed_count = cmd_idx + 1;
+        }
+    }
+
+    cmd_type
+}
+
+/// バッファ処理完了の可視化状態を更新
+pub fn complete_buffer_processing(buffer_idx: usize) {
+    if let Some(ref mut vis_state) = *MINI_VIS_STATE.lock() {
+        if buffer_idx < 4 {
+            vis_state.buffer_queues[buffer_idx].is_processing = false;
+            vis_state.buffer_queues[buffer_idx].compositor_commands = [None; 5];
+            vis_state.buffer_queues[buffer_idx].processed_count = 0;
+            vis_state.buffer_queues[buffer_idx].total_commands = 0;
+        }
+    }
+}
+
+/// Blitアニメーションを開始
+pub fn start_blit_animation() {
+    if let Some(ref mut vis_state) = *MINI_VIS_STATE.lock() {
+        vis_state.phase = PipelinePhase::Blit;
+        vis_state.start_blit_animation_from_cumulative();
+    }
+}
+
+/// Blitアニメーションが完了するまで待機
+pub fn wait_for_blit_animation() {
+    loop {
+        let blit_done = {
+            if let Some(ref vis_state) = *MINI_VIS_STATE.lock() {
+                vis_state.blit_animation.is_none()
+            } else {
+                true
+            }
+        };
+        if blit_done {
+            break;
+        }
+        crate::sched::sleep_ms(16);
+    }
+}
+
+/// Blit完了後にフェーズをIdleに戻す
+pub fn set_phase_idle() {
+    if let Some(ref mut vis_state) = *MINI_VIS_STATE.lock() {
+        vis_state.phase = PipelinePhase::Idle;
+    }
+}
+
+/// 可視化モードでのフレーム処理
+///
+/// Compositorから呼び出され、可視化モード時の全フレーム処理を担当。
+/// 通常のシャドウバッファへの描画の代わりに、ミニバッファへの描画と
+/// アニメーション制御を行う。
+///
+/// # Returns
+/// 可視化モードで処理した場合は`true`、可視化モードでない場合は`false`
+pub fn process_frame_if_visualization(
+    buffers_snapshot: &alloc::sync::Arc<alloc::vec::Vec<crate::graphics::buffer::SharedBuffer>>,
+    screen_width: u32,
+    screen_height: u32,
+) -> bool {
+    // 可視化モードでなければ早期リターン
+    if !is_visualization_mode() {
+        return false;
+    }
+
+    // バッファ数を更新
+    update_buffer_count(buffers_snapshot.len());
+
+    // 各バッファを処理
+    for (buffer_idx, buffer) in buffers_snapshot.iter().enumerate() {
+        if let Some(mut buf) = buffer.try_lock() {
+            if buf.is_dirty() {
+                let region = buf.region();
+                let commands = buf.commands();
+
+                // コマンドをローカルにコピー（ロック解放のため）
+                let commands_copy: alloc::vec::Vec<_> = commands.iter().cloned().collect();
+                drop(buf); // バッファのロックを解放
+
+                // このバッファの処理開始
+                start_buffer_processing(buffer_idx, commands_copy.len());
+
+                // バッファコピーアニメーション完了を待機
+                wait_for_buffer_copy_animation();
+
+                // コピー完了: コマンドをCompositor内部に移動
+                complete_buffer_copy(buffer_idx);
+
+                // コピー完了後、コマンド処理開始前にウェイト（可視化用）
+                crate::sched::sleep_ms(500);
+
+                for (cmd_idx, cmd) in commands_copy.iter().enumerate() {
+                    // コマンドを処理（ミニシャドウバッファに描画）
+                    process_command_visualization(
+                        buffer_idx,
+                        cmd_idx,
+                        &region,
+                        cmd,
+                        screen_width,
+                        screen_height,
+                    );
+
+                    // 各コマンド処理後に待機（アニメーション可視化用、0.5秒）
+                    crate::sched::sleep_ms(500);
+                }
+
+                // このバッファの処理完了
+                complete_buffer_processing(buffer_idx);
+
+                // バッファを再ロックしてクリア
+                if let Some(mut buf) = buffer.try_lock() {
+                    buf.clear_commands();
+                    // 所有タスクを起床
+                    if let Some(id) = buf.owner_task_id() {
+                        drop(buf);
+                        crate::sched::unblock_task(crate::sched::TaskId::from_u64(id));
+                    }
+                }
+            }
+        }
+    }
+
+    // ミニシャドウ → ミニFB へのblitアニメーション
+    start_blit_animation();
+    wait_for_blit_animation();
+    set_phase_idle();
+
+    true
+}
+
 /// タスクのflush()から呼ばれる: バッファ内のコマンド情報を更新
 ///
 /// タスクがflush()を呼んだときに即座に可視化状態を更新する。
@@ -589,11 +848,189 @@ impl MiniBuffer {
             }
         }
     }
+
+    /// 描画コマンドをミニバッファにレンダリング（可視化用）
+    ///
+    /// スケールに応じてコマンドをミニバッファに描画
+    /// 戻り値: 描画されたdirty region (x, y, w, h) in mini-buffer coordinates
+    pub fn render_command(
+        &mut self,
+        region: &Region,
+        cmd: &DrawCommand,
+        screen_width: u32,
+        screen_height: u32,
+    ) -> (u32, u32, u32, u32) {
+        // ミニバッファサイズに基づくスケール変換
+        let mini_w = self.width;
+        let mini_h = self.height;
+        let scale_x = |x: u32| -> usize { (x as usize * mini_w) / screen_width as usize };
+        let scale_y = |y: u32| -> usize { (y as usize * mini_h) / screen_height as usize };
+        let scale_w = |w: u32| -> usize { ((w as usize * mini_w) / screen_width as usize).max(1) };
+        let scale_h = |h: u32| -> usize { ((h as usize * mini_h) / screen_height as usize).max(1) };
+
+        match cmd {
+            DrawCommand::Clear { color } => {
+                let x = scale_x(region.x);
+                let y = scale_y(region.y);
+                let w = scale_w(region.width);
+                let h = scale_h(region.height);
+                self.draw_rect(x, y, w, h, *color);
+                (x as u32, y as u32, w as u32, h as u32)
+            }
+            DrawCommand::FillRect {
+                x,
+                y,
+                width,
+                height,
+                color,
+            } => {
+                let global_x = region.x + x;
+                let global_y = region.y + y;
+                let sx = scale_x(global_x);
+                let sy = scale_y(global_y);
+                let sw = scale_w(*width);
+                let sh = scale_h(*height);
+                self.draw_rect(sx, sy, sw, sh, *color);
+                (sx as u32, sy as u32, sw as u32, sh as u32)
+            }
+            DrawCommand::DrawString { x, y, text, color } => {
+                // 文字列は点として表現（スケールが小さいため）
+                let global_x = region.x + x;
+                let global_y = region.y + y;
+                let sx = scale_x(global_x);
+                let sy = scale_y(global_y);
+                let text_width = (text.len() as u32) * 8;
+                let sw = scale_w(text_width).max(2);
+                self.draw_rect(sx, sy, sw, 2, *color);
+                (sx as u32, sy as u32, sw as u32, 2)
+            }
+            DrawCommand::DrawChar { x, y, color, .. } => {
+                let global_x = region.x + x;
+                let global_y = region.y + y;
+                let sx = scale_x(global_x);
+                let sy = scale_y(global_y);
+                self.draw_rect(sx, sy, 2, 2, *color);
+                (sx as u32, sy as u32, 2, 2)
+            }
+        }
+    }
 }
 
 // =============================================================================
 // 可視化UIタスク（リアルタイム）
 // =============================================================================
+
+// =============================================================================
+// 可視化用デモタスク
+// =============================================================================
+
+/// tick値に応じた色を取得（視認性の高い色をサイクル）
+fn get_demo_color() -> u32 {
+    const COLORS: [u32; 6] = [
+        0xFF5555, // 赤
+        0x55FF55, // 緑
+        0x5555FF, // 青
+        0xFFFF55, // 黄
+        0xFF55FF, // マゼンタ
+        0x55FFFF, // シアン
+    ];
+    let tick = crate::timer::current_tick();
+    COLORS[(tick as usize) % COLORS.len()]
+}
+
+/// デモタスク1: カウンタを表示し続ける
+extern "C" fn demo_task1() -> ! {
+    crate::info!("[DemoTask1] Started");
+
+    let region = crate::graphics::Region::new(400, 500, 350, 20);
+    let buffer =
+        crate::graphics::compositor::register_writer(region).expect("Failed to register writer");
+    let mut writer = crate::graphics::TaskWriter::new(buffer, 0xFFFFFFFF);
+
+    let mut counter = 0u64;
+    loop {
+        writer.set_color(get_demo_color());
+        writer.clear(0x00000000);
+        let tick = crate::timer::current_tick();
+        let _ = core::fmt::Write::write_fmt(
+            &mut writer,
+            format_args!("[Task1] Count:{} Tick:{}", counter, tick),
+        );
+        writer.sync_flush();
+        counter += 1;
+    }
+}
+
+/// デモタスク2: カウンタを表示し続ける
+extern "C" fn demo_task2() -> ! {
+    crate::info!("[DemoTask2] Started");
+
+    let region = crate::graphics::Region::new(400, 520, 300, 20);
+    let buffer =
+        crate::graphics::compositor::register_writer(region).expect("Failed to register writer");
+    let mut writer = crate::graphics::TaskWriter::new(buffer, 0xFFFFFFFF);
+
+    let mut counter = 0u64;
+    loop {
+        writer.set_color(get_demo_color());
+        writer.clear(0x00000000);
+        let _ = core::fmt::Write::write_fmt(
+            &mut writer,
+            format_args!("[Task2 Med ] Count: {}", counter),
+        );
+        writer.sync_flush();
+        counter += 1;
+    }
+}
+
+/// デモタスク3: カウンタを表示し続ける
+extern "C" fn demo_task3() -> ! {
+    crate::info!("[DemoTask3] Started");
+
+    let region = crate::graphics::Region::new(400, 540, 300, 20);
+    let buffer =
+        crate::graphics::compositor::register_writer(region).expect("Failed to register writer");
+    let mut writer = crate::graphics::TaskWriter::new(buffer, 0xFFFFFFFF);
+
+    let mut counter = 0u64;
+    loop {
+        writer.set_color(get_demo_color());
+        writer.clear(0x00000000);
+        let _ = core::fmt::Write::write_fmt(
+            &mut writer,
+            format_args!("[Task3 Low ] Count: {}", counter),
+        );
+        writer.sync_flush();
+        counter += 1;
+    }
+}
+
+/// 可視化用デモタスクを登録
+fn register_demo_tasks() {
+    use crate::sched::{self, nice};
+    use alloc::boxed::Box;
+
+    crate::info!("[VisualizationUI] Registering demo tasks");
+
+    let t1 = Box::new(
+        sched::Task::new("DemoTask1", nice::DEFAULT - 5, demo_task1)
+            .expect("Failed to create DemoTask1"),
+    );
+    sched::add_task(*t1);
+
+    let t2 = Box::new(
+        sched::Task::new("DemoTask2", nice::DEFAULT, demo_task2)
+            .expect("Failed to create DemoTask2"),
+    );
+    sched::add_task(*t2);
+
+    let t3 = Box::new(
+        sched::Task::new("DemoTask3", nice::MAX, demo_task3).expect("Failed to create DemoTask3"),
+    );
+    sched::add_task(*t3);
+
+    crate::info!("[VisualizationUI] Demo tasks registered");
+}
 
 /// パイプライン可視化UIタスク
 ///
@@ -601,6 +1038,9 @@ impl MiniBuffer {
 /// 画面にリアルタイム表示します。
 pub extern "C" fn visualization_ui_task() -> ! {
     crate::info!("[VisualizationUI] Started");
+
+    // デモタスクを登録
+    register_demo_tasks();
 
     // 少し待機してからCompositorから情報を取得
     crate::sched::sleep_ms(100);

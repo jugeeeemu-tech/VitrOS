@@ -390,6 +390,14 @@ extern "C" fn kernel_main_inner(boot_info_phys_addr: u64) -> ! {
             Box::new(task::Task::new_idle("Idle", idle_task).expect("Failed to create idle task"));
         task::add_task(*idle);
 
+        // 可視化モード: 専用の初期化処理へ（戻らない）
+        #[cfg(feature = "visualize-pipeline")]
+        pipeline_visualization::start_visualization();
+
+        // =================================================================
+        // 通常モード: ワーカータスク・デバッグオーバーレイを登録
+        // =================================================================
+
         // ワーカータスク1（やや高い優先度）
         let t1 = Box::new(
             task::Task::new("Task1", task::nice::DEFAULT - 5, task1)
@@ -410,39 +418,15 @@ extern "C" fn kernel_main_inner(boot_info_phys_addr: u64) -> ! {
         task::add_task(*t3);
 
         // デバッグオーバーレイタスク（Normalクラス、標準優先度）
-        // 可視化モードでは無効（UIが画面全体を使用するため）
-        #[cfg(not(feature = "visualize-pipeline"))]
-        {
-            let debug = Box::new(
-                task::Task::new(
-                    "DebugOverlay",
-                    task::nice::DEFAULT,
-                    debug_overlay::debug_overlay_task,
-                )
-                .expect("Failed to create DebugOverlay task"),
-            );
-            task::add_task(*debug);
-        }
-
-        // パイプライン可視化タスク（visualize-pipeline feature有効時のみ）
-        #[cfg(feature = "visualize-pipeline")]
-        {
-            // 可視化状態を初期化
-            pipeline_visualization::init_visualization_state();
-
-            // 可視化UIタスクを作成（最高優先度で滑らかな描画）
-            let vis_ui = Box::new(
-                task::Task::new(
-                    "VisualizationUI",
-                    task::nice::MIN,
-                    pipeline_visualization::visualization_ui_task,
-                )
-                .expect("Failed to create VisualizationUI task"),
-            );
-            task::add_task(*vis_ui);
-
-            info!("Pipeline visualization task registered");
-        }
+        let debug = Box::new(
+            task::Task::new(
+                "DebugOverlay",
+                task::nice::DEFAULT,
+                debug_overlay::debug_overlay_task,
+            )
+            .expect("Failed to create DebugOverlay task"),
+        );
+        task::add_task(*debug);
 
         info!("All tasks created. Setting up kernel main task...");
 
@@ -474,65 +458,71 @@ extern "C" fn kernel_main_inner(boot_info_phys_addr: u64) -> ! {
 
         info!("Returned from scheduler! KernelMain task rescheduled, entering idle loop...");
 
-        // TaskWriterで情報を表示（Compositor経由）
-        let region = graphics::Region::new(10, 350, 700, 80);
-        let buffer =
-            graphics::compositor::register_writer(region).expect("Failed to register writer");
-        let mut writer = graphics::TaskWriter::new(buffer, 0xFFFFFFFF);
-
-        let _ = writeln!(
-            writer,
-            "Framebuffer: 0x{:X}, {}x{}",
-            boot_info.framebuffer.base, boot_info.framebuffer.width, boot_info.framebuffer.height
-        );
-        let _ = writeln!(writer, "Memory regions: {}", boot_info.memory_map_count);
-        let _ = writeln!(
-            writer,
-            "Largest usable memory: phys=0x{:X} virt=0x{:X} - 0x{:X} ({} MB)",
-            largest_start_phys,
-            largest_start_virt,
-            largest_start_virt + largest_size as u64,
-            largest_size / 1024 / 1024
-        );
-        let _ = writeln!(writer, "Heap initialized: {} KB", heap_size / 1024);
-
-        #[cfg(not(feature = "visualize-allocator"))]
+        // 通常モード: システム情報表示とテストタイマー登録
+        #[cfg(not(feature = "visualize-pipeline"))]
         {
-            let _ = writeln!(writer, "");
-            let _ = writeln!(writer, "Kernel running...");
-            let _ = writeln!(writer, "System ready.");
+            // TaskWriterで情報を表示（Compositor経由）
+            let region = graphics::Region::new(10, 350, 700, 80);
+            let buffer =
+                graphics::compositor::register_writer(region).expect("Failed to register writer");
+            let mut writer = graphics::TaskWriter::new(buffer, 0xFFFFFFFF);
+
+            let _ = writeln!(
+                writer,
+                "Framebuffer: 0x{:X}, {}x{}",
+                boot_info.framebuffer.base,
+                boot_info.framebuffer.width,
+                boot_info.framebuffer.height
+            );
+            let _ = writeln!(writer, "Memory regions: {}", boot_info.memory_map_count);
+            let _ = writeln!(
+                writer,
+                "Largest usable memory: phys=0x{:X} virt=0x{:X} - 0x{:X} ({} MB)",
+                largest_start_phys,
+                largest_start_virt,
+                largest_start_virt + largest_size as u64,
+                largest_size / 1024 / 1024
+            );
+            let _ = writeln!(writer, "Heap initialized: {} KB", heap_size / 1024);
+
+            #[cfg(not(feature = "visualize-allocator"))]
+            {
+                let _ = writeln!(writer, "");
+                let _ = writeln!(writer, "Kernel running...");
+                let _ = writeln!(writer, "System ready.");
+            }
+            // ローカルバッファを共有バッファに一括転送
+            writer.flush();
+
+            // ヒープが初期化されたので、タイマーを登録できる
+            info!("Registering test timers...");
+
+            // 1秒後に実行されるタイマー
+            timer::register_timer(
+                timer::seconds_to_ticks(1),
+                Box::new(|| {
+                    info!("Timer 1: 1 second elapsed!");
+                }),
+            );
+
+            // 2秒後に実行されるタイマー
+            timer::register_timer(
+                timer::seconds_to_ticks(2),
+                Box::new(|| {
+                    info!("Timer 2: 2 seconds elapsed!");
+                }),
+            );
+
+            // 3秒後に実行されるタイマー
+            timer::register_timer(
+                timer::seconds_to_ticks(3),
+                Box::new(|| {
+                    info!("Timer 3: 3 seconds elapsed!");
+                }),
+            );
+
+            info!("Test timers registered");
         }
-        // ローカルバッファを共有バッファに一括転送
-        writer.flush();
-
-        // ヒープが初期化されたので、タイマーを登録できる
-        info!("Registering test timers...");
-
-        // 1秒後に実行されるタイマー
-        timer::register_timer(
-            timer::seconds_to_ticks(1),
-            Box::new(|| {
-                info!("Timer 1: 1 second elapsed!");
-            }),
-        );
-
-        // 2秒後に実行されるタイマー
-        timer::register_timer(
-            timer::seconds_to_ticks(2),
-            Box::new(|| {
-                info!("Timer 2: 2 seconds elapsed!");
-            }),
-        );
-
-        // 3秒後に実行されるタイマー
-        timer::register_timer(
-            timer::seconds_to_ticks(3),
-            Box::new(|| {
-                info!("Timer 3: 3 seconds elapsed!");
-            }),
-        );
-
-        info!("Test timers registered");
     } else {
         error!("No usable memory found!");
     }
