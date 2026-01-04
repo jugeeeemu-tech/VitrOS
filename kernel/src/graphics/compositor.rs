@@ -74,8 +74,16 @@ impl Compositor {
 
         // Copy-on-Write: 新しいVecを作成して追加
         let mut new_buffers = Vec::clone(&self.buffers);
+        #[cfg(feature = "visualize-pipeline")]
+        let buffer_index = new_buffers.len();
         new_buffers.push(Arc::clone(&buffer));
         self.buffers = Arc::new(new_buffers);
+
+        // 可視化モード: バッファインデックスを設定
+        #[cfg(feature = "visualize-pipeline")]
+        {
+            buffer.lock().set_vis_buffer_index(buffer_index);
+        }
 
         buffer
     }
@@ -223,6 +231,16 @@ pub fn screen_size() -> (u32, u32) {
     )
 }
 
+/// フレームバッファのベースアドレスを取得
+///
+/// # Returns
+/// フレームバッファのベースアドレス。Compositorが未初期化なら0
+#[cfg(feature = "visualize-pipeline")]
+pub fn fb_base() -> u64 {
+    let comp = COMPOSITOR.lock();
+    comp.as_ref().map(|c| c.get_config().fb_base).unwrap_or(0)
+}
+
 /// 新しいWriterを登録（タスク作成時に呼ばれる）
 ///
 /// # Arguments
@@ -235,6 +253,10 @@ pub fn screen_size() -> (u32, u32) {
 /// 割り込みを無効化してロックを取得することで、
 /// ロック保持中にプリエンプトされることを防ぎます。
 pub fn register_writer(region: Region) -> Option<SharedBuffer> {
+    // 可視化モード: 現在のタスクIDを取得
+    #[cfg(feature = "visualize-pipeline")]
+    let task_id = crate::sched::current_task_id().as_u64();
+
     // 割り込みを無効化してロック取得（スピンロック競合回避）
     let flags = unsafe {
         let flags: u64;
@@ -257,6 +279,14 @@ pub fn register_writer(region: Region) -> Option<SharedBuffer> {
     unsafe {
         if flags & 0x200 != 0 {
             core::arch::asm!("sti", options(nomem, nostack));
+        }
+    }
+
+    // 可視化モード: バッファに所有タスクIDを設定
+    #[cfg(feature = "visualize-pipeline")]
+    if let Some(ref buffer) = result {
+        if let Some(mut buf) = buffer.try_lock() {
+            buf.set_owner_task_id(task_id);
         }
     }
 
@@ -348,13 +378,26 @@ pub extern "C" fn compositor_task() -> ! {
 
         // Phase 2+3: 各バッファから直接レンダリング（アロケーションフリー）
         // ロックを取得したままレンダリングし、終わったらクリア
+
+        // 可視化モード: 可視化処理を実行（処理された場合は通常処理をスキップ）
+        #[cfg(feature = "visualize-pipeline")]
+        if crate::pipeline_visualization::process_frame_if_visualization(
+            &buffers_snapshot,
+            config.fb_width,
+            config.fb_height,
+        ) {
+            FRAME_COUNT.fetch_add(1, Ordering::Relaxed);
+            crate::sched::sleep_ms(16);
+            continue;
+        }
+
+        // 通常モード: 各バッファを処理
         for buffer in buffers_snapshot.iter() {
             if let Some(mut buf) = buffer.try_lock() {
                 if buf.is_dirty() {
                     let region = buf.region();
-                    // スライス参照で直接レンダリング（Vecの移動なし）
-                    render_commands_to(&mut shadow_buffer, &region, buf.commands());
-                    // 容量を維持したままクリア（再アロケーションなし）
+                    let commands = buf.commands();
+                    render_commands_to(&mut shadow_buffer, &region, commands);
                     buf.clear_commands();
                 }
             }

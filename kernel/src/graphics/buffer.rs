@@ -42,6 +42,12 @@ pub struct WriterBuffer {
     dirty: bool,
     /// このバッファの描画領域
     region: Region,
+    /// 所有タスクのID（可視化モード用）
+    #[cfg(feature = "visualize-pipeline")]
+    owner_task_id: Option<u64>,
+    /// 可視化用のバッファインデックス
+    #[cfg(feature = "visualize-pipeline")]
+    vis_buffer_index: Option<usize>,
 }
 
 impl WriterBuffer {
@@ -54,7 +60,35 @@ impl WriterBuffer {
             commands: Vec::with_capacity(64), // 初期容量64コマンド
             dirty: false,
             region,
+            #[cfg(feature = "visualize-pipeline")]
+            owner_task_id: None,
+            #[cfg(feature = "visualize-pipeline")]
+            vis_buffer_index: None,
         }
+    }
+
+    /// 所有タスクIDを設定（可視化モード用）
+    #[cfg(feature = "visualize-pipeline")]
+    pub fn set_owner_task_id(&mut self, task_id: u64) {
+        self.owner_task_id = Some(task_id);
+    }
+
+    /// 所有タスクIDを取得（可視化モード用）
+    #[cfg(feature = "visualize-pipeline")]
+    pub fn owner_task_id(&self) -> Option<u64> {
+        self.owner_task_id
+    }
+
+    /// 可視化用バッファインデックスを設定
+    #[cfg(feature = "visualize-pipeline")]
+    pub fn set_vis_buffer_index(&mut self, index: usize) {
+        self.vis_buffer_index = Some(index);
+    }
+
+    /// 可視化用バッファインデックスを取得
+    #[cfg(feature = "visualize-pipeline")]
+    pub fn vis_buffer_index(&self) -> Option<usize> {
+        self.vis_buffer_index
     }
 
     /// コマンドを追加
@@ -119,3 +153,21 @@ impl WriterBuffer {
 /// Arc<BlockingMutex<WriterBuffer>>の型エイリアス。
 /// TaskWriterとCompositorの間でバッファを共有するために使用します。
 pub type SharedBuffer = Arc<BlockingMutex<WriterBuffer>>;
+
+/// SharedBuffer用の同期フラッシュ拡張トレイト（可視化モード用）
+#[cfg(feature = "visualize-pipeline")]
+pub trait SyncFlushExt {
+    /// コマンド追加後、Compositorによる処理完了を待機
+    ///
+    /// タスクはブロック状態に入り、Compositorがコマンドを処理して
+    /// unblock_taskを呼ぶまで待機します。
+    fn sync_flush(&self);
+}
+
+#[cfg(feature = "visualize-pipeline")]
+impl SyncFlushExt for SharedBuffer {
+    fn sync_flush(&self) {
+        // ロックを解放した状態でブロック（Compositorがロックを取得できるように）
+        crate::sched::block_current_task();
+    }
+}

@@ -30,6 +30,9 @@ use sched as task;
 #[cfg(feature = "visualize-allocator")]
 mod allocator_visualization;
 
+#[cfg(feature = "visualize-pipeline")]
+mod pipeline_visualization;
+
 use crate::graphics::FramebufferWriter;
 use alloc::boxed::Box;
 use core::arch::asm;
@@ -104,11 +107,19 @@ extern "C" fn task1() -> ! {
         // tick数を表示してタイマー割り込みが発生しているか確認
         let tick = timer::current_tick();
         let _ = write!(writer, "[Task1] Count:{} Tick:{}", counter, tick);
-        // ローカルバッファを共有バッファに一括転送（1回のロックのみ）
-        writer.flush();
+
+        // 可視化モード: 同期フラッシュ（Compositorの処理完了を待機）
+        #[cfg(feature = "visualize-pipeline")]
+        writer.sync_flush();
+
+        // 通常モード: 非同期フラッシュ + スリープ
+        #[cfg(not(feature = "visualize-pipeline"))]
+        {
+            writer.flush();
+            task::sleep_ms(16);
+        }
+
         counter += 1;
-        // 描画頻度を制限（16ms = 約60fps）
-        task::sleep_ms(16);
     }
 }
 
@@ -125,11 +136,19 @@ extern "C" fn task2() -> ! {
     loop {
         writer.clear(0x00000000);
         let _ = write!(writer, "[Task2 Med ] Count: {}", counter);
-        // ローカルバッファを共有バッファに一括転送（1回のロックのみ）
-        writer.flush();
+
+        // 可視化モード: 同期フラッシュ（Compositorの処理完了を待機）
+        #[cfg(feature = "visualize-pipeline")]
+        writer.sync_flush();
+
+        // 通常モード: 非同期フラッシュ + スリープ
+        #[cfg(not(feature = "visualize-pipeline"))]
+        {
+            writer.flush();
+            task::sleep_ms(16);
+        }
+
         counter += 1;
-        // 描画頻度を制限（16ms = 約60fps）
-        task::sleep_ms(16);
     }
 }
 
@@ -146,11 +165,19 @@ extern "C" fn task3() -> ! {
     loop {
         writer.clear(0x00000000);
         let _ = write!(writer, "[Task3 Low ] Count: {}", counter);
-        // ローカルバッファを共有バッファに一括転送（1回のロックのみ）
-        writer.flush();
+
+        // 可視化モード: 同期フラッシュ（Compositorの処理完了を待機）
+        #[cfg(feature = "visualize-pipeline")]
+        writer.sync_flush();
+
+        // 通常モード: 非同期フラッシュ + スリープ
+        #[cfg(not(feature = "visualize-pipeline"))]
+        {
+            writer.flush();
+            task::sleep_ms(16);
+        }
+
         counter += 1;
-        // 描画頻度を制限（16ms = 約60fps）
-        task::sleep_ms(16);
     }
 }
 
@@ -363,20 +390,28 @@ extern "C" fn kernel_main_inner(boot_info_phys_addr: u64) -> ! {
             Box::new(task::Task::new_idle("Idle", idle_task).expect("Failed to create idle task"));
         task::add_task(*idle);
 
-        // ワーカータスク1（Normalクラス、nice -5 = やや高い優先度）
+        // 可視化モード: 専用の初期化処理へ（戻らない）
+        #[cfg(feature = "visualize-pipeline")]
+        pipeline_visualization::start_visualization();
+
+        // =================================================================
+        // 通常モード: ワーカータスク・デバッグオーバーレイを登録
+        // =================================================================
+
+        // ワーカータスク1（やや高い優先度）
         let t1 = Box::new(
             task::Task::new("Task1", task::nice::DEFAULT - 5, task1)
                 .expect("Failed to create Task1"),
         );
         task::add_task(*t1);
 
-        // ワーカータスク2（Normalクラス、nice 0 = 標準優先度）
+        // ワーカータスク2（標準優先度）
         let t2 = Box::new(
             task::Task::new("Task2", task::nice::DEFAULT, task2).expect("Failed to create Task2"),
         );
         task::add_task(*t2);
 
-        // ワーカータスク3（Normalクラス、nice +19 = 最低優先度）
+        // ワーカータスク3（最低優先度）
         let t3 = Box::new(
             task::Task::new("Task3", task::nice::MAX, task3).expect("Failed to create Task3"),
         );
@@ -423,65 +458,71 @@ extern "C" fn kernel_main_inner(boot_info_phys_addr: u64) -> ! {
 
         info!("Returned from scheduler! KernelMain task rescheduled, entering idle loop...");
 
-        // TaskWriterで情報を表示（Compositor経由）
-        let region = graphics::Region::new(10, 350, 700, 80);
-        let buffer =
-            graphics::compositor::register_writer(region).expect("Failed to register writer");
-        let mut writer = graphics::TaskWriter::new(buffer, 0xFFFFFFFF);
-
-        let _ = writeln!(
-            writer,
-            "Framebuffer: 0x{:X}, {}x{}",
-            boot_info.framebuffer.base, boot_info.framebuffer.width, boot_info.framebuffer.height
-        );
-        let _ = writeln!(writer, "Memory regions: {}", boot_info.memory_map_count);
-        let _ = writeln!(
-            writer,
-            "Largest usable memory: phys=0x{:X} virt=0x{:X} - 0x{:X} ({} MB)",
-            largest_start_phys,
-            largest_start_virt,
-            largest_start_virt + largest_size as u64,
-            largest_size / 1024 / 1024
-        );
-        let _ = writeln!(writer, "Heap initialized: {} KB", heap_size / 1024);
-
-        #[cfg(not(feature = "visualize-allocator"))]
+        // 通常モード: システム情報表示とテストタイマー登録
+        #[cfg(not(feature = "visualize-pipeline"))]
         {
-            let _ = writeln!(writer, "");
-            let _ = writeln!(writer, "Kernel running...");
-            let _ = writeln!(writer, "System ready.");
+            // TaskWriterで情報を表示（Compositor経由）
+            let region = graphics::Region::new(10, 350, 700, 80);
+            let buffer =
+                graphics::compositor::register_writer(region).expect("Failed to register writer");
+            let mut writer = graphics::TaskWriter::new(buffer, 0xFFFFFFFF);
+
+            let _ = writeln!(
+                writer,
+                "Framebuffer: 0x{:X}, {}x{}",
+                boot_info.framebuffer.base,
+                boot_info.framebuffer.width,
+                boot_info.framebuffer.height
+            );
+            let _ = writeln!(writer, "Memory regions: {}", boot_info.memory_map_count);
+            let _ = writeln!(
+                writer,
+                "Largest usable memory: phys=0x{:X} virt=0x{:X} - 0x{:X} ({} MB)",
+                largest_start_phys,
+                largest_start_virt,
+                largest_start_virt + largest_size as u64,
+                largest_size / 1024 / 1024
+            );
+            let _ = writeln!(writer, "Heap initialized: {} KB", heap_size / 1024);
+
+            #[cfg(not(feature = "visualize-allocator"))]
+            {
+                let _ = writeln!(writer, "");
+                let _ = writeln!(writer, "Kernel running...");
+                let _ = writeln!(writer, "System ready.");
+            }
+            // ローカルバッファを共有バッファに一括転送
+            writer.flush();
+
+            // ヒープが初期化されたので、タイマーを登録できる
+            info!("Registering test timers...");
+
+            // 1秒後に実行されるタイマー
+            timer::register_timer(
+                timer::seconds_to_ticks(1),
+                Box::new(|| {
+                    info!("Timer 1: 1 second elapsed!");
+                }),
+            );
+
+            // 2秒後に実行されるタイマー
+            timer::register_timer(
+                timer::seconds_to_ticks(2),
+                Box::new(|| {
+                    info!("Timer 2: 2 seconds elapsed!");
+                }),
+            );
+
+            // 3秒後に実行されるタイマー
+            timer::register_timer(
+                timer::seconds_to_ticks(3),
+                Box::new(|| {
+                    info!("Timer 3: 3 seconds elapsed!");
+                }),
+            );
+
+            info!("Test timers registered");
         }
-        // ローカルバッファを共有バッファに一括転送
-        writer.flush();
-
-        // ヒープが初期化されたので、タイマーを登録できる
-        info!("Registering test timers...");
-
-        // 1秒後に実行されるタイマー
-        timer::register_timer(
-            timer::seconds_to_ticks(1),
-            Box::new(|| {
-                info!("Timer 1: 1 second elapsed!");
-            }),
-        );
-
-        // 2秒後に実行されるタイマー
-        timer::register_timer(
-            timer::seconds_to_ticks(2),
-            Box::new(|| {
-                info!("Timer 2: 2 seconds elapsed!");
-            }),
-        );
-
-        // 3秒後に実行されるタイマー
-        timer::register_timer(
-            timer::seconds_to_ticks(3),
-            Box::new(|| {
-                info!("Timer 3: 3 seconds elapsed!");
-            }),
-        );
-
-        info!("Test timers registered");
     } else {
         error!("No usable memory found!");
     }

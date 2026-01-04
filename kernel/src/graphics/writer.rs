@@ -107,9 +107,44 @@ impl TaskWriter {
         }
 
         // 一括転送: drain()を使用してVecの容量を維持（アロケーションフリー）
-        self.buffer
-            .lock()
-            .extend_commands(self.local_commands.drain(..));
+        let mut buf = self.buffer.lock();
+        buf.extend_commands(self.local_commands.drain(..));
+
+        // 可視化モード: flush時に即座に可視化状態を更新
+        #[cfg(feature = "visualize-pipeline")]
+        {
+            if let Some(buffer_index) = buf.vis_buffer_index() {
+                let commands = buf.commands();
+                let command_count = commands.len();
+                let mut command_types: [Option<&'static str>; 5] = [None; 5];
+                for (i, cmd) in commands.iter().enumerate().take(5) {
+                    command_types[i] = Some(match cmd {
+                        DrawCommand::Clear { .. } => "Clear",
+                        DrawCommand::FillRect { .. } => "FillRect",
+                        DrawCommand::DrawString { .. } => "String",
+                        DrawCommand::DrawChar { .. } => "Char",
+                    });
+                }
+                drop(buf); // ロック解放してから可視化状態を更新
+                crate::pipeline_visualization::update_buffer_on_flush(
+                    buffer_index,
+                    command_count,
+                    command_types,
+                );
+            }
+        }
+    }
+
+    /// 同期フラッシュ: コマンド転送後、Compositorの処理完了を待機（可視化モード用）
+    ///
+    /// flush()を呼んだ後、Compositorがコマンドを処理するまでブロックします。
+    /// これにより、パイプラインの可視化で正確な同期が取れます。
+    #[cfg(feature = "visualize-pipeline")]
+    pub fn sync_flush(&mut self) {
+        self.flush();
+        // Compositorがコマンドを処理してunblock_task()を呼ぶまで待機
+        use super::buffer::SyncFlushExt;
+        self.buffer.sync_flush();
     }
 
     /// 蓄積中のテキストをDrawStringコマンドにコミット
