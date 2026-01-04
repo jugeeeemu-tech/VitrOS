@@ -5,6 +5,7 @@ edition.workspace = true
 
 [features]
 visualize-allocator = ["vitros-common/visualize-allocator"]
+visualize-pipeline = ["vitros-common/visualize-pipeline"]
 
 [dependencies]
 vitros-common = { path = "../common" }

@@ -30,6 +30,9 @@ use sched as task;
 #[cfg(feature = "visualize-allocator")]
 mod allocator_visualization;
 
+#[cfg(feature = "visualize-pipeline")]
+mod pipeline_visualization;
+
 use crate::graphics::FramebufferWriter;
 use alloc::boxed::Box;
 use core::arch::asm;
@@ -104,11 +107,19 @@ extern "C" fn task1() -> ! {
         // tick数を表示してタイマー割り込みが発生しているか確認
         let tick = timer::current_tick();
         let _ = write!(writer, "[Task1] Count:{} Tick:{}", counter, tick);
-        // ローカルバッファを共有バッファに一括転送（1回のロックのみ）
-        writer.flush();
+
+        // 可視化モード: 同期フラッシュ（Compositorの処理完了を待機）
+        #[cfg(feature = "visualize-pipeline")]
+        writer.sync_flush();
+
+        // 通常モード: 非同期フラッシュ + スリープ
+        #[cfg(not(feature = "visualize-pipeline"))]
+        {
+            writer.flush();
+            task::sleep_ms(16);
+        }
+
         counter += 1;
-        // 描画頻度を制限（16ms = 約60fps）
-        task::sleep_ms(16);
     }
 }
 
@@ -125,11 +136,19 @@ extern "C" fn task2() -> ! {
     loop {
         writer.clear(0x00000000);
         let _ = write!(writer, "[Task2 Med ] Count: {}", counter);
-        // ローカルバッファを共有バッファに一括転送（1回のロックのみ）
-        writer.flush();
+
+        // 可視化モード: 同期フラッシュ（Compositorの処理完了を待機）
+        #[cfg(feature = "visualize-pipeline")]
+        writer.sync_flush();
+
+        // 通常モード: 非同期フラッシュ + スリープ
+        #[cfg(not(feature = "visualize-pipeline"))]
+        {
+            writer.flush();
+            task::sleep_ms(16);
+        }
+
         counter += 1;
-        // 描画頻度を制限（16ms = 約60fps）
-        task::sleep_ms(16);
     }
 }
 
@@ -146,11 +165,19 @@ extern "C" fn task3() -> ! {
     loop {
         writer.clear(0x00000000);
         let _ = write!(writer, "[Task3 Low ] Count: {}", counter);
-        // ローカルバッファを共有バッファに一括転送（1回のロックのみ）
-        writer.flush();
+
+        // 可視化モード: 同期フラッシュ（Compositorの処理完了を待機）
+        #[cfg(feature = "visualize-pipeline")]
+        writer.sync_flush();
+
+        // 通常モード: 非同期フラッシュ + スリープ
+        #[cfg(not(feature = "visualize-pipeline"))]
+        {
+            writer.flush();
+            task::sleep_ms(16);
+        }
+
         counter += 1;
-        // 描画頻度を制限（16ms = 約60fps）
-        task::sleep_ms(16);
     }
 }
 
@@ -363,35 +390,59 @@ extern "C" fn kernel_main_inner(boot_info_phys_addr: u64) -> ! {
             Box::new(task::Task::new_idle("Idle", idle_task).expect("Failed to create idle task"));
         task::add_task(*idle);
 
-        // ワーカータスク1（Normalクラス、nice -5 = やや高い優先度）
+        // ワーカータスク1（やや高い優先度）
         let t1 = Box::new(
             task::Task::new("Task1", task::nice::DEFAULT - 5, task1)
                 .expect("Failed to create Task1"),
         );
         task::add_task(*t1);
 
-        // ワーカータスク2（Normalクラス、nice 0 = 標準優先度）
+        // ワーカータスク2（標準優先度）
         let t2 = Box::new(
             task::Task::new("Task2", task::nice::DEFAULT, task2).expect("Failed to create Task2"),
         );
         task::add_task(*t2);
 
-        // ワーカータスク3（Normalクラス、nice +19 = 最低優先度）
+        // ワーカータスク3（最低優先度）
         let t3 = Box::new(
             task::Task::new("Task3", task::nice::MAX, task3).expect("Failed to create Task3"),
         );
         task::add_task(*t3);
 
         // デバッグオーバーレイタスク（Normalクラス、標準優先度）
-        let debug = Box::new(
-            task::Task::new(
-                "DebugOverlay",
-                task::nice::DEFAULT,
-                debug_overlay::debug_overlay_task,
-            )
-            .expect("Failed to create DebugOverlay task"),
-        );
-        task::add_task(*debug);
+        // 可視化モードでは無効（UIが画面全体を使用するため）
+        #[cfg(not(feature = "visualize-pipeline"))]
+        {
+            let debug = Box::new(
+                task::Task::new(
+                    "DebugOverlay",
+                    task::nice::DEFAULT,
+                    debug_overlay::debug_overlay_task,
+                )
+                .expect("Failed to create DebugOverlay task"),
+            );
+            task::add_task(*debug);
+        }
+
+        // パイプライン可視化タスク（visualize-pipeline feature有効時のみ）
+        #[cfg(feature = "visualize-pipeline")]
+        {
+            // 可視化状態を初期化
+            pipeline_visualization::init_visualization_state();
+
+            // 可視化UIタスクを作成（最高優先度で滑らかな描画）
+            let vis_ui = Box::new(
+                task::Task::new(
+                    "VisualizationUI",
+                    task::nice::MIN,
+                    pipeline_visualization::visualization_ui_task,
+                )
+                .expect("Failed to create VisualizationUI task"),
+            );
+            task::add_task(*vis_ui);
+
+            info!("Pipeline visualization task registered");
+        }
 
         info!("All tasks created. Setting up kernel main task...");
 

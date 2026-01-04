@@ -248,19 +248,19 @@ pub unsafe fn draw_rect_outline(
 // フレームバッファライター（writeln!マクロ対応）
 pub struct FramebufferWriter {
     // 可視化機能が有効な場合はパブリック、それ以外はプライベート
-    #[cfg(feature = "visualize-allocator")]
+    #[cfg(any(feature = "visualize-allocator", feature = "visualize-pipeline"))]
     pub fb_base: u64,
-    #[cfg(not(feature = "visualize-allocator"))]
+    #[cfg(not(any(feature = "visualize-allocator", feature = "visualize-pipeline")))]
     fb_base: u64,
 
-    #[cfg(feature = "visualize-allocator")]
+    #[cfg(any(feature = "visualize-allocator", feature = "visualize-pipeline"))]
     pub width: u32,
-    #[cfg(not(feature = "visualize-allocator"))]
+    #[cfg(not(any(feature = "visualize-allocator", feature = "visualize-pipeline")))]
     width: u32,
 
-    #[cfg(feature = "visualize-allocator")]
+    #[cfg(any(feature = "visualize-allocator", feature = "visualize-pipeline"))]
     pub height: u32,
-    #[cfg(not(feature = "visualize-allocator"))]
+    #[cfg(not(any(feature = "visualize-allocator", feature = "visualize-pipeline")))]
     height: u32,
 
     x: usize,

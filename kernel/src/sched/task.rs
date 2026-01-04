@@ -55,6 +55,12 @@ impl TaskId {
         TaskId(id)
     }
 
+    /// u64からTaskIdを作成（可視化モード用）
+    #[cfg(feature = "visualize-pipeline")]
+    pub fn from_u64(id: u64) -> Self {
+        TaskId(id)
+    }
+
     /// タスクIDの値を取得
     pub fn as_u64(&self) -> u64 {
         self.0
