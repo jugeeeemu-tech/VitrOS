@@ -55,6 +55,12 @@ cargo run
 KERNEL_FEATURES=visualize-allocator cargo run
 ```
 
+### 描画パイプライン可視化
+
+```bash
+KERNEL_FEATURES=visualize-pipeline cargo run
+```
+
 ## プロジェクト構造
 
 ```
