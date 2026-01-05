@@ -1645,10 +1645,11 @@ fn draw_flow_arrows(fb_base: u64, fb_width: u32, current_phase: PipelinePhase) {
 /// progressに応じて矩形がシャドウバッファパネルからFBパネルへ移動する
 fn draw_blit_animation(fb_base: u64, fb_width: u32, blit_anim: &BlitAnimation) {
     // シャドウパネル内のdirty region位置（ミニバッファ内座標からパネル座標へ）
+    // draw_panel_with_mini で mini_x = x + (panel_width - mini.width) / 2 = x + 10, mini_y = y + 22
     let shadow_mini_x = SHADOW_PANEL_X + 10;
-    let shadow_mini_y = SHADOW_PANEL_Y + 25;
+    let shadow_mini_y = SHADOW_PANEL_Y + 22;
     let fb_mini_x = FB_PANEL_X + 10;
-    let fb_mini_y = FB_PANEL_Y + 25;
+    let fb_mini_y = FB_PANEL_Y + 22;
 
     // dirty regionの位置（ミニバッファ内座標）
     let dx = blit_anim.dirty_x as usize;
@@ -1669,32 +1670,20 @@ fn draw_blit_animation(fb_base: u64, fb_width: u32, blit_anim: &BlitAnimation) {
     let current_x = start_x as f32 + (end_x as f32 - start_x as f32) * progress;
     let current_y = start_y as f32 + (end_y as f32 - start_y as f32) * progress;
 
-    // dirty region矩形を描画（半透明風にアウトラインのみ）
+    // dirty region矩形を描画（二重枠線で視認性向上）
+    // 二重線が dirty region を外側から囲む
     let color = 0xFFFF00; // 黄色（ハイライト）
     // SAFETY: fb_baseは有効なバッファアドレス。座標はパネル位置(レイアウト定数)
     // とdirty region(ミニバッファサイズ内)から計算され、画面サイズ内に収まる。
     unsafe {
-        draw_rect_outline(
-            fb_base,
-            fb_width,
-            current_x as usize,
-            current_y as usize,
-            dw.max(4),
-            dh.max(4),
-            color,
-        );
-        // 内側にも小さい矩形を描いて視認性向上
-        if dw > 8 && dh > 8 {
-            draw_rect_outline(
-                fb_base,
-                fb_width,
-                current_x as usize + 2,
-                current_y as usize + 2,
-                dw - 4,
-                dh - 4,
-                color,
-            );
-        }
+        // 外側の枠線（dirty regionの3ピクセル外側から）
+        let outer_x = (current_x as isize - 3).max(0) as usize;
+        let outer_y = (current_y as isize - 3).max(0) as usize;
+        draw_rect_outline(fb_base, fb_width, outer_x, outer_y, dw + 6, dh + 6, color);
+        // 内側の枠線（dirty regionの1ピクセル外側から）
+        let inner_x = (current_x as isize - 1).max(0) as usize;
+        let inner_y = (current_y as isize - 1).max(0) as usize;
+        draw_rect_outline(fb_base, fb_width, inner_x, inner_y, dw + 2, dh + 2, color);
     }
 }
 
