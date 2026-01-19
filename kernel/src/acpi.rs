@@ -77,28 +77,28 @@ struct RsdpExtended {
     reserved: [u8; 3],
 }
 
-/// SDTエントリサイズを抽象化するトレイト
+/// SDT（System Description Table）エントリの抽象化
 ///
 /// XSDTは64ビット、RSDTは32ビットのエントリを持つため、
 /// この差を抽象化してparse処理を共通化する。
-trait SdtEntrySize {
+trait SdtEntry {
     /// エントリのバイトサイズ
-    const SIZE: usize;
+    const ENTRY_SIZE: usize;
     /// 期待されるシグネチャ
     const SIGNATURE: &'static str;
 
     /// ポインタからアドレスを読み取る
     ///
     /// # Safety
-    /// ptrは有効なメモリを指しており、SIZE分のバイトが読み取り可能であること
+    /// ptrは有効なメモリを指しており、ENTRY_SIZE分のバイトが読み取り可能であること
     unsafe fn read_address(ptr: *const u8) -> u64;
 }
 
 /// XSDT用エントリ（64ビットアドレス）
-struct XsdtEntry;
+struct Xsdt;
 
-impl SdtEntrySize for XsdtEntry {
-    const SIZE: usize = 8;
+impl SdtEntry for Xsdt {
+    const ENTRY_SIZE: usize = 8;
     const SIGNATURE: &'static str = "XSDT";
 
     unsafe fn read_address(ptr: *const u8) -> u64 {
@@ -108,10 +108,10 @@ impl SdtEntrySize for XsdtEntry {
 }
 
 /// RSDT用エントリ（32ビットアドレス）
-struct RsdtEntry;
+struct Rsdt;
 
-impl SdtEntrySize for RsdtEntry {
-    const SIZE: usize = 4;
+impl SdtEntry for Rsdt {
+    const ENTRY_SIZE: usize = 4;
     const SIGNATURE: &'static str = "RSDT";
 
     unsafe fn read_address(ptr: *const u8) -> u64 {
@@ -142,7 +142,11 @@ impl AcpiTableHeader {
     }
 
     /// チェックサムを検証
-    fn verify_checksum(&self) -> bool {
+    ///
+    /// # Safety
+    /// - selfが有効なACPIテーブルヘッダを指していること
+    /// - self.lengthバイトのメモリが読み取り可能であること
+    unsafe fn verify_checksum(&self) -> bool {
         let length = self.length;
         let bytes =
             unsafe { core::slice::from_raw_parts(self as *const _ as *const u8, length as usize) };
@@ -335,7 +339,7 @@ pub fn init(boot_info: &BootInfo) -> Result<(), AcpiError> {
 /// * `AcpiError::ChecksumFailed` - チェックサム検証に失敗した場合
 /// * `AcpiError::NotSupported` - シグネチャが無効な場合
 fn parse_xsdt(xsdt_phys_addr: u64) -> Result<(), AcpiError> {
-    parse_sdt::<XsdtEntry>(xsdt_phys_addr)
+    parse_sdt::<Xsdt>(xsdt_phys_addr)
 }
 
 /// RSDT (Root System Description Table) を解析
@@ -345,7 +349,7 @@ fn parse_xsdt(xsdt_phys_addr: u64) -> Result<(), AcpiError> {
 /// * `AcpiError::ChecksumFailed` - チェックサム検証に失敗した場合
 /// * `AcpiError::NotSupported` - シグネチャが無効な場合
 fn parse_rsdt(rsdt_phys_addr: u64) -> Result<(), AcpiError> {
-    parse_sdt::<RsdtEntry>(rsdt_phys_addr)
+    parse_sdt::<Rsdt>(rsdt_phys_addr)
 }
 
 /// XSDT/RSDTの共通解析ロジック
@@ -357,7 +361,7 @@ fn parse_rsdt(rsdt_phys_addr: u64) -> Result<(), AcpiError> {
 /// * `AcpiError::AddressConversionFailed` - SDTアドレスの変換に失敗した場合
 /// * `AcpiError::ChecksumFailed` - チェックサム検証に失敗した場合
 /// * `AcpiError::NotSupported` - シグネチャが無効な場合
-fn parse_sdt<E: SdtEntrySize>(sdt_phys_addr: u64) -> Result<(), AcpiError> {
+fn parse_sdt<E: SdtEntry>(sdt_phys_addr: u64) -> Result<(), AcpiError> {
     // 物理アドレスを高位仮想アドレスに変換（0チェックも含む）
     let sdt_virt_addr =
         phys_to_virt(sdt_phys_addr).map_err(|_| AcpiError::AddressConversionFailed)?;
@@ -372,14 +376,16 @@ fn parse_sdt<E: SdtEntrySize>(sdt_phys_addr: u64) -> Result<(), AcpiError> {
         return Err(AcpiError::NotSupported);
     }
 
-    if !header.verify_checksum() {
+    // SAFETY: headerはphys_to_virtで変換された有効なポインタから参照しており、
+    // header.lengthバイトのメモリはACPIテーブルとして読み取り可能
+    if !unsafe { header.verify_checksum() } {
         info!("{} checksum verification failed", E::SIGNATURE);
         return Err(AcpiError::ChecksumFailed);
     }
 
     // テーブルエントリ数を計算
     let header_size = core::mem::size_of::<AcpiTableHeader>();
-    let entry_count = (header.length as usize - header_size) / E::SIZE;
+    let entry_count = (header.length as usize - header_size) / E::ENTRY_SIZE;
 
     info!(
         "{} parsed successfully. Tables found: {}",
@@ -392,7 +398,7 @@ fn parse_sdt<E: SdtEntrySize>(sdt_phys_addr: u64) -> Result<(), AcpiError> {
 
     for i in 0..entry_count {
         // packed 構造体の後なのでアンアラインドアクセスが必要
-        let entry_ptr = unsafe { entries_base.add(i * E::SIZE) };
+        let entry_ptr = unsafe { entries_base.add(i * E::ENTRY_SIZE) };
         let table_phys_addr = unsafe { E::read_address(entry_ptr) };
 
         let table_virt_addr = match phys_to_virt(table_phys_addr) {
@@ -447,7 +453,9 @@ fn parse_madt(madt_phys_addr: u64) -> Result<(), AcpiError> {
     let madt = unsafe { &*(madt_virt_addr as *const Madt) };
 
     // チェックサムを検証
-    if !madt.header.verify_checksum() {
+    // SAFETY: madtはphys_to_virtで変換された有効なポインタから参照しており、
+    // header.lengthバイトのメモリはACPIテーブルとして読み取り可能
+    if !unsafe { madt.header.verify_checksum() } {
         return Err(AcpiError::ChecksumFailed);
     }
 
@@ -544,7 +552,9 @@ fn parse_mcfg(mcfg_phys_addr: u64) -> Result<(), AcpiError> {
     let mcfg = unsafe { &*(mcfg_virt_addr as *const Mcfg) };
 
     // チェックサムを検証
-    if !mcfg.header.verify_checksum() {
+    // SAFETY: mcfgはphys_to_virtで変換された有効なポインタから参照しており、
+    // header.lengthバイトのメモリはACPIテーブルとして読み取り可能
+    if !unsafe { mcfg.header.verify_checksum() } {
         return Err(AcpiError::ChecksumFailed);
     }
 
@@ -604,7 +614,9 @@ fn parse_hpet(hpet_phys_addr: u64) -> Result<(), AcpiError> {
     let hpet = unsafe { &*(hpet_virt_addr as *const HpetTable) };
 
     // チェックサムを検証
-    if !hpet.header.verify_checksum() {
+    // SAFETY: hpetはphys_to_virtで変換された有効なポインタから参照しており、
+    // header.lengthバイトのメモリはACPIテーブルとして読み取り可能
+    if !unsafe { hpet.header.verify_checksum() } {
         return Err(AcpiError::ChecksumFailed);
     }
 
