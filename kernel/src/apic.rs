@@ -4,7 +4,7 @@
 
 use core::arch::asm;
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use crate::hpet;
 use crate::paging::KERNEL_VIRTUAL_BASE;
@@ -41,13 +41,25 @@ const DEFAULT_APIC_PHYS_BASE: u64 = 0xFEE00000;
 /// Local APICの物理ベースアドレス（MADTから動的に設定可能）
 static APIC_PHYS_BASE: AtomicU64 = AtomicU64::new(DEFAULT_APIC_PHYS_BASE);
 
+/// APIC MMIOがマッピングされたかどうかのフラグ
+/// enable_apic()成功後にtrueに設定される
+static APIC_MMIO_MAPPED: AtomicBool = AtomicBool::new(false);
+
 /// 現在のAPIC物理ベースアドレスを取得
 fn apic_phys_base() -> u64 {
     APIC_PHYS_BASE.load(Ordering::SeqCst)
 }
 
 /// 現在のAPIC仮想ベースアドレスを取得
+///
+/// # Panics (debug build only)
+/// enable_apic()が呼び出される前にこの関数を呼び出すとパニックする
 fn apic_virt_base() -> u64 {
+    #[cfg(debug_assertions)]
+    debug_assert!(
+        APIC_MMIO_MAPPED.load(Ordering::SeqCst),
+        "apic_virt_base() called before enable_apic()"
+    );
     KERNEL_VIRTUAL_BASE + apic_phys_base()
 }
 
@@ -100,6 +112,9 @@ unsafe fn read_apic_register(offset: u32) -> u32 {
 fn enable_apic() -> Result<(), crate::paging::PagingError> {
     // APIC MMIO領域をUC属性でマッピング
     crate::paging::map_mmio(apic_phys_base(), crate::paging::PAGE_SIZE as u64)?;
+
+    // マッピング成功を記録（debug_assertで使用）
+    APIC_MMIO_MAPPED.store(true, Ordering::SeqCst);
 
     // SAFETY: IA32_APIC_BASE MSR (0x1B) はx86_64アーキテクチャで定義された
     // 標準的なMSRであり、APICの有効化に使用される。
