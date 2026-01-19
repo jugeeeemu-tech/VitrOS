@@ -296,6 +296,8 @@ pub fn init(boot_info: &BootInfo) -> Result<(), AcpiError> {
     // RSDP の物理アドレスを高位仮想アドレスに変換
     let rsdp_virt_addr =
         phys_to_virt(boot_info.rsdp_address).map_err(|_| AcpiError::AddressConversionFailed)?;
+    // SAFETY: phys_to_virtで変換した有効なアドレス。ACPIテーブルはUEFIが配置し
+    // カーネル実行中有効。#[repr(C, packed)]により非アラインアクセスが許可される。
     let rsdp = unsafe { &*(rsdp_virt_addr as *const Rsdp) };
 
     if !rsdp.is_valid_signature() {
@@ -312,6 +314,8 @@ pub fn init(boot_info: &BootInfo) -> Result<(), AcpiError> {
 
     if rsdp.revision >= 2 {
         // ACPI 2.0+ - XSDT を使用
+        // SAFETY: phys_to_virtで変換した有効なアドレス。revision >= 2 で拡張ヘッダの
+        // 存在が保証される。#[repr(C, packed)]により非アラインアクセスが許可される。
         let rsdp_ext = unsafe { &*(rsdp_virt_addr as *const RsdpExtended) };
         // packed struct のフィールドはローカル変数にコピー
         let xsdt_addr = rsdp_ext.xsdt_address;
@@ -365,6 +369,8 @@ fn parse_sdt<E: SdtEntry>(sdt_phys_addr: u64) -> Result<(), AcpiError> {
     // 物理アドレスを高位仮想アドレスに変換（0チェックも含む）
     let sdt_virt_addr =
         phys_to_virt(sdt_phys_addr).map_err(|_| AcpiError::AddressConversionFailed)?;
+    // SAFETY: phys_to_virtで変換した有効なアドレス。ACPIテーブルはUEFIが配置し
+    // カーネル実行中有効。#[repr(C, packed)]により非アラインアクセスが許可される。
     let header = unsafe { &*(sdt_virt_addr as *const AcpiTableHeader) };
 
     if header.signature_str() != E::SIGNATURE {
@@ -405,6 +411,8 @@ fn parse_sdt<E: SdtEntry>(sdt_phys_addr: u64) -> Result<(), AcpiError> {
             Ok(addr) => addr,
             Err(_) => continue,
         };
+        // SAFETY: phys_to_virtで変換した有効なアドレス。ACPIテーブルはUEFIが配置し
+        // カーネル実行中有効。#[repr(C, packed)]により非アラインアクセスが許可される。
         let table_header = unsafe { &*(table_virt_addr as *const AcpiTableHeader) };
 
         info!(
@@ -450,6 +458,8 @@ fn parse_madt(madt_phys_addr: u64) -> Result<(), AcpiError> {
     // 物理アドレスを高位仮想アドレスに変換（0チェックも含む）
     let madt_virt_addr =
         phys_to_virt(madt_phys_addr).map_err(|_| AcpiError::AddressConversionFailed)?;
+    // SAFETY: phys_to_virtで変換した有効なアドレス。ACPIテーブルはUEFIが配置し
+    // カーネル実行中有効。#[repr(C, packed)]により非アラインアクセスが許可される。
     let madt = unsafe { &*(madt_virt_addr as *const Madt) };
 
     // チェックサムを検証
@@ -482,6 +492,8 @@ fn parse_madt(madt_phys_addr: u64) -> Result<(), AcpiError> {
 
     // エントリをイテレート
     while current_addr < entries_end {
+        // SAFETY: current_addrはMADTテーブル内の有効なエントリを指す。
+        // ループ条件でentries_end未満を検証済み。#[repr(C, packed)]により非アラインアクセスが許可される。
         let entry_header = unsafe { &*(current_addr as *const MadtEntryHeader) };
 
         // packed struct のフィールドはローカル変数にコピー
@@ -491,6 +503,8 @@ fn parse_madt(madt_phys_addr: u64) -> Result<(), AcpiError> {
         match entry_type {
             0 => {
                 // Processor Local APIC
+                // SAFETY: entry_type == 0 でProcessor Local APICエントリであることを確認済み。
+                // current_addrはMADTテーブル内の有効なアドレス。#[repr(C, packed)]により非アラインアクセスが許可される。
                 let apic_entry = unsafe { &*(current_addr as *const MadtProcessorLocalApic) };
                 let acpi_id = apic_entry.acpi_processor_id;
                 let apic_id = apic_entry.apic_id;
@@ -509,6 +523,8 @@ fn parse_madt(madt_phys_addr: u64) -> Result<(), AcpiError> {
             }
             1 => {
                 // I/O APIC
+                // SAFETY: entry_type == 1 でI/O APICエントリであることを確認済み。
+                // current_addrはMADTテーブル内の有効なアドレス。#[repr(C, packed)]により非アラインアクセスが許可される。
                 let io_apic_entry = unsafe { &*(current_addr as *const MadtIoApic) };
                 let io_apic_id = io_apic_entry.io_apic_id;
                 let io_apic_address = io_apic_entry.io_apic_address;
@@ -549,6 +565,8 @@ fn parse_mcfg(mcfg_phys_addr: u64) -> Result<(), AcpiError> {
     // 物理アドレスを高位仮想アドレスに変換（0チェックも含む）
     let mcfg_virt_addr =
         phys_to_virt(mcfg_phys_addr).map_err(|_| AcpiError::AddressConversionFailed)?;
+    // SAFETY: phys_to_virtで変換した有効なアドレス。ACPIテーブルはUEFIが配置し
+    // カーネル実行中有効。#[repr(C, packed)]により非アラインアクセスが許可される。
     let mcfg = unsafe { &*(mcfg_virt_addr as *const Mcfg) };
 
     // チェックサムを検証
@@ -577,6 +595,8 @@ fn parse_mcfg(mcfg_phys_addr: u64) -> Result<(), AcpiError> {
     let mut index = 0;
 
     while current_addr < entries_end {
+        // SAFETY: current_addrはMCFGテーブル内の有効なエントリを指す。
+        // ループ条件でentries_end未満を検証済み。#[repr(C, packed)]により非アラインアクセスが許可される。
         let entry = unsafe { &*(current_addr as *const McfgEntry) };
 
         // packed struct のフィールドはローカル変数にコピー
@@ -611,6 +631,8 @@ fn parse_hpet(hpet_phys_addr: u64) -> Result<(), AcpiError> {
     // 物理アドレスを高位仮想アドレスに変換（0チェックも含む）
     let hpet_virt_addr =
         phys_to_virt(hpet_phys_addr).map_err(|_| AcpiError::AddressConversionFailed)?;
+    // SAFETY: phys_to_virtで変換した有効なアドレス。ACPIテーブルはUEFIが配置し
+    // カーネル実行中有効。#[repr(C, packed)]により非アラインアクセスが許可される。
     let hpet = unsafe { &*(hpet_virt_addr as *const HpetTable) };
 
     // チェックサムを検証
