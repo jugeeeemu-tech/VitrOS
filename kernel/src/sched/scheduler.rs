@@ -53,17 +53,12 @@ pub fn init() {
     crate::info!("Task system initialized");
 }
 
-/// タスクを適切なキューに追加（単一キューロック版）
+/// タスクを適切なキューに追加する共通実装
 ///
-/// schedule()の最適化用。必要なキューのみをロックしてエンキューします。
-/// これにより、ロック保持時間を最小化します。
-///
-/// # Safety Contract
-/// この関数は割り込み無効状態（cli実行後）でのみ呼び出すこと。
-/// schedule()の内部ヘルパーとして設計されており、割り込み有効状態で
-/// 呼び出すとデッドロックの可能性があります。
+/// スケジューリングクラスに応じて、適切なキュー（RT/CFS/IDLE）にタスクを追加します。
+/// 必要なキューのみをロックすることで、ロック保持時間を最小化します。
 #[inline]
-fn enqueue_task_single(task: Box<Task>) {
+fn enqueue_task_impl(task: Box<Task>) {
     match task.sched_class() {
         SchedulingClass::Realtime => {
             let key = (rt_priority::MAX - task.rt_priority(), task.id().as_u64());
@@ -82,24 +77,22 @@ fn enqueue_task_single(task: Box<Task>) {
     }
 }
 
+/// タスクを適切なキューに追加（単一キューロック版）
+///
+/// schedule()の最適化用。必要なキューのみをロックしてエンキューします。
+///
+/// # Safety Contract
+/// この関数は割り込み無効状態（cli実行後）でのみ呼び出すこと。
+/// schedule()の内部ヘルパーとして設計されており、割り込み有効状態で
+/// 呼び出すとデッドロックの可能性があります。
+#[inline]
+fn enqueue_task_single(task: Box<Task>) {
+    enqueue_task_impl(task);
+}
+
 /// タスクを適切なキューに追加（blocking.rsから呼び出される）
-pub(super) fn enqueue_to_appropriate_queue(task: Box<Task>, sched_class: SchedulingClass) {
-    match sched_class {
-        SchedulingClass::Realtime => {
-            let mut rt = RT_QUEUE.lock();
-            let key = (rt_priority::MAX - task.rt_priority(), task.id().as_u64());
-            rt.insert(key, task);
-        }
-        SchedulingClass::Normal => {
-            let mut cfs = CFS_QUEUE.lock();
-            let key = (task.vruntime(), task.id().as_u64());
-            cfs.insert(key, task);
-        }
-        SchedulingClass::Idle => {
-            let mut idle = IDLE_QUEUE.lock();
-            idle.push_back(task);
-        }
-    }
+pub(super) fn enqueue_to_appropriate_queue(task: Box<Task>, _sched_class: SchedulingClass) {
+    enqueue_task_impl(task);
 }
 
 /// 新しいタスクをタスクキューに追加（エラーハンドリング版）

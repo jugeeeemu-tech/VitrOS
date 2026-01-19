@@ -232,32 +232,81 @@ pub fn reload_cr3() {
     write_cr3(cr3);
 }
 
-/// 指定した物理アドレスがMMIO領域かどうかを判定
-///
-/// UEFIメモリマップに基づいて、EFI_MEMORY_MAPPED_IOまたは
-/// EFI_MEMORY_MAPPED_IO_PORT_SPACEタイプの領域に含まれるかを確認する。
+/// MMIO領域の範囲を表す構造体（二分探索用）
+#[derive(Clone, Copy)]
+struct MmioRange {
+    start: u64,
+    end: u64,
+}
+
+/// メモリマップからMMIO領域を抽出し、開始アドレスでソートして返す
 ///
 /// # Arguments
-/// * `phys_addr` - 判定する物理アドレス
-/// * `memory_regions` - UEFIメモリマップのスライス（有効範囲のみ）
-fn is_mmio_region(
-    phys_addr: u64,
+/// * `memory_regions` - UEFIメモリマップのスライス
+///
+/// # Returns
+/// MMIO領域の配列（最大64個）とその個数
+fn extract_mmio_regions(
     memory_regions: &[vitros_common::boot_info::MemoryRegion],
-) -> bool {
+) -> ([MmioRange; 64], usize) {
     use vitros_common::uefi::{EFI_MEMORY_MAPPED_IO, EFI_MEMORY_MAPPED_IO_PORT_SPACE};
 
-    for region in memory_regions {
-        let region_end = region.start + region.size;
+    let mut mmio_ranges = [MmioRange { start: 0, end: 0 }; 64];
+    let mut count = 0;
 
-        if phys_addr >= region.start && phys_addr < region_end {
-            if region.region_type == EFI_MEMORY_MAPPED_IO
-                || region.region_type == EFI_MEMORY_MAPPED_IO_PORT_SPACE
-            {
-                return true;
+    // MMIO領域を抽出
+    for region in memory_regions {
+        if region.region_type == EFI_MEMORY_MAPPED_IO
+            || region.region_type == EFI_MEMORY_MAPPED_IO_PORT_SPACE
+        {
+            if count < 64 {
+                mmio_ranges[count] = MmioRange {
+                    start: region.start,
+                    end: region.start + region.size,
+                };
+                count += 1;
             }
         }
     }
-    false
+
+    // 開始アドレスでソート（挿入ソート: 小規模配列向け）
+    for i in 1..count {
+        let key = mmio_ranges[i];
+        let mut j = i;
+        while j > 0 && mmio_ranges[j - 1].start > key.start {
+            mmio_ranges[j] = mmio_ranges[j - 1];
+            j -= 1;
+        }
+        mmio_ranges[j] = key;
+    }
+
+    (mmio_ranges, count)
+}
+
+/// 二分探索によるMMIO領域判定（O(log m)）
+///
+/// # Arguments
+/// * `phys_addr` - 判定する物理アドレス
+/// * `mmio_ranges` - ソート済みMMIO領域配列
+/// * `count` - 有効なMMIO領域の数
+fn is_mmio_region_binary(phys_addr: u64, mmio_ranges: &[MmioRange; 64], count: usize) -> bool {
+    if count == 0 {
+        return false;
+    }
+
+    // partition_point: phys_addr >= range.start となる最初の位置を超える位置を返す
+    // つまり、phys_addr以下のstartを持つ領域の数を返す
+    let ranges = &mmio_ranges[..count];
+    let idx = ranges.partition_point(|range| range.start <= phys_addr);
+
+    // idxが0の場合、すべてのMMIO領域のstartがphys_addrより大きいため、MMIO外
+    if idx == 0 {
+        return false;
+    }
+
+    // idx-1 の領域が phys_addr を含むかチェック
+    let candidate = &ranges[idx - 1];
+    phys_addr < candidate.end
 }
 
 /// カーネル専用スタック（64KB）
@@ -403,15 +452,16 @@ pub fn init(boot_info: &vitros_common::boot_info::BootInfo) -> Result<(), Paging
         // === 必要なページのみマッピング（高位のみ）===
         // MMIO領域はスキップし、後でmap_mmio()でUC属性でマッピングする
         let mut skipped_mmio_pages = 0usize;
-        // メモリマップのスライスをループ外で一度だけ作成
+        // メモリマップからMMIO領域を抽出し、ソート済み配列を作成（ループ前に1回だけ）
         let memory_region_count = boot_info.memory_map_count.min(boot_info.memory_map.len());
         let memory_regions = &boot_info.memory_map[..memory_region_count];
+        let (mmio_ranges, mmio_count) = extract_mmio_regions(memory_regions);
         for pt_idx in 0..required_pt_count {
             for page_idx in 0..PAGE_TABLE_ENTRY_COUNT {
                 let physical_addr =
                     ((pt_idx * PAGE_TABLE_ENTRY_COUNT + page_idx) * PAGE_SIZE) as u64;
                 if physical_addr < actual_max {
-                    if is_mmio_region(physical_addr, memory_regions) {
+                    if is_mmio_region_binary(physical_addr, &mmio_ranges, mmio_count) {
                         // MMIO領域はスキップ（Present=0のまま）
                         skipped_mmio_pages += 1;
                     } else {
