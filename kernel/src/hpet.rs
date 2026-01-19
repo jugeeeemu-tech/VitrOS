@@ -6,6 +6,13 @@
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+/// HPETエラー
+#[derive(Debug, Clone, Copy)]
+pub enum HpetError {
+    /// HPETが初期化されていない
+    NotInitialized,
+}
+
 /// HPETが利用可能かどうか
 static HPET_AVAILABLE: AtomicBool = AtomicBool::new(false);
 
@@ -32,23 +39,24 @@ mod registers {
 }
 
 /// HPETレジスタからの読み込み（64bit）
-unsafe fn read_hpet_reg(offset: u64) -> u64 {
+unsafe fn read_hpet_reg(offset: u64) -> Result<u64, HpetError> {
     let base = HPET_BASE.load(Ordering::SeqCst);
     if base == 0 {
-        return 0;
+        return Err(HpetError::NotInitialized);
     }
     let addr = (base + offset) as *const u64;
-    unsafe { read_volatile(addr) }
+    Ok(unsafe { read_volatile(addr) })
 }
 
 /// HPETレジスタへの書き込み（64bit）
-unsafe fn write_hpet_reg(offset: u64, value: u64) {
+unsafe fn write_hpet_reg(offset: u64, value: u64) -> Result<(), HpetError> {
     let base = HPET_BASE.load(Ordering::SeqCst);
     if base == 0 {
-        return;
+        return Err(HpetError::NotInitialized);
     }
     let addr = (base + offset) as *mut u64;
-    unsafe { write_volatile(addr, value) }
+    unsafe { write_volatile(addr, value) };
+    Ok(())
 }
 
 /// ACPIからHPETを初期化
@@ -64,13 +72,16 @@ pub fn init(base_phys_addr: u64) -> Result<(), crate::paging::PagingError> {
     HPET_BASE.store(base_virt, Ordering::SeqCst);
 
     // SAFETY:
-    // - HPETのベースアドレスはACPIテーブルから取得した有効なMMIOアドレス
-    // - 上記の map_mmio() によりUC属性でページテーブルにマッピング済み
+    // - HPETのベースアドレスは上記でHPET_BASEに設定済み
+    // - map_mmio() によりUC属性でページテーブルにマッピング済み
     // - read_volatile/write_volatile により、コンパイラの最適化を防ぎ
     //   MMIOレジスタへの正確なアクセスを保証
+    // Note: read_hpet_reg/write_hpet_regの呼び出しは、ベースアドレスが
+    // 設定された直後なのでNotInitializedエラーは発生しない
     unsafe {
         // General Capabilities and ID レジスタを読み込み
-        let cap_id = read_hpet_reg(registers::GENERAL_CAP_ID);
+        let cap_id =
+            read_hpet_reg(registers::GENERAL_CAP_ID).expect("HPET base address already set");
 
         // bits 63:32 = Counter Clock Period in femtoseconds
         let period_fs = cap_id >> 32;
@@ -87,11 +98,14 @@ pub fn init(base_phys_addr: u64) -> Result<(), crate::paging::PagingError> {
 
         // HPETを有効化
         // bit 0 = ENABLE_CNF (Overall Enable)
-        let config = read_hpet_reg(registers::GENERAL_CONFIG);
-        write_hpet_reg(registers::GENERAL_CONFIG, config | 1);
+        let config =
+            read_hpet_reg(registers::GENERAL_CONFIG).expect("HPET base address already set");
+        write_hpet_reg(registers::GENERAL_CONFIG, config | 1)
+            .expect("HPET base address already set");
 
         // 初期カウンタ値を保存（経過時間計算の基準点）
-        let start_counter = read_hpet_reg(registers::MAIN_COUNTER);
+        let start_counter =
+            read_hpet_reg(registers::MAIN_COUNTER).expect("HPET base address already set");
         HPET_START_COUNTER.store(start_counter, Ordering::SeqCst);
 
         HPET_AVAILABLE.store(true, Ordering::SeqCst);
@@ -119,9 +133,11 @@ pub fn frequency() -> u64 {
 }
 
 /// HPETのメインカウンタを読み取る
+///
+/// HPETが初期化されていない場合は0を返す
 pub fn read_counter() -> u64 {
     // SAFETY: HPETが初期化されていれば、メインカウンタの読み取りは安全
-    unsafe { read_hpet_reg(registers::MAIN_COUNTER) }
+    unsafe { read_hpet_reg(registers::MAIN_COUNTER).unwrap_or(0) }
 }
 
 /// 指定ナノ秒間待機（HPETを使用）
