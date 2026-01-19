@@ -281,7 +281,7 @@ pub unsafe extern "C" fn switch_to_kernel_stack() {
 pub const MAX_SUPPORTED_MEMORY_GB: usize = 8;
 
 /// Page Table数（各PTは2MBをカバー）
-/// 4GB = 2048個のPT（512 * 4 = 2048）
+/// 8GB = 4096個のPT（512 * 8 = 4096）
 const PT_COUNT: usize = MAX_SUPPORTED_MEMORY_GB * 512;
 
 static mut KERNEL_PML4: PageTable = PageTable::new();
@@ -605,6 +605,11 @@ pub fn dump_mtrr() {
 /// init()でスキップされたMMIO領域を、デバイス使用前に動的にマッピングする。
 /// キャッシュ無効（UC）属性でマッピングされるため、MMIOレジスタへのアクセスが
 /// 正しく行われることが保証される。
+///
+/// # Safety Preconditions
+/// * この関数はシングルコア環境または割り込み無効状態で呼び出すこと
+/// * カーネル初期化段階（BSP上でAPが起動する前）での使用を想定
+/// * 同じアドレスに対して複数回呼び出された場合、既存のマッピングを上書きする
 ///
 /// # Arguments
 /// * `phys_addr` - マッピングする物理アドレス（4KB境界にアライメントされている必要がある）

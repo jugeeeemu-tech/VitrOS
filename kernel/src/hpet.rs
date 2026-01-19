@@ -59,6 +59,8 @@ unsafe fn write_hpet_reg(offset: u64, value: u64) {
 /// * `base_phys_addr` - HPETレジスタの物理ベースアドレス
 pub fn init(base_phys_addr: u64) {
     // HPET MMIO領域をUC属性でマッピング
+    // NOTE: カーネル初期化の初期段階で失敗した場合は継続不可能なため、
+    // panicで即座に停止するのが適切
     crate::paging::map_mmio(base_phys_addr, 0x1000).expect("Failed to map HPET MMIO");
 
     // 物理アドレスを仮想アドレスに変換

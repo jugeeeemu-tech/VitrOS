@@ -132,6 +132,8 @@ unsafe fn write_msr(msr: u32, value: u64) {
 /// Local APICを有効化
 pub fn enable_apic() {
     // APIC MMIO領域をUC属性でマッピング
+    // NOTE: カーネル初期化の初期段階で失敗した場合は継続不可能なため、
+    // panicで即座に停止するのが適切
     crate::paging::map_mmio(APIC_PHYS_BASE, 0x1000).expect("Failed to map APIC MMIO");
 
     // SAFETY: IA32_APIC_BASE MSR (0x1B) はx86_64アーキテクチャで定義された
