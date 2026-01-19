@@ -68,7 +68,11 @@ pub fn init(base_phys_addr: u64) -> Result<(), crate::paging::PagingError> {
     let base_virt = KERNEL_VIRTUAL_BASE + base_phys_addr;
     HPET_BASE.store(base_virt, Ordering::SeqCst);
 
-    // SAFETY: HPETのベースアドレスはACPIテーブルから取得した有効なアドレス
+    // SAFETY:
+    // - HPETのベースアドレスはACPIテーブルから取得した有効なMMIOアドレス
+    // - 上記の map_mmio() によりUC属性でページテーブルにマッピング済み
+    // - read_volatile/write_volatile により、コンパイラの最適化を防ぎ
+    //   MMIOレジスタへの正確なアクセスを保証
     unsafe {
         // General Capabilities and ID レジスタを読み込み
         let cap_id = read_hpet_reg(registers::GENERAL_CAP_ID);

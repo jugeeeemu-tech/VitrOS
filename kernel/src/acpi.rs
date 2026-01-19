@@ -4,7 +4,7 @@
 //! UEFI ブートローダーから RSDP アドレスを受け取り、XSDT/RSDT を解析します。
 
 use crate::info;
-use crate::paging::{KERNEL_VIRTUAL_BASE, phys_to_virt};
+use crate::paging::phys_to_virt;
 use vitros_common::boot_info::BootInfo;
 
 /// RSDP (Root System Description Pointer) - ACPI 1.0
@@ -196,10 +196,13 @@ pub fn init(boot_info: &BootInfo) {
     }
 
     // RSDP の物理アドレスを高位仮想アドレスに変換
-    let rsdp_virt_addr = phys_to_virt(boot_info.rsdp_address).unwrap_or_else(|_| {
-        info!("Failed to convert RSDP address, falling back to direct addition");
-        KERNEL_VIRTUAL_BASE + boot_info.rsdp_address
-    });
+    let rsdp_virt_addr = match phys_to_virt(boot_info.rsdp_address) {
+        Ok(addr) => addr,
+        Err(_) => {
+            info!("Failed to convert RSDP address. ACPI not available.");
+            return;
+        }
+    };
     let rsdp = unsafe { &*(rsdp_virt_addr as *const Rsdp) };
 
     if !rsdp.is_valid_signature() {
@@ -238,12 +241,11 @@ pub fn init(boot_info: &BootInfo) {
 
 /// XSDT (Extended System Description Table) を解析
 fn parse_xsdt(xsdt_phys_addr: u64) {
-    if xsdt_phys_addr == 0 {
-        return;
-    }
-
-    // 物理アドレスを高位仮想アドレスに変換
-    let xsdt_virt_addr = KERNEL_VIRTUAL_BASE + xsdt_phys_addr;
+    // 物理アドレスを高位仮想アドレスに変換（0チェックも含む）
+    let xsdt_virt_addr = match phys_to_virt(xsdt_phys_addr) {
+        Ok(addr) => addr,
+        Err(_) => return,
+    };
     let header = unsafe { &*(xsdt_virt_addr as *const AcpiTableHeader) };
 
     if header.signature_str() != "XSDT" {
@@ -268,7 +270,10 @@ fn parse_xsdt(xsdt_phys_addr: u64) {
     for i in 0..entry_count {
         // packed 構造体の後なのでアンアラインドアクセスが必要
         let table_phys_addr = unsafe { entries_ptr.add(i).read_unaligned() };
-        let table_virt_addr = KERNEL_VIRTUAL_BASE + table_phys_addr;
+        let table_virt_addr = match phys_to_virt(table_phys_addr) {
+            Ok(addr) => addr,
+            Err(_) => continue,
+        };
         let table_header = unsafe { &*(table_virt_addr as *const AcpiTableHeader) };
 
         info!(
@@ -301,12 +306,11 @@ fn parse_xsdt(xsdt_phys_addr: u64) {
 
 /// RSDT (Root System Description Table) を解析
 fn parse_rsdt(rsdt_phys_addr: u64) {
-    if rsdt_phys_addr == 0 {
-        return;
-    }
-
-    // 物理アドレスを高位仮想アドレスに変換
-    let rsdt_virt_addr = KERNEL_VIRTUAL_BASE + rsdt_phys_addr;
+    // 物理アドレスを高位仮想アドレスに変換（0チェックも含む）
+    let rsdt_virt_addr = match phys_to_virt(rsdt_phys_addr) {
+        Ok(addr) => addr,
+        Err(_) => return,
+    };
     let header = unsafe { &*(rsdt_virt_addr as *const AcpiTableHeader) };
 
     if header.signature_str() != "RSDT" {
@@ -331,7 +335,10 @@ fn parse_rsdt(rsdt_phys_addr: u64) {
     for i in 0..entry_count {
         // packed 構造体の後なのでアンアラインドアクセスが必要
         let table_phys_addr = unsafe { entries_ptr.add(i).read_unaligned() } as u64;
-        let table_virt_addr = KERNEL_VIRTUAL_BASE + table_phys_addr;
+        let table_virt_addr = match phys_to_virt(table_phys_addr) {
+            Ok(addr) => addr,
+            Err(_) => continue,
+        };
         let table_header = unsafe { &*(table_virt_addr as *const AcpiTableHeader) };
 
         info!(
@@ -364,12 +371,11 @@ fn parse_rsdt(rsdt_phys_addr: u64) {
 
 /// MADT (Multiple APIC Description Table) を解析
 fn parse_madt(madt_phys_addr: u64) {
-    if madt_phys_addr == 0 {
-        return;
-    }
-
-    // 物理アドレスを高位仮想アドレスに変換
-    let madt_virt_addr = KERNEL_VIRTUAL_BASE + madt_phys_addr;
+    // 物理アドレスを高位仮想アドレスに変換（0チェックも含む）
+    let madt_virt_addr = match phys_to_virt(madt_phys_addr) {
+        Ok(addr) => addr,
+        Err(_) => return,
+    };
     let madt = unsafe { &*(madt_virt_addr as *const Madt) };
 
     // チェックサムを検証
@@ -456,12 +462,11 @@ fn parse_madt(madt_phys_addr: u64) {
 
 /// MCFG (Memory Mapped Configuration) を解析
 fn parse_mcfg(mcfg_phys_addr: u64) {
-    if mcfg_phys_addr == 0 {
-        return;
-    }
-
-    // 物理アドレスを高位仮想アドレスに変換
-    let mcfg_virt_addr = KERNEL_VIRTUAL_BASE + mcfg_phys_addr;
+    // 物理アドレスを高位仮想アドレスに変換（0チェックも含む）
+    let mcfg_virt_addr = match phys_to_virt(mcfg_phys_addr) {
+        Ok(addr) => addr,
+        Err(_) => return,
+    };
     let mcfg = unsafe { &*(mcfg_virt_addr as *const Mcfg) };
 
     // チェックサムを検証
@@ -515,12 +520,11 @@ fn parse_mcfg(mcfg_phys_addr: u64) {
 /// # Errors
 /// * `PagingError` - HPETのMMIOマッピングに失敗した場合
 fn parse_hpet(hpet_phys_addr: u64) -> Result<(), crate::paging::PagingError> {
-    if hpet_phys_addr == 0 {
-        return Ok(());
-    }
-
-    // 物理アドレスを高位仮想アドレスに変換
-    let hpet_virt_addr = KERNEL_VIRTUAL_BASE + hpet_phys_addr;
+    // 物理アドレスを高位仮想アドレスに変換（0チェックも含む）
+    let hpet_virt_addr = match phys_to_virt(hpet_phys_addr) {
+        Ok(addr) => addr,
+        Err(_) => return Ok(()),
+    };
     let hpet = unsafe { &*(hpet_virt_addr as *const HpetTable) };
 
     // チェックサムを検証

@@ -21,10 +21,6 @@ pub enum PagingError {
     GuardPageSetupFailed,
     /// ページテーブル初期化に失敗
     PageTableInitFailed,
-    /// ACPIアドレスが無効
-    AcpiAddressInvalid,
-    /// チェックサム検証失敗
-    ChecksumFailed,
 }
 
 impl core::fmt::Display for PagingError {
@@ -34,8 +30,6 @@ impl core::fmt::Display for PagingError {
             PagingError::AddressConversionFailed => write!(f, "Address conversion failed"),
             PagingError::GuardPageSetupFailed => write!(f, "Guard page setup failed"),
             PagingError::PageTableInitFailed => write!(f, "Page table initialization failed"),
-            PagingError::AcpiAddressInvalid => write!(f, "ACPI address is invalid"),
-            PagingError::ChecksumFailed => write!(f, "Checksum verification failed"),
         }
     }
 }
@@ -45,6 +39,9 @@ const PAGE_TABLE_ENTRY_COUNT: usize = 512;
 
 /// ページサイズ（4KB）
 pub const PAGE_SIZE: usize = 4096;
+
+/// ページオフセットマスク（下位12ビット）
+const PAGE_OFFSET_MASK: u64 = 0xFFF;
 
 /// 物理アドレスを仮想アドレスに変換
 ///
@@ -130,7 +127,7 @@ impl PageTableEntry {
         // 下位12ビットをクリア（4KBアライメント）
         let addr_masked = addr & 0x000F_FFFF_FFFF_F000;
         // フラグをクリアして新しいアドレスを設定
-        self.entry = (self.entry & 0xFFF) | addr_masked;
+        self.entry = (self.entry & PAGE_OFFSET_MASK) | addr_masked;
     }
 
     /// エントリを完全に設定（アドレス + フラグ）
@@ -215,6 +212,11 @@ pub fn write_cr3(pml4_addr: u64) {
 }
 
 /// CR3レジスタをリロード（TLBフラッシュ）
+///
+/// 現在のCPUのTLBのみをフラッシュする。
+///
+/// # TODO: マルチコア対応
+/// マルチコア環境では他CPUへのIPIによるTLB shootdownが必要。
 #[allow(dead_code)]
 pub fn reload_cr3() {
     let cr3 = read_cr3();
@@ -617,6 +619,10 @@ pub fn dump_mtrr() {
 /// * カーネル初期化段階（BSP上でAPが起動する前）での使用を想定
 /// * 同じアドレスに対して複数回呼び出された場合、既存のマッピングを上書きする
 ///
+/// # TODO: マルチコア対応
+/// マルチコア環境ではspinlockまたはmutexによる排他制御が必要。
+/// 現在はカーネル初期化段階でのみ使用されるため未実装。
+///
 /// # Arguments
 /// * `phys_addr` - マッピングする物理アドレス（4KB境界にアライメントされている必要がある）
 /// * `size` - マッピングするサイズ（バイト単位、4KB単位に切り上げられる）
@@ -631,7 +637,7 @@ pub fn map_mmio(phys_addr: u64, size: u64) -> Result<u64, PagingError> {
     use crate::info;
 
     // 4KB境界アライメントチェック
-    if phys_addr & 0xFFF != 0 {
+    if phys_addr & PAGE_OFFSET_MASK != 0 {
         return Err(PagingError::InvalidAddress);
     }
 
