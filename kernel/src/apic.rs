@@ -130,11 +130,12 @@ unsafe fn write_msr(msr: u32, value: u64) {
 }
 
 /// Local APICを有効化
-pub fn enable_apic() {
+///
+/// # Errors
+/// * `PagingError` - APIC MMIOマッピングに失敗した場合
+pub fn enable_apic() -> Result<(), crate::paging::PagingError> {
     // APIC MMIO領域をUC属性でマッピング
-    // NOTE: カーネル初期化の初期段階で失敗した場合は継続不可能なため、
-    // panicで即座に停止するのが適切
-    crate::paging::map_mmio(APIC_PHYS_BASE, 0x1000).expect("Failed to map APIC MMIO");
+    crate::paging::map_mmio(APIC_PHYS_BASE, crate::paging::PAGE_SIZE as u64)?;
 
     // SAFETY: IA32_APIC_BASE MSR (0x1B) はx86_64アーキテクチャで定義された
     // 標準的なMSRであり、APICの有効化に使用される。
@@ -156,6 +157,8 @@ pub fn enable_apic() {
         // bits 0-7: Spurious Vector (通常は0xFF)
         write_apic_register(registers::SPURIOUS_INTERRUPT_VECTOR, 0x1FF);
     }
+
+    Ok(())
 }
 
 /// タイマー割り込みベクタ番号
@@ -371,9 +374,13 @@ fn disable_legacy_pic() {
 }
 
 /// Local APICを初期化
-pub fn init() {
+///
+/// # Errors
+/// * `PagingError` - APIC MMIOマッピングに失敗した場合
+pub fn init() -> Result<(), crate::paging::PagingError> {
     // まずレガシーPICを無効化
     disable_legacy_pic();
-    enable_apic();
+    enable_apic()?;
     // タイマーは別途 init_timer() で初期化
+    Ok(())
 }

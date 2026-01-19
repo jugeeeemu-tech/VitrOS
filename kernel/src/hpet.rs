@@ -57,11 +57,12 @@ unsafe fn write_hpet_reg(offset: u64, value: u64) {
 ///
 /// # Arguments
 /// * `base_phys_addr` - HPETレジスタの物理ベースアドレス
-pub fn init(base_phys_addr: u64) {
+///
+/// # Errors
+/// * `PagingError` - MMIOマッピングに失敗した場合
+pub fn init(base_phys_addr: u64) -> Result<(), crate::paging::PagingError> {
     // HPET MMIO領域をUC属性でマッピング
-    // NOTE: カーネル初期化の初期段階で失敗した場合は継続不可能なため、
-    // panicで即座に停止するのが適切
-    crate::paging::map_mmio(base_phys_addr, 0x1000).expect("Failed to map HPET MMIO");
+    crate::paging::map_mmio(base_phys_addr, crate::paging::PAGE_SIZE as u64)?;
 
     // 物理アドレスを仮想アドレスに変換
     let base_virt = KERNEL_VIRTUAL_BASE + base_phys_addr;
@@ -103,6 +104,8 @@ pub fn init(base_phys_addr: u64) {
             frequency / 1_000_000
         );
     }
+
+    Ok(())
 }
 
 /// HPETが利用可能かどうか

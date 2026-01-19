@@ -287,8 +287,14 @@ fn parse_xsdt(xsdt_phys_addr: u64) {
             parse_mcfg(table_phys_addr);
         }
         // HPET テーブルを見つけたら解析
+        // HPETは必須ではないのでエラー時はログ出力して継続
         else if table_header.signature_str() == "HPET" {
-            parse_hpet(table_phys_addr);
+            if let Err(e) = parse_hpet(table_phys_addr) {
+                info!(
+                    "HPET initialization failed: {:?}, continuing without HPET",
+                    e
+                );
+            }
         }
     }
 }
@@ -344,8 +350,14 @@ fn parse_rsdt(rsdt_phys_addr: u64) {
             parse_mcfg(table_phys_addr);
         }
         // HPET テーブルを見つけたら解析
+        // HPETは必須ではないのでエラー時はログ出力して継続
         else if table_header.signature_str() == "HPET" {
-            parse_hpet(table_phys_addr);
+            if let Err(e) = parse_hpet(table_phys_addr) {
+                info!(
+                    "HPET initialization failed: {:?}, continuing without HPET",
+                    e
+                );
+            }
         }
     }
 }
@@ -499,9 +511,12 @@ fn parse_mcfg(mcfg_phys_addr: u64) {
 }
 
 /// HPET (High Precision Event Timer) テーブルを解析
-fn parse_hpet(hpet_phys_addr: u64) {
+///
+/// # Errors
+/// * `PagingError` - HPETのMMIOマッピングに失敗した場合
+fn parse_hpet(hpet_phys_addr: u64) -> Result<(), crate::paging::PagingError> {
     if hpet_phys_addr == 0 {
-        return;
+        return Ok(());
     }
 
     // 物理アドレスを高位仮想アドレスに変換
@@ -511,7 +526,7 @@ fn parse_hpet(hpet_phys_addr: u64) {
     // チェックサムを検証
     if !hpet.header.verify_checksum() {
         info!("HPET checksum verification failed");
-        return;
+        return Ok(());
     }
 
     // packed struct のフィールドはローカル変数にコピー
@@ -528,9 +543,10 @@ fn parse_hpet(hpet_phys_addr: u64) {
     // メモリ空間のみサポート
     if address_space != 0 {
         info!("  HPET in I/O space not supported");
-        return;
+        return Ok(());
     }
 
     // HPETモジュールを初期化
-    crate::hpet::init(base_address);
+    crate::hpet::init(base_address)?;
+    Ok(())
 }

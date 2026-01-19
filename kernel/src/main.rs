@@ -258,8 +258,9 @@ extern "C" fn kernel_main_inner(boot_info_phys_addr: u64) -> ! {
     pci::scan_pci_bus();
 
     // Local APICを初期化
+    // APICは必須なので失敗時はpanic
     info!("Initializing Local APIC...");
-    apic::init();
+    apic::init().expect("Failed to initialize Local APIC");
     info!("Local APIC initialized");
 
     // APIC Timerをキャリブレーション（割り込み無効状態で実行）

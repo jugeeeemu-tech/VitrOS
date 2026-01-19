@@ -189,6 +189,12 @@ impl PageTable {
             entry.entry = 0;
         }
     }
+
+    /// 指定インデックスのエントリを読み取り専用で取得（デバッグビルド用）
+    #[cfg(debug_assertions)]
+    pub fn get_entry(&self, index: usize) -> &PageTableEntry {
+        &self.entries[index]
+    }
 }
 
 /// CR3レジスタを読み取る
@@ -303,7 +309,7 @@ static mut KERNEL_PT_HIGH: [PageTable; PT_COUNT] = [PageTable::new(); PT_COUNT];
 /// - 高位アドレス（0xFFFF_8000_0000_0000+）: カーネル用の直接マッピング
 ///
 /// UEFIメモリマップに基づいて、実際に利用可能なメモリ範囲のみをマッピングする。
-/// 最大サポートメモリは MAX_SUPPORTED_MEMORY_GB (4GB) まで。
+/// 最大サポートメモリは MAX_SUPPORTED_MEMORY_GB (8GB) まで。
 ///
 /// # Arguments
 /// * `boot_info` - ブートローダから渡されたメモリ情報
@@ -313,7 +319,7 @@ static mut KERNEL_PT_HIGH: [PageTable; PT_COUNT] = [PageTable::new(); PT_COUNT];
 /// * `PagingError::GuardPageSetupFailed` - Guard Page設定に失敗した場合
 pub fn init(boot_info: &vitros_common::boot_info::BootInfo) -> Result<(), PagingError> {
     // サポートする最大アドレスを計算
-    let max_supported = (MAX_SUPPORTED_MEMORY_GB as u64) << 30; // 4GB
+    let max_supported = (MAX_SUPPORTED_MEMORY_GB as u64) << 30; // 8GB
     let actual_max = boot_info.max_physical_address.min(max_supported);
 
     // 必要なPD数とPT数を計算
@@ -653,6 +659,20 @@ pub fn map_mmio(phys_addr: u64, size: u64) -> Result<u64, PagingError> {
             // インデックスの範囲検証
             if pt_array_idx >= PT_COUNT {
                 return Err(PagingError::PageTableInitFailed);
+            }
+
+            // デバッグビルド時のみ重複マッピングを警告
+            #[cfg(debug_assertions)]
+            {
+                if (*pt_high)[pt_array_idx]
+                    .get_entry(page_idx_in_pt)
+                    .is_present()
+                {
+                    info!(
+                        "Warning: map_mmio overwriting existing mapping at 0x{:X}",
+                        addr
+                    );
+                }
             }
 
             // UC属性でページテーブルエントリを設定
