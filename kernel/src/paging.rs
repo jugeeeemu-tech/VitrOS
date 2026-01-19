@@ -46,6 +46,10 @@ const PAGE_TABLE_COVERAGE: u64 = (PAGE_TABLE_ENTRY_COUNT * PAGE_SIZE) as u64;
 /// ページオフセットマスク（下位12ビット）
 const PAGE_OFFSET_MASK: u64 = 0xFFF;
 
+/// カーネル空間のPML4エントリインデックス (0xFFFF_8000_0000_0000に対応)
+/// x86_64では仮想アドレスのビット47:39がPML4インデックスとなる
+const PML4_KERNEL_INDEX: usize = 256;
+
 /// 物理アドレスを仮想アドレスに変換
 ///
 /// # Arguments
@@ -370,9 +374,9 @@ pub fn init(boot_info: &vitros_common::boot_info::BootInfo) -> Result<(), Paging
         // 低位アドレス（0x0〜）はアンマップ（ハイヤーハーフカーネル）
         // PML4[0]は設定しない（Present=0のまま）
 
-        // PML4[256] -> PDP_HIGH (高位アドレス用: 0xFFFF_8000_0000_0000〜)
+        // PML4[PML4_KERNEL_INDEX] -> PDP_HIGH (高位アドレス用: 0xFFFF_8000_0000_0000〜)
         (*pml4)
-            .entry(256)
+            .entry(PML4_KERNEL_INDEX)
             .set((*pdp_high).physical_address()?, flags);
 
         // === 必要なPDPエントリのみ設定（高位のみ）===
@@ -527,23 +531,6 @@ impl MemoryType {
     }
 }
 
-/// MSRを読み込む
-///
-/// # Safety
-/// - msrが有効なMSRアドレスであること
-unsafe fn read_msr(msr: u32) -> u64 {
-    let low: u32;
-    let high: u32;
-    asm!(
-        "rdmsr",
-        in("ecx") msr,
-        out("eax") low,
-        out("edx") high,
-        options(nostack, preserves_flags)
-    );
-    ((high as u64) << 32) | (low as u64)
-}
-
 /// MTRRの情報を表示
 pub fn dump_mtrr() {
     use crate::info;
@@ -552,7 +539,7 @@ pub fn dump_mtrr() {
 
     unsafe {
         // MTRRCAP: MTRRの機能を確認
-        let mtrrcap = read_msr(msr::IA32_MTRRCAP);
+        let mtrrcap = crate::msr::read(msr::IA32_MTRRCAP);
         let vcnt = (mtrrcap & 0xFF) as u8; // 可変範囲レジスタの数
         let fix_supported = (mtrrcap >> 8) & 1 != 0;
         let wc_supported = (mtrrcap >> 10) & 1 != 0;
@@ -563,7 +550,7 @@ pub fn dump_mtrr() {
         );
 
         // デフォルトメモリタイプ
-        let def_type = read_msr(msr::IA32_MTRR_DEF_TYPE);
+        let def_type = crate::msr::read(msr::IA32_MTRR_DEF_TYPE);
         let default_type = MemoryType::from_u8((def_type & 0xFF) as u8);
         let mtrr_enabled = (def_type >> 11) & 1 != 0;
         let fixed_enabled = (def_type >> 10) & 1 != 0;
@@ -581,8 +568,8 @@ pub fn dump_mtrr() {
             let base_msr = msr::IA32_MTRR_PHYSBASE0 + (i as u32 * 2);
             let mask_msr = msr::IA32_MTRR_PHYSMASK0 + (i as u32 * 2);
 
-            let base = read_msr(base_msr);
-            let mask = read_msr(mask_msr);
+            let base = crate::msr::read(base_msr);
+            let mask = crate::msr::read(mask_msr);
 
             let valid = (mask >> 11) & 1 != 0;
             if valid {
@@ -606,7 +593,7 @@ pub fn dump_mtrr() {
         }
 
         // PAT (Page Attribute Table)
-        let pat = read_msr(msr::IA32_PAT);
+        let pat = crate::msr::read(msr::IA32_PAT);
         info!("PAT Register: 0x{:016X}", pat);
         info!("PAT Entries:");
         for i in 0..8 {

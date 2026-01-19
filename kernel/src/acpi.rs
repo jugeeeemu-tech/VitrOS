@@ -328,12 +328,18 @@ fn parse_xsdt(xsdt_phys_addr: u64) {
         );
 
         // APIC (MADT) テーブルを見つけたら解析
+        // MADTは必須ではないのでエラー時はログ出力して継続
         if table_header.signature_str() == "APIC" {
-            parse_madt(table_phys_addr);
+            if let Err(e) = parse_madt(table_phys_addr) {
+                info!("MADT parsing failed: {:?}, continuing without MADT", e);
+            }
         }
         // MCFG テーブルを見つけたら解析
+        // MCFGは必須ではないのでエラー時はログ出力して継続
         else if table_header.signature_str() == "MCFG" {
-            parse_mcfg(table_phys_addr);
+            if let Err(e) = parse_mcfg(table_phys_addr) {
+                info!("MCFG parsing failed: {:?}, continuing without MCFG", e);
+            }
         }
         // HPET テーブルを見つけたら解析
         // HPETは必須ではないのでエラー時はログ出力して継続
@@ -393,12 +399,18 @@ fn parse_rsdt(rsdt_phys_addr: u64) {
         );
 
         // APIC (MADT) テーブルを見つけたら解析
+        // MADTは必須ではないのでエラー時はログ出力して継続
         if table_header.signature_str() == "APIC" {
-            parse_madt(table_phys_addr);
+            if let Err(e) = parse_madt(table_phys_addr) {
+                info!("MADT parsing failed: {:?}, continuing without MADT", e);
+            }
         }
         // MCFG テーブルを見つけたら解析
+        // MCFGは必須ではないのでエラー時はログ出力して継続
         else if table_header.signature_str() == "MCFG" {
-            parse_mcfg(table_phys_addr);
+            if let Err(e) = parse_mcfg(table_phys_addr) {
+                info!("MCFG parsing failed: {:?}, continuing without MCFG", e);
+            }
         }
         // HPET テーブルを見つけたら解析
         // HPETは必須ではないのでエラー時はログ出力して継続
@@ -414,18 +426,19 @@ fn parse_rsdt(rsdt_phys_addr: u64) {
 }
 
 /// MADT (Multiple APIC Description Table) を解析
-fn parse_madt(madt_phys_addr: u64) {
+///
+/// # Errors
+/// * `AcpiError::AddressConversionFailed` - MADTテーブルのアドレス変換に失敗した場合
+/// * `AcpiError::ChecksumFailed` - チェックサム検証に失敗した場合
+fn parse_madt(madt_phys_addr: u64) -> Result<(), AcpiError> {
     // 物理アドレスを高位仮想アドレスに変換（0チェックも含む）
-    let madt_virt_addr = match phys_to_virt(madt_phys_addr) {
-        Ok(addr) => addr,
-        Err(_) => return,
-    };
+    let madt_virt_addr =
+        phys_to_virt(madt_phys_addr).map_err(|_| AcpiError::AddressConversionFailed)?;
     let madt = unsafe { &*(madt_virt_addr as *const Madt) };
 
     // チェックサムを検証
     if !madt.header.verify_checksum() {
-        info!("MADT checksum verification failed");
-        return;
+        return Err(AcpiError::ChecksumFailed);
     }
 
     // packed struct のフィールドはローカル変数にコピー
@@ -505,21 +518,24 @@ fn parse_madt(madt_phys_addr: u64) {
         "MADT Summary: {} CPU(s), {} I/O APIC(s)",
         cpu_count, io_apic_count
     );
+
+    Ok(())
 }
 
 /// MCFG (Memory Mapped Configuration) を解析
-fn parse_mcfg(mcfg_phys_addr: u64) {
+///
+/// # Errors
+/// * `AcpiError::AddressConversionFailed` - MCFGテーブルのアドレス変換に失敗した場合
+/// * `AcpiError::ChecksumFailed` - チェックサム検証に失敗した場合
+fn parse_mcfg(mcfg_phys_addr: u64) -> Result<(), AcpiError> {
     // 物理アドレスを高位仮想アドレスに変換（0チェックも含む）
-    let mcfg_virt_addr = match phys_to_virt(mcfg_phys_addr) {
-        Ok(addr) => addr,
-        Err(_) => return,
-    };
+    let mcfg_virt_addr =
+        phys_to_virt(mcfg_phys_addr).map_err(|_| AcpiError::AddressConversionFailed)?;
     let mcfg = unsafe { &*(mcfg_virt_addr as *const Mcfg) };
 
     // チェックサムを検証
     if !mcfg.header.verify_checksum() {
-        info!("MCFG checksum verification failed");
-        return;
+        return Err(AcpiError::ChecksumFailed);
     }
 
     // packed struct のフィールドはローカル変数にコピー
@@ -560,6 +576,8 @@ fn parse_mcfg(mcfg_phys_addr: u64) {
         current_addr += entry_size as u64;
         index += 1;
     }
+
+    Ok(())
 }
 
 /// HPET (High Precision Event Timer) テーブルを解析

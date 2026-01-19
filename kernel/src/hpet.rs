@@ -6,8 +6,6 @@
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crate::paging::KERNEL_VIRTUAL_BASE;
-
 /// HPETが利用可能かどうか
 static HPET_AVAILABLE: AtomicBool = AtomicBool::new(false);
 
@@ -61,11 +59,8 @@ unsafe fn write_hpet_reg(offset: u64, value: u64) {
 /// # Errors
 /// * `PagingError` - MMIOマッピングに失敗した場合
 pub fn init(base_phys_addr: u64) -> Result<(), crate::paging::PagingError> {
-    // HPET MMIO領域をUC属性でマッピング
-    crate::paging::map_mmio(base_phys_addr, crate::paging::PAGE_SIZE as u64)?;
-
-    // 物理アドレスを仮想アドレスに変換
-    let base_virt = KERNEL_VIRTUAL_BASE + base_phys_addr;
+    // HPET MMIO領域をUC属性でマッピングし、仮想アドレスを取得
+    let base_virt = crate::paging::map_mmio(base_phys_addr, crate::paging::PAGE_SIZE as u64)?;
     HPET_BASE.store(base_virt, Ordering::SeqCst);
 
     // SAFETY:

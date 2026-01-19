@@ -93,50 +93,6 @@ unsafe fn read_apic_register(offset: u32) -> u32 {
     unsafe { read_volatile(addr) }
 }
 
-/// MSR (Model Specific Register) の読み込み
-///
-/// # Safety
-/// - msrが有効なMSRアドレスであること
-/// - Ring 0で実行されること
-unsafe fn read_msr(msr: u32) -> u64 {
-    let low: u32;
-    let high: u32;
-    // SAFETY: 呼び出し元が有効なMSRアドレスを指定することを保証する。
-    // RDMSR命令はRing 0でのみ実行可能であり、カーネルモードで動作している。
-    unsafe {
-        asm!(
-            "rdmsr",
-            in("ecx") msr,
-            out("eax") low,
-            out("edx") high,
-            options(nostack, preserves_flags)
-        );
-    }
-    ((high as u64) << 32) | (low as u64)
-}
-
-/// MSR (Model Specific Register) への書き込み
-///
-/// # Safety
-/// - msrが有効な書き込み可能MSRアドレスであること
-/// - valueがそのMSRに対して有効な値であること
-/// - Ring 0で実行されること
-unsafe fn write_msr(msr: u32, value: u64) {
-    let low = (value & 0xFFFFFFFF) as u32;
-    let high = ((value >> 32) & 0xFFFFFFFF) as u32;
-    // SAFETY: 呼び出し元が有効なMSRアドレスと値を指定することを保証する。
-    // WRMSR命令はRing 0でのみ実行可能であり、カーネルモードで動作している。
-    unsafe {
-        asm!(
-            "wrmsr",
-            in("ecx") msr,
-            in("eax") low,
-            in("edx") high,
-            options(nostack, preserves_flags)
-        );
-    }
-}
-
 /// Local APICを有効化
 ///
 /// # Errors
@@ -152,13 +108,13 @@ fn enable_apic() -> Result<(), crate::paging::PagingError> {
     unsafe {
         // IA32_APIC_BASE MSR (0x1B) を読み込み
         const IA32_APIC_BASE_MSR: u32 = 0x1B;
-        let mut apic_base_msr = read_msr(IA32_APIC_BASE_MSR);
+        let mut apic_base_msr = crate::msr::read(IA32_APIC_BASE_MSR);
 
         // APIC Enable bit (bit 11) をセット
         apic_base_msr |= 1 << 11;
 
         // MSRに書き戻し
-        write_msr(IA32_APIC_BASE_MSR, apic_base_msr);
+        crate::msr::write(IA32_APIC_BASE_MSR, apic_base_msr);
 
         // Spurious Interrupt Vector Registerを設定してAPICを有効化
         // bit 8: APIC Software Enable/Disable

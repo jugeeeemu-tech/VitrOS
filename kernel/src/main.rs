@@ -16,6 +16,7 @@ mod graphics;
 mod hpet;
 mod idt;
 mod io;
+mod msr;
 mod paging;
 mod pci;
 mod pit;
