@@ -487,6 +487,9 @@ pub fn init(boot_info: &vitros_common::boot_info::BootInfo) -> Result<(), Paging
 // MMIO マッピング関連
 // =============================================================================
 
+/// RFLAGS の IF (Interrupt Flag) ビット（ビット9）
+const RFLAGS_IF: u64 = 1 << 9;
+
 /// 割り込みが無効であることを確認
 ///
 /// スレッドセーフティのため、ページテーブル操作は割り込み無効状態で
@@ -498,9 +501,8 @@ fn assert_interrupts_disabled(context: &str) {
     unsafe {
         asm!("pushfq; pop {}", out(reg) rflags, options(nomem, preserves_flags));
     }
-    // IF (Interrupt Flag) はbit 9
     assert!(
-        (rflags & 0x200) == 0,
+        (rflags & RFLAGS_IF) == 0,
         "{}: must be called with interrupts disabled",
         context
     );
