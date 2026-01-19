@@ -16,6 +16,8 @@ mod graphics;
 mod hpet;
 mod idt;
 mod io;
+mod msr;
+mod mtrr;
 mod paging;
 mod pci;
 mod pit;
@@ -251,15 +253,23 @@ extern "C" fn kernel_main_inner(boot_info_phys_addr: u64) -> ! {
     // タスクシステムを初期化
     task::init();
 
-    // ACPI を初期化
-    acpi::init(&boot_info);
+    // ACPI を初期化（失敗してもカーネルは継続動作可能）
+    if let Err(e) = acpi::init(&boot_info) {
+        info!(
+            "ACPI initialization failed: {:?}, continuing without ACPI",
+            e
+        );
+    }
 
     // PCIバスをスキャン
     pci::scan_pci_bus();
 
     // Local APICを初期化
+    // APICは必須なので失敗時はpanic
+    // MADTから取得したAPICアドレスを使用（取得できなければデフォルト値を使用）
     info!("Initializing Local APIC...");
-    apic::init();
+    let apic_base = acpi::get_local_apic_address();
+    apic::init(apic_base).expect("Failed to initialize Local APIC");
     info!("Local APIC initialized");
 
     // APIC Timerをキャリブレーション（割り込み無効状態で実行）
@@ -267,7 +277,7 @@ extern "C" fn kernel_main_inner(boot_info_phys_addr: u64) -> ! {
     apic::calibrate_timer().expect("Failed to calibrate APIC Timer");
 
     // MTRR/PAT設定をダンプ（デバッグ用）
-    paging::dump_mtrr();
+    mtrr::dump();
 
     // ローカルフレームバッファを初期化
     // 物理アドレスを高位仮想アドレスに変換

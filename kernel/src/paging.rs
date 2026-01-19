@@ -21,10 +21,6 @@ pub enum PagingError {
     GuardPageSetupFailed,
     /// ページテーブル初期化に失敗
     PageTableInitFailed,
-    /// ACPIアドレスが無効
-    AcpiAddressInvalid,
-    /// チェックサム検証失敗
-    ChecksumFailed,
 }
 
 impl core::fmt::Display for PagingError {
@@ -34,8 +30,6 @@ impl core::fmt::Display for PagingError {
             PagingError::AddressConversionFailed => write!(f, "Address conversion failed"),
             PagingError::GuardPageSetupFailed => write!(f, "Guard page setup failed"),
             PagingError::PageTableInitFailed => write!(f, "Page table initialization failed"),
-            PagingError::AcpiAddressInvalid => write!(f, "ACPI address is invalid"),
-            PagingError::ChecksumFailed => write!(f, "Checksum verification failed"),
         }
     }
 }
@@ -45,6 +39,20 @@ const PAGE_TABLE_ENTRY_COUNT: usize = 512;
 
 /// ページサイズ（4KB）
 pub const PAGE_SIZE: usize = 4096;
+
+/// 1つのPage Tableがカバーする領域サイズ（2MB = 512 * 4KB）
+const PAGE_TABLE_COVERAGE: u64 = (PAGE_TABLE_ENTRY_COUNT * PAGE_SIZE) as u64;
+
+/// ページオフセットマスク（下位12ビット）
+const PAGE_OFFSET_MASK: u64 = 0xFFF;
+
+/// ページテーブルエントリから物理アドレスを抽出するためのマスク
+/// ビット12〜51が物理アドレス（4KB境界アライメント、最大52ビット物理アドレス対応）
+const PHYSICAL_ADDRESS_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+
+/// カーネル空間のPML4エントリインデックス (0xFFFF_8000_0000_0000に対応)
+/// x86_64では仮想アドレスのビット47:39がPML4インデックスとなる
+const PML4_KERNEL_INDEX: usize = 256;
 
 /// 物理アドレスを仮想アドレスに変換
 ///
@@ -128,22 +136,22 @@ impl PageTableEntry {
     #[allow(dead_code)]
     pub fn set_address(&mut self, addr: u64) {
         // 下位12ビットをクリア（4KBアライメント）
-        let addr_masked = addr & 0x000F_FFFF_FFFF_F000;
+        let addr_masked = addr & PHYSICAL_ADDRESS_MASK;
         // フラグをクリアして新しいアドレスを設定
-        self.entry = (self.entry & 0xFFF) | addr_masked;
+        self.entry = (self.entry & PAGE_OFFSET_MASK) | addr_masked;
     }
 
     /// エントリを完全に設定（アドレス + フラグ）
     pub fn set(&mut self, addr: u64, flags: u64) {
         // 既存のエントリを完全にクリアしてから設定
-        let addr_masked = addr & 0x000F_FFFF_FFFF_F000;
+        let addr_masked = addr & PHYSICAL_ADDRESS_MASK;
         self.entry = addr_masked | flags;
     }
 
     /// 物理アドレスを取得
     #[allow(dead_code)]
     pub fn get_address(&self) -> u64 {
-        self.entry & 0x000F_FFFF_FFFF_F000
+        self.entry & PHYSICAL_ADDRESS_MASK
     }
 
     /// エントリの生の値を取得（デバッグ用）
@@ -189,10 +197,15 @@ impl PageTable {
             entry.entry = 0;
         }
     }
+
+    /// 指定インデックスのエントリを読み取り専用で取得（デバッグビルド用）
+    #[cfg(debug_assertions)]
+    pub fn get_entry(&self, index: usize) -> &PageTableEntry {
+        &self.entries[index]
+    }
 }
 
 /// CR3レジスタを読み取る
-#[allow(dead_code)]
 pub fn read_cr3() -> u64 {
     let value: u64;
     unsafe {
@@ -209,10 +222,42 @@ pub fn write_cr3(pml4_addr: u64) {
 }
 
 /// CR3レジスタをリロード（TLBフラッシュ）
-#[allow(dead_code)]
+///
+/// 現在のCPUのTLBのみをフラッシュする。
+///
+/// # TODO: マルチコア対応
+/// マルチコア環境では他CPUへのIPIによるTLB shootdownが必要。
 pub fn reload_cr3() {
     let cr3 = read_cr3();
     write_cr3(cr3);
+}
+
+/// 指定した物理アドレスがMMIO領域かどうかを判定
+///
+/// UEFIメモリマップに基づいて、EFI_MEMORY_MAPPED_IOまたは
+/// EFI_MEMORY_MAPPED_IO_PORT_SPACEタイプの領域に含まれるかを確認する。
+///
+/// # Arguments
+/// * `phys_addr` - 判定する物理アドレス
+/// * `memory_regions` - UEFIメモリマップのスライス（有効範囲のみ）
+fn is_mmio_region(
+    phys_addr: u64,
+    memory_regions: &[vitros_common::boot_info::MemoryRegion],
+) -> bool {
+    use vitros_common::uefi::{EFI_MEMORY_MAPPED_IO, EFI_MEMORY_MAPPED_IO_PORT_SPACE};
+
+    for region in memory_regions {
+        let region_end = region.start + region.size;
+
+        if phys_addr >= region.start && phys_addr < region_end {
+            if region.region_type == EFI_MEMORY_MAPPED_IO
+                || region.region_type == EFI_MEMORY_MAPPED_IO_PORT_SPACE
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// カーネル専用スタック（64KB）
@@ -254,11 +299,12 @@ pub unsafe extern "C" fn switch_to_kernel_stack() {
 // 物理メモリの直接マッピング（Direct Mapping）を実装
 
 /// 最大サポートメモリ（GB単位）
-/// 静的配列のサイズを決定する - 4GB対応で約16MBのメモリ削減
-pub const MAX_SUPPORTED_MEMORY_GB: usize = 4;
+/// 静的配列のサイズを決定する - 8GBまでサポート
+/// MMIOホール（3-4GB付近）を超えてメモリマッピングするため8GBに拡張
+pub const MAX_SUPPORTED_MEMORY_GB: usize = 8;
 
 /// Page Table数（各PTは2MBをカバー）
-/// 4GB = 2048個のPT（512 * 4 = 2048）
+/// 8GB = 4096個のPT（512 * 8 = 4096）
 const PT_COUNT: usize = MAX_SUPPORTED_MEMORY_GB * 512;
 
 static mut KERNEL_PML4: PageTable = PageTable::new();
@@ -280,7 +326,7 @@ static mut KERNEL_PT_HIGH: [PageTable; PT_COUNT] = [PageTable::new(); PT_COUNT];
 /// - 高位アドレス（0xFFFF_8000_0000_0000+）: カーネル用の直接マッピング
 ///
 /// UEFIメモリマップに基づいて、実際に利用可能なメモリ範囲のみをマッピングする。
-/// 最大サポートメモリは MAX_SUPPORTED_MEMORY_GB (4GB) まで。
+/// 最大サポートメモリは MAX_SUPPORTED_MEMORY_GB (8GB) まで。
 ///
 /// # Arguments
 /// * `boot_info` - ブートローダから渡されたメモリ情報
@@ -290,12 +336,12 @@ static mut KERNEL_PT_HIGH: [PageTable; PT_COUNT] = [PageTable::new(); PT_COUNT];
 /// * `PagingError::GuardPageSetupFailed` - Guard Page設定に失敗した場合
 pub fn init(boot_info: &vitros_common::boot_info::BootInfo) -> Result<(), PagingError> {
     // サポートする最大アドレスを計算
-    let max_supported = (MAX_SUPPORTED_MEMORY_GB as u64) << 30; // 4GB
+    let max_supported = (MAX_SUPPORTED_MEMORY_GB as u64) << 30; // 8GB
     let actual_max = boot_info.max_physical_address.min(max_supported);
 
     // 必要なPD数とPT数を計算
     // 1 PT = 512 * 4KB = 2MB
-    let required_pt_count = ((actual_max + (2 << 20) - 1) / (2 << 20)) as usize;
+    let required_pt_count = ((actual_max + PAGE_TABLE_COVERAGE - 1) / PAGE_TABLE_COVERAGE) as usize;
     let required_pd_count = (required_pt_count + 511) / 512;
 
     use crate::info;
@@ -332,9 +378,9 @@ pub fn init(boot_info: &vitros_common::boot_info::BootInfo) -> Result<(), Paging
         // 低位アドレス（0x0〜）はアンマップ（ハイヤーハーフカーネル）
         // PML4[0]は設定しない（Present=0のまま）
 
-        // PML4[256] -> PDP_HIGH (高位アドレス用: 0xFFFF_8000_0000_0000〜)
+        // PML4[PML4_KERNEL_INDEX] -> PDP_HIGH (高位アドレス用: 0xFFFF_8000_0000_0000〜)
         (*pml4)
-            .entry(256)
+            .entry(PML4_KERNEL_INDEX)
             .set((*pdp_high).physical_address()?, flags);
 
         // === 必要なPDPエントリのみ設定（高位のみ）===
@@ -355,14 +401,27 @@ pub fn init(boot_info: &vitros_common::boot_info::BootInfo) -> Result<(), Paging
         }
 
         // === 必要なページのみマッピング（高位のみ）===
+        // MMIO領域はスキップし、後でmap_mmio()でUC属性でマッピングする
+        let mut skipped_mmio_pages = 0usize;
+        // メモリマップのスライスをループ外で一度だけ作成
+        let memory_region_count = boot_info.memory_map_count.min(boot_info.memory_map.len());
+        let memory_regions = &boot_info.memory_map[..memory_region_count];
         for pt_idx in 0..required_pt_count {
             for page_idx in 0..PAGE_TABLE_ENTRY_COUNT {
                 let physical_addr =
                     ((pt_idx * PAGE_TABLE_ENTRY_COUNT + page_idx) * PAGE_SIZE) as u64;
                 if physical_addr < actual_max {
-                    (*pt_high)[pt_idx].entry(page_idx).set(physical_addr, flags);
+                    if is_mmio_region(physical_addr, memory_regions) {
+                        // MMIO領域はスキップ（Present=0のまま）
+                        skipped_mmio_pages += 1;
+                    } else {
+                        (*pt_high)[pt_idx].entry(page_idx).set(physical_addr, flags);
+                    }
                 }
             }
+        }
+        if skipped_mmio_pages > 0 {
+            info!("Skipped {} pages as MMIO regions", skipped_mmio_pages);
         }
 
         // === Guard Page の設定 ===
@@ -397,21 +456,24 @@ pub fn init(boot_info: &vitros_common::boot_info::BootInfo) -> Result<(), Paging
             .entry(page_idx_in_pt)
             .set(guard_page_phys_addr, 0);
 
-        // デバッグ: Guard Page設定を確認
-        info!("Guard Page setup:");
-        info!("  Virtual address: 0x{:016X}", guard_page_virt_addr);
-        info!("  Physical offset: 0x{:X}", physical_offset);
-        info!("  Page number: {}", page_num);
-        info!("  PT array index: {}", pt_array_idx);
-        info!("  Entry in PT: {}", page_idx_in_pt);
-        info!(
-            "  Entry value: 0x{:016X}",
-            (*pt_high)[pt_array_idx].entry(page_idx_in_pt).get_raw()
-        );
-        info!(
-            "  Entry is Present: {}",
-            (*pt_high)[pt_array_idx].entry(page_idx_in_pt).get_raw() & 1 != 0
-        );
+        // デバッグ: Guard Page設定を確認（リリースビルドでは省略）
+        #[cfg(debug_assertions)]
+        {
+            info!("Guard Page setup:");
+            info!("  Virtual address: 0x{:016X}", guard_page_virt_addr);
+            info!("  Physical offset: 0x{:X}", physical_offset);
+            info!("  Page number: {}", page_num);
+            info!("  PT array index: {}", pt_array_idx);
+            info!("  Entry in PT: {}", page_idx_in_pt);
+            info!(
+                "  Entry value: 0x{:016X}",
+                (*pt_high)[pt_array_idx].entry(page_idx_in_pt).get_raw()
+            );
+            info!(
+                "  Entry is Present: {}",
+                (*pt_high)[pt_array_idx].entry(page_idx_in_pt).get_raw() & 1 != 0
+            );
+        }
 
         // CR3レジスタにPML4のアドレスを設定
         let pml4_addr = (*pml4).physical_address()?;
@@ -422,143 +484,123 @@ pub fn init(boot_info: &vitros_common::boot_info::BootInfo) -> Result<(), Paging
 }
 
 // =============================================================================
-// MTRR (Memory Type Range Registers) 関連
+// MMIO マッピング関連
 // =============================================================================
 
-/// MSR アドレス定義
-mod msr {
-    pub const IA32_MTRRCAP: u32 = 0xFE;
-    pub const IA32_MTRR_DEF_TYPE: u32 = 0x2FF;
-    pub const IA32_MTRR_PHYSBASE0: u32 = 0x200;
-    pub const IA32_MTRR_PHYSMASK0: u32 = 0x201;
-    pub const IA32_PAT: u32 = 0x277;
-}
+/// RFLAGS の IF (Interrupt Flag) ビット（ビット9）
+const RFLAGS_IF: u64 = 1 << 9;
 
-/// メモリタイプの定義
-#[derive(Debug, Clone, Copy)]
-#[repr(u8)]
-pub enum MemoryType {
-    Uncacheable = 0,      // UC
-    WriteCombining = 1,   // WC
-    WriteThrough = 4,     // WT
-    WriteProtected = 5,   // WP
-    WriteBack = 6,        // WB
-    UncacheableMinus = 7, // UC-
-    Unknown = 0xFF,
-}
-
-impl MemoryType {
-    fn from_u8(value: u8) -> Self {
-        match value {
-            0 => MemoryType::Uncacheable,
-            1 => MemoryType::WriteCombining,
-            4 => MemoryType::WriteThrough,
-            5 => MemoryType::WriteProtected,
-            6 => MemoryType::WriteBack,
-            7 => MemoryType::UncacheableMinus,
-            _ => MemoryType::Unknown,
-        }
-    }
-
-    fn as_str(&self) -> &'static str {
-        match self {
-            MemoryType::Uncacheable => "UC (Uncacheable)",
-            MemoryType::WriteCombining => "WC (Write-Combining)",
-            MemoryType::WriteThrough => "WT (Write-Through)",
-            MemoryType::WriteProtected => "WP (Write-Protected)",
-            MemoryType::WriteBack => "WB (Write-Back)",
-            MemoryType::UncacheableMinus => "UC- (Uncacheable Minus)",
-            MemoryType::Unknown => "Unknown",
-        }
-    }
-}
-
-/// MSRを読み込む
+/// 割り込みが無効であることを確認
 ///
-/// # Safety
-/// - msrが有効なMSRアドレスであること
-unsafe fn read_msr(msr: u32) -> u64 {
-    let low: u32;
-    let high: u32;
-    asm!(
-        "rdmsr",
-        in("ecx") msr,
-        out("eax") low,
-        out("edx") high,
-        options(nostack, preserves_flags)
+/// スレッドセーフティのため、ページテーブル操作は割り込み無効状態で
+/// 行われることを検証する。
+fn assert_interrupts_disabled(context: &str) {
+    let rflags: u64;
+    // SAFETY: RFLAGSレジスタをスタックにプッシュしてから読み取る標準的な方法。
+    // この操作はメモリ安全性に影響しない。
+    unsafe {
+        asm!("pushfq; pop {}", out(reg) rflags, options(nomem, preserves_flags));
+    }
+    assert!(
+        (rflags & RFLAGS_IF) == 0,
+        "{}: must be called with interrupts disabled",
+        context
     );
-    ((high as u64) << 32) | (low as u64)
 }
 
-/// MTRRの情報を表示
-pub fn dump_mtrr() {
+/// MMIO領域をUC（Uncacheable）属性でマッピングする
+///
+/// init()でスキップされたMMIO領域を、デバイス使用前に動的にマッピングする。
+/// キャッシュ無効（UC）属性でマッピングされるため、MMIOレジスタへのアクセスが
+/// 正しく行われることが保証される。
+///
+/// # Safety Preconditions
+/// * この関数はシングルコア環境または割り込み無効状態で呼び出すこと
+/// * カーネル初期化段階（BSP上でAPが起動する前）での使用を想定
+/// * 同じアドレスに対して複数回呼び出された場合、既存のマッピングを上書きする
+///
+/// # TODO: マルチコア対応
+/// マルチコア環境ではspinlockまたはmutexによる排他制御が必要。
+/// 現在はカーネル初期化段階でのみ使用されるため未実装。
+///
+/// # Arguments
+/// * `phys_addr` - マッピングする物理アドレス（4KB境界にアライメントされている必要がある）
+/// * `size` - マッピングするサイズ（バイト単位、4KB単位に切り上げられる）
+///
+/// # Returns
+/// マッピングされた仮想アドレス、またはエラー
+///
+/// # Errors
+/// * `PagingError::InvalidAddress` - アドレスが4KB境界にアライメントされていない場合
+/// * `PagingError::PageTableInitFailed` - ページテーブルのインデックスが範囲外の場合
+pub fn map_mmio(phys_addr: u64, size: u64) -> Result<u64, PagingError> {
     use crate::info;
 
-    info!("=== MTRR Configuration ===");
+    // 割り込みが無効であることを確認
+    assert_interrupts_disabled("map_mmio");
+
+    // 4KB境界アライメントチェック
+    if phys_addr & PAGE_OFFSET_MASK != 0 {
+        return Err(PagingError::InvalidAddress);
+    }
+
+    // 必要なページ数を計算（切り上げ）
+    let page_count = ((size + PAGE_SIZE as u64 - 1) / PAGE_SIZE as u64) as usize;
+
+    // UC属性フラグ: Present | Writable | CacheDisable
+    let uc_flags = PageTableFlags::Present as u64
+        | PageTableFlags::Writable as u64
+        | PageTableFlags::CacheDisable as u64;
 
     unsafe {
-        // MTRRCAP: MTRRの機能を確認
-        let mtrrcap = read_msr(msr::IA32_MTRRCAP);
-        let vcnt = (mtrrcap & 0xFF) as u8; // 可変範囲レジスタの数
-        let fix_supported = (mtrrcap >> 8) & 1 != 0;
-        let wc_supported = (mtrrcap >> 10) & 1 != 0;
+        let pt_high = addr_of_mut!(KERNEL_PT_HIGH);
 
-        info!(
-            "MTRRCAP: VCNT={}, FIX={}, WC={}",
-            vcnt, fix_supported, wc_supported
-        );
+        for i in 0..page_count {
+            let addr = phys_addr + (i * PAGE_SIZE) as u64;
 
-        // デフォルトメモリタイプ
-        let def_type = read_msr(msr::IA32_MTRR_DEF_TYPE);
-        let default_type = MemoryType::from_u8((def_type & 0xFF) as u8);
-        let mtrr_enabled = (def_type >> 11) & 1 != 0;
-        let fixed_enabled = (def_type >> 10) & 1 != 0;
+            // ページ番号を計算
+            let page_num = (addr >> 12) as usize;
 
-        info!(
-            "DEF_TYPE: {} (E={}, FE={})",
-            default_type.as_str(),
-            mtrr_enabled,
-            fixed_enabled
-        );
+            // PT配列内のインデックスとPT内のエントリ番号を計算
+            let pt_array_idx = page_num / PAGE_TABLE_ENTRY_COUNT;
+            let page_idx_in_pt = page_num % PAGE_TABLE_ENTRY_COUNT;
 
-        // 可変範囲MTRR
-        info!("Variable Range MTRRs:");
-        for i in 0..vcnt.min(8) {
-            let base_msr = msr::IA32_MTRR_PHYSBASE0 + (i as u32 * 2);
-            let mask_msr = msr::IA32_MTRR_PHYSMASK0 + (i as u32 * 2);
-
-            let base = read_msr(base_msr);
-            let mask = read_msr(mask_msr);
-
-            let valid = (mask >> 11) & 1 != 0;
-            if valid {
-                let mem_type = MemoryType::from_u8((base & 0xFF) as u8);
-                let base_addr = base & 0xFFFF_FFFF_FFFF_F000;
-                // マスクからサイズを計算
-                // マスクの最下位の1ビットがサイズを決定する
-                // 例: mask = 0xFF80000000 → 最下位1 = bit31 → サイズ = 2^31 = 2GB
-                let mask_bits = mask & 0xFFFF_FFFF_FFFF_F000;
-                let size = mask_bits & mask_bits.wrapping_neg(); // x & -x で最下位の1ビットを取得
-
-                info!("  MTRR{}: base=0x{:016X} mask=0x{:016X}", i, base, mask);
-                info!(
-                    "         0x{:012X} - 0x{:012X} ({}MB) = {}",
-                    base_addr,
-                    base_addr.wrapping_add(size).wrapping_sub(1),
-                    size / (1024 * 1024),
-                    mem_type.as_str()
-                );
+            // インデックスの範囲検証
+            if pt_array_idx >= PT_COUNT {
+                return Err(PagingError::PageTableInitFailed);
             }
+
+            // デバッグビルド時のみ重複マッピングを警告
+            #[cfg(debug_assertions)]
+            {
+                if (*pt_high)[pt_array_idx]
+                    .get_entry(page_idx_in_pt)
+                    .is_present()
+                {
+                    info!(
+                        "Warning: map_mmio overwriting existing mapping at 0x{:X}",
+                        addr
+                    );
+                }
+            }
+
+            // UC属性でページテーブルエントリを設定
+            (*pt_high)[pt_array_idx]
+                .entry(page_idx_in_pt)
+                .set(addr, uc_flags);
         }
 
-        // PAT (Page Attribute Table)
-        let pat = read_msr(msr::IA32_PAT);
-        info!("PAT Register: 0x{:016X}", pat);
-        info!("PAT Entries:");
-        for i in 0..8 {
-            let entry = ((pat >> (i * 8)) & 0xFF) as u8;
-            let mem_type = MemoryType::from_u8(entry);
-            info!("  PAT[{}] = {}", i, mem_type.as_str());
-        }
+        // TLBフラッシュ
+        reload_cr3();
     }
+
+    // 仮想アドレスを計算して返す
+    let virt_addr = phys_to_virt(phys_addr)?;
+
+    info!(
+        "MMIO mapped: phys=0x{:X} -> virt=0x{:X} ({} pages, UC)",
+        phys_addr, virt_addr, page_count
+    );
+
+    Ok(virt_addr)
 }
