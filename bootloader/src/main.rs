@@ -511,22 +511,9 @@ extern "efiapi" fn efi_main(
 
     // ExitBootServices成功 - ここから先はBoot Servicesは使用不可
 
-    // BOOT_INFOを低位アドレス（4GB未満）にコピー
-    // UEFIがMMIOホールの影響でBOOT_INFOを高位アドレス（4GB以上）に配置する可能性があるため、
-    // カーネルが確実にアクセスできる低位アドレスにコピーする
-    //
-    // TODO: 将来的にはMMIOホールによって分断されたメモリ領域を適切にマッピングし、
-    //       高位アドレスに配置されたデータにもアクセスできるようにする。
-    //       参照: https://github.com/jugeeeemu-tech/VitrOS/issues/5
-    const LOW_BOOT_INFO_ADDR: u64 = 0x80000; // 512KB（安全な低位アドレス）
-    let boot_info_phys_addr = unsafe {
-        core::ptr::copy_nonoverlapping(
-            core::ptr::addr_of!(BOOT_INFO),
-            LOW_BOOT_INFO_ADDR as *mut BootInfo,
-            1,
-        );
-        LOW_BOOT_INFO_ADDR
-    };
+    // BOOT_INFOの物理アドレスを取得
+    // カーネルは8GBまでマッピングされているので、高位アドレスに配置されても問題なし
+    let boot_info_phys_addr = core::ptr::addr_of!(BOOT_INFO) as u64;
 
     // ページテーブルをセットアップ（UEFIメモリマップに基づいて必要な範囲のみマッピング）
     let pml4_addr = unsafe { setup_initial_page_tables(boot_info.max_physical_address) };

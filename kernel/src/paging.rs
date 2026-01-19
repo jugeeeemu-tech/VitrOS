@@ -254,8 +254,9 @@ pub unsafe extern "C" fn switch_to_kernel_stack() {
 // 物理メモリの直接マッピング（Direct Mapping）を実装
 
 /// 最大サポートメモリ（GB単位）
-/// 静的配列のサイズを決定する - 4GB対応で約16MBのメモリ削減
-pub const MAX_SUPPORTED_MEMORY_GB: usize = 4;
+/// 静的配列のサイズを決定する - 8GBまでサポート
+/// MMIOホール（3-4GB付近）を超えてメモリマッピングするため8GBに拡張
+pub const MAX_SUPPORTED_MEMORY_GB: usize = 8;
 
 /// Page Table数（各PTは2MBをカバー）
 /// 4GB = 2048個のPT（512 * 4 = 2048）
