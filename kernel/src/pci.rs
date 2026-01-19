@@ -6,7 +6,7 @@
 use crate::info;
 use crate::paging::KERNEL_VIRTUAL_BASE;
 use core::arch::asm;
-use core::ptr::read_volatile;
+use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 /// PCI Configuration Address レジスタ (I/Oポート 0xCF8)
@@ -279,4 +279,128 @@ fn print_device(dev: &PciDevice) {
         dev.class_code,
         dev.subclass
     );
+}
+
+// ============================================================================
+// PciConfigAccess trait
+// ============================================================================
+
+/// PCI Configuration Spaceアクセスの抽象化
+pub trait PciConfigAccess {
+    fn read_u32(&self, bus: u8, device: u8, function: u8, offset: u16) -> u32;
+    fn write_u32(&self, bus: u8, device: u8, function: u8, offset: u16, value: u32);
+
+    fn read_u16(&self, bus: u8, device: u8, function: u8, offset: u16) -> u16 {
+        let data = self.read_u32(bus, device, function, offset & 0xFFFC);
+        ((data >> ((offset & 0x02) * 8)) & 0xFFFF) as u16
+    }
+
+    fn read_u8(&self, bus: u8, device: u8, function: u8, offset: u16) -> u8 {
+        let data = self.read_u32(bus, device, function, offset & 0xFFFC);
+        ((data >> ((offset & 0x03) * 8)) & 0xFF) as u8
+    }
+
+    fn write_u16(&self, bus: u8, device: u8, function: u8, offset: u16, value: u16) {
+        let aligned = offset & 0xFFFC;
+        let shift = (offset & 0x02) * 8;
+        let current = self.read_u32(bus, device, function, aligned);
+        let new_val = (current & !(0xFFFF << shift)) | ((value as u32) << shift);
+        self.write_u32(bus, device, function, aligned, new_val);
+    }
+
+    fn write_u8(&self, bus: u8, device: u8, function: u8, offset: u16, value: u8) {
+        let aligned = offset & 0xFFFC;
+        let shift = (offset & 0x03) * 8;
+        let current = self.read_u32(bus, device, function, aligned);
+        let new_val = (current & !(0xFF << shift)) | ((value as u32) << shift);
+        self.write_u32(bus, device, function, aligned, new_val);
+    }
+}
+
+/// レガシーI/Oポートアクセス
+pub struct LegacyPciConfig;
+
+impl PciConfigAccess for LegacyPciConfig {
+    fn read_u32(&self, bus: u8, device: u8, function: u8, offset: u16) -> u32 {
+        pci_config_read_u32(bus, device, function, offset as u8)
+    }
+
+    fn write_u32(&self, bus: u8, device: u8, function: u8, offset: u16, value: u32) {
+        pci_config_write_u32(bus, device, function, offset as u8, value);
+    }
+}
+
+/// MMCONFIG/Legacy統合アクセス
+pub struct UnifiedPciConfig;
+
+impl PciConfigAccess for UnifiedPciConfig {
+    fn read_u32(&self, bus: u8, device: u8, function: u8, offset: u16) -> u32 {
+        if is_mmconfig_available(bus) {
+            // SAFETY: MMCONFIGが利用可能なことを確認済み
+            unsafe { mmconfig_read_u32(bus, device, function, offset) }
+        } else {
+            pci_config_read_u32(bus, device, function, offset as u8)
+        }
+    }
+
+    fn write_u32(&self, bus: u8, device: u8, function: u8, offset: u16, value: u32) {
+        if is_mmconfig_available(bus) {
+            // SAFETY: MMCONFIGが利用可能なことを確認済み
+            unsafe { mmconfig_write_u32(bus, device, function, offset, value) }
+        } else {
+            pci_config_write_u32(bus, device, function, offset as u8, value);
+        }
+    }
+}
+
+/// グローバルPCIアクセスインスタンス（統合方式）
+pub static PCI_CONFIG: UnifiedPciConfig = UnifiedPciConfig;
+
+// ============================================================================
+// Write関数
+// ============================================================================
+
+/// レガシーI/OポートでPCI Configuration Spaceに32ビット値を書き込む
+fn pci_config_write_u32(bus: u8, device: u8, function: u8, offset: u8, value: u32) {
+    let address: u32 = (1 << 31)
+        | ((bus as u32) << 16)
+        | ((device as u32) << 11)
+        | ((function as u32) << 8)
+        | ((offset as u32) & 0xFC);
+
+    unsafe {
+        // CONFIG_ADDRESS レジスタにアドレスを書き込む
+        asm!(
+            "out dx, eax",
+            in("dx") CONFIG_ADDRESS,
+            in("eax") address,
+            options(nomem, nostack, preserves_flags)
+        );
+
+        // CONFIG_DATA レジスタにデータを書き込む
+        asm!(
+            "out dx, eax",
+            in("dx") CONFIG_DATA,
+            in("eax") value,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+}
+
+/// MMCONFIG経由でPCI Configuration Spaceに32ビット値を書き込む
+///
+/// # Safety
+/// この関数はMMCONFIGが有効な場合のみ呼び出すべきです
+unsafe fn mmconfig_write_u32(bus: u8, device: u8, function: u8, offset: u16, value: u32) {
+    let base = MMCONFIG_BASE.load(Ordering::SeqCst);
+
+    let phys_addr = base
+        + ((bus as u64) << 20)
+        + ((device as u64) << 15)
+        + ((function as u64) << 12)
+        + (offset as u64);
+
+    let virt_addr = KERNEL_VIRTUAL_BASE + phys_addr;
+
+    unsafe { write_volatile(virt_addr as *mut u32, value) }
 }

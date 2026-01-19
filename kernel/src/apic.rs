@@ -9,6 +9,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use crate::hpet;
 use crate::paging::KERNEL_VIRTUAL_BASE;
 use crate::pit;
+use crate::timer_device::TimerDevice;
 
 /// APIC操作のエラー型
 #[allow(dead_code)]
@@ -186,20 +187,12 @@ where
     }
 }
 
-/// HPETを使って1回のAPIC Timer測定を実行
-///
-/// # Safety
-/// APICが有効化されていること、HPETが初期化済みであること
-unsafe fn measure_apic_ticks_hpet(ms: u64) -> u32 {
-    unsafe { measure_apic_ticks(|| hpet::delay_ms(ms)) }
-}
-
-/// PITを使って1回のAPIC Timer測定を実行
+/// 任意のTimerDeviceでAPIC Timerを測定
 ///
 /// # Safety
 /// APICが有効化されていること
-unsafe fn measure_apic_ticks_pit(ms: u32) -> u32 {
-    unsafe { measure_apic_ticks(|| pit::sleep_ms(ms)) }
+unsafe fn measure_apic_ticks_with<T: TimerDevice>(timer: &T, ms: u64) -> u32 {
+    unsafe { measure_apic_ticks(|| timer.delay_ms(ms)) }
 }
 
 /// APIC Timerをキャリブレーション
@@ -211,14 +204,14 @@ unsafe fn measure_apic_ticks_pit(ms: u32) -> u32 {
 /// # Errors
 /// * `ApicError::CalibrationFailed` - キャリブレーションに失敗した場合（周波数が0など）
 pub fn calibrate_timer() -> Result<(), ApicError> {
-    let ticks_per_second = if hpet::is_available() {
+    let ticks_per_second = if hpet::HPET.is_available() {
         // HPETが利用可能: 高精度なので1回測定で十分
         const CALIBRATION_MS: u64 = 50;
 
         crate::info!("Calibrating APIC Timer using HPET...");
 
         // SAFETY: enable_apic()呼び出し後であることが前提
-        let ticks = unsafe { measure_apic_ticks_hpet(CALIBRATION_MS) };
+        let ticks = unsafe { measure_apic_ticks_with(&hpet::HPET, CALIBRATION_MS) };
         let ticks_per_second = ticks * (1000 / CALIBRATION_MS as u32);
 
         crate::info!(
@@ -232,7 +225,7 @@ pub fn calibrate_timer() -> Result<(), ApicError> {
     } else {
         // PITを使用: 精度向上のため5回測定して中央値
         const MEASUREMENTS: usize = 5;
-        const CALIBRATION_MS: u32 = 50;
+        const CALIBRATION_MS: u64 = 50;
 
         crate::info!(
             "Calibrating APIC Timer using PIT ({} measurements)...",
@@ -243,13 +236,13 @@ pub fn calibrate_timer() -> Result<(), ApicError> {
 
         for measurement in measurements.iter_mut() {
             // SAFETY: enable_apic()呼び出し後であることが前提
-            *measurement = unsafe { measure_apic_ticks_pit(CALIBRATION_MS) };
+            *measurement = unsafe { measure_apic_ticks_with(&pit::PIT, CALIBRATION_MS) };
         }
 
         // ソートして中央値を取る（外れ値の影響を排除）
         measurements.sort_unstable();
         let median_ticks = measurements[MEASUREMENTS / 2];
-        let multiplier = 1000 / CALIBRATION_MS;
+        let multiplier = (1000 / CALIBRATION_MS) as u32;
         let ticks_per_second = median_ticks * multiplier;
 
         crate::info!(

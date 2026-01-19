@@ -25,6 +25,7 @@ mod sched;
 mod serial;
 mod sync;
 mod timer;
+mod timer_device;
 
 // 後方互換性のためのエイリアス
 use sched as task;

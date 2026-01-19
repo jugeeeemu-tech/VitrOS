@@ -223,3 +223,35 @@ pub fn elapsed_ms() -> u64 {
 pub fn elapsed_secs() -> u64 {
     elapsed_ns() / 1_000_000_000
 }
+
+// ============================================================================
+// TimerDevice trait 実装
+// ============================================================================
+
+use crate::timer_device::{ElapsedTimer, TimerDevice};
+
+/// HPET タイマーデバイス
+pub struct Hpet;
+
+impl TimerDevice for Hpet {
+    fn is_available(&self) -> bool {
+        is_available()
+    }
+
+    fn frequency(&self) -> u64 {
+        frequency()
+    }
+
+    fn delay_ns(&self, ns: u64) {
+        delay_ns(ns)
+    }
+}
+
+impl ElapsedTimer for Hpet {
+    fn elapsed_ns(&self) -> u64 {
+        elapsed_ns()
+    }
+}
+
+/// グローバルHPETインスタンス
+pub static HPET: Hpet = Hpet;
