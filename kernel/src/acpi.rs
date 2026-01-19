@@ -77,6 +77,49 @@ struct RsdpExtended {
     reserved: [u8; 3],
 }
 
+/// SDTエントリサイズを抽象化するトレイト
+///
+/// XSDTは64ビット、RSDTは32ビットのエントリを持つため、
+/// この差を抽象化してparse処理を共通化する。
+trait SdtEntrySize {
+    /// エントリのバイトサイズ
+    const SIZE: usize;
+    /// 期待されるシグネチャ
+    const SIGNATURE: &'static str;
+
+    /// ポインタからアドレスを読み取る
+    ///
+    /// # Safety
+    /// ptrは有効なメモリを指しており、SIZE分のバイトが読み取り可能であること
+    unsafe fn read_address(ptr: *const u8) -> u64;
+}
+
+/// XSDT用エントリ（64ビットアドレス）
+struct XsdtEntry;
+
+impl SdtEntrySize for XsdtEntry {
+    const SIZE: usize = 8;
+    const SIGNATURE: &'static str = "XSDT";
+
+    unsafe fn read_address(ptr: *const u8) -> u64 {
+        // SAFETY: 呼び出し元がptrの有効性を保証する
+        unsafe { (ptr as *const u64).read_unaligned() }
+    }
+}
+
+/// RSDT用エントリ（32ビットアドレス）
+struct RsdtEntry;
+
+impl SdtEntrySize for RsdtEntry {
+    const SIZE: usize = 4;
+    const SIGNATURE: &'static str = "RSDT";
+
+    unsafe fn read_address(ptr: *const u8) -> u64 {
+        // SAFETY: 呼び出し元がptrの有効性を保証する
+        unsafe { (ptr as *const u32).read_unaligned() as u64 }
+    }
+}
+
 /// ACPI テーブル共通ヘッダ
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
@@ -231,32 +274,32 @@ impl Rsdp {
 ///
 /// # Arguments
 /// * `boot_info` - ブートローダーから渡された情報（RSDP アドレスを含む）
-pub fn init(boot_info: &BootInfo) {
+///
+/// # Returns
+/// 成功時は`Ok(())`、失敗時は`Err(AcpiError)`
+///
+/// # Errors
+/// * `AcpiError::AddressConversionFailed` - RSDPアドレスの変換に失敗した場合
+/// * `AcpiError::ChecksumFailed` - RSDP/XSDT/RSDTのチェックサム検証に失敗した場合
+/// * `AcpiError::NotSupported` - RSDPシグネチャが無効な場合
+pub fn init(boot_info: &BootInfo) -> Result<(), AcpiError> {
     info!("Initializing ACPI...");
 
     if boot_info.rsdp_address == 0 {
-        info!("RSDP address not provided by bootloader. ACPI not available.");
-        return;
+        return Err(AcpiError::AddressConversionFailed);
     }
 
     // RSDP の物理アドレスを高位仮想アドレスに変換
-    let rsdp_virt_addr = match phys_to_virt(boot_info.rsdp_address) {
-        Ok(addr) => addr,
-        Err(_) => {
-            info!("Failed to convert RSDP address. ACPI not available.");
-            return;
-        }
-    };
+    let rsdp_virt_addr =
+        phys_to_virt(boot_info.rsdp_address).map_err(|_| AcpiError::AddressConversionFailed)?;
     let rsdp = unsafe { &*(rsdp_virt_addr as *const Rsdp) };
 
     if !rsdp.is_valid_signature() {
-        info!("Invalid RSDP signature. ACPI not available.");
-        return;
+        return Err(AcpiError::NotSupported);
     }
 
     if !rsdp.verify_checksum() {
-        info!("RSDP checksum verification failed. ACPI not available.");
-        return;
+        return Err(AcpiError::ChecksumFailed);
     }
 
     info!("RSDP found at 0x{:016X}", boot_info.rsdp_address);
@@ -271,7 +314,7 @@ pub fn init(boot_info: &BootInfo) {
         info!("  ACPI 2.0+ detected");
         info!("  XSDT Address: 0x{:016X}", xsdt_addr);
 
-        parse_xsdt(xsdt_addr);
+        parse_xsdt(xsdt_addr)?;
     } else {
         // ACPI 1.0 - RSDT を使用
         // packed struct のフィールドはローカル変数にコピー
@@ -279,112 +322,79 @@ pub fn init(boot_info: &BootInfo) {
         info!("  ACPI 1.0 detected");
         info!("  RSDT Address: 0x{:08X}", rsdt_addr);
 
-        parse_rsdt(rsdt_addr as u64);
+        parse_rsdt(rsdt_addr as u64)?;
     }
+
+    Ok(())
 }
 
 /// XSDT (Extended System Description Table) を解析
-fn parse_xsdt(xsdt_phys_addr: u64) {
-    // 物理アドレスを高位仮想アドレスに変換（0チェックも含む）
-    let xsdt_virt_addr = match phys_to_virt(xsdt_phys_addr) {
-        Ok(addr) => addr,
-        Err(_) => return,
-    };
-    let header = unsafe { &*(xsdt_virt_addr as *const AcpiTableHeader) };
-
-    if header.signature_str() != "XSDT" {
-        info!("Invalid XSDT signature: {}", header.signature_str());
-        return;
-    }
-
-    if !header.verify_checksum() {
-        info!("XSDT checksum verification failed");
-        return;
-    }
-
-    // テーブルエントリ数を計算（ヘッダ以降が64ビットアドレスの配列）
-    let header_size = core::mem::size_of::<AcpiTableHeader>();
-    let entry_count = (header.length as usize - header_size) / 8;
-
-    info!("XSDT parsed successfully. Tables found: {}", entry_count);
-
-    // エントリのアドレス配列にアクセス
-    let entries_ptr = (xsdt_virt_addr + header_size as u64) as *const u64;
-
-    for i in 0..entry_count {
-        // packed 構造体の後なのでアンアラインドアクセスが必要
-        let table_phys_addr = unsafe { entries_ptr.add(i).read_unaligned() };
-        let table_virt_addr = match phys_to_virt(table_phys_addr) {
-            Ok(addr) => addr,
-            Err(_) => continue,
-        };
-        let table_header = unsafe { &*(table_virt_addr as *const AcpiTableHeader) };
-
-        info!(
-            "  [{}] {} at 0x{:016X}",
-            i,
-            table_header.signature_str(),
-            table_phys_addr
-        );
-
-        // APIC (MADT) テーブルを見つけたら解析
-        // MADTは必須ではないのでエラー時はログ出力して継続
-        if table_header.signature_str() == "APIC" {
-            if let Err(e) = parse_madt(table_phys_addr) {
-                info!("MADT parsing failed: {:?}, continuing without MADT", e);
-            }
-        }
-        // MCFG テーブルを見つけたら解析
-        // MCFGは必須ではないのでエラー時はログ出力して継続
-        else if table_header.signature_str() == "MCFG" {
-            if let Err(e) = parse_mcfg(table_phys_addr) {
-                info!("MCFG parsing failed: {:?}, continuing without MCFG", e);
-            }
-        }
-        // HPET テーブルを見つけたら解析
-        // HPETは必須ではないのでエラー時はログ出力して継続
-        else if table_header.signature_str() == "HPET" {
-            if let Err(e) = parse_hpet(table_phys_addr) {
-                info!(
-                    "HPET initialization failed: {:?}, continuing without HPET",
-                    e
-                );
-            }
-        }
-    }
+///
+/// # Errors
+/// * `AcpiError::AddressConversionFailed` - XSDTアドレスの変換に失敗した場合
+/// * `AcpiError::ChecksumFailed` - チェックサム検証に失敗した場合
+/// * `AcpiError::NotSupported` - シグネチャが無効な場合
+fn parse_xsdt(xsdt_phys_addr: u64) -> Result<(), AcpiError> {
+    parse_sdt::<XsdtEntry>(xsdt_phys_addr)
 }
 
 /// RSDT (Root System Description Table) を解析
-fn parse_rsdt(rsdt_phys_addr: u64) {
-    // 物理アドレスを高位仮想アドレスに変換（0チェックも含む）
-    let rsdt_virt_addr = match phys_to_virt(rsdt_phys_addr) {
-        Ok(addr) => addr,
-        Err(_) => return,
-    };
-    let header = unsafe { &*(rsdt_virt_addr as *const AcpiTableHeader) };
+///
+/// # Errors
+/// * `AcpiError::AddressConversionFailed` - RSDTアドレスの変換に失敗した場合
+/// * `AcpiError::ChecksumFailed` - チェックサム検証に失敗した場合
+/// * `AcpiError::NotSupported` - シグネチャが無効な場合
+fn parse_rsdt(rsdt_phys_addr: u64) -> Result<(), AcpiError> {
+    parse_sdt::<RsdtEntry>(rsdt_phys_addr)
+}
 
-    if header.signature_str() != "RSDT" {
-        info!("Invalid RSDT signature: {}", header.signature_str());
-        return;
+/// XSDT/RSDTの共通解析ロジック
+///
+/// 型パラメータEでエントリサイズを抽象化し、XSDT（64ビット）と
+/// RSDT（32ビット）の両方を同じコードで処理する。
+///
+/// # Errors
+/// * `AcpiError::AddressConversionFailed` - SDTアドレスの変換に失敗した場合
+/// * `AcpiError::ChecksumFailed` - チェックサム検証に失敗した場合
+/// * `AcpiError::NotSupported` - シグネチャが無効な場合
+fn parse_sdt<E: SdtEntrySize>(sdt_phys_addr: u64) -> Result<(), AcpiError> {
+    // 物理アドレスを高位仮想アドレスに変換（0チェックも含む）
+    let sdt_virt_addr =
+        phys_to_virt(sdt_phys_addr).map_err(|_| AcpiError::AddressConversionFailed)?;
+    let header = unsafe { &*(sdt_virt_addr as *const AcpiTableHeader) };
+
+    if header.signature_str() != E::SIGNATURE {
+        info!(
+            "Invalid {} signature: {}",
+            E::SIGNATURE,
+            header.signature_str()
+        );
+        return Err(AcpiError::NotSupported);
     }
 
     if !header.verify_checksum() {
-        info!("RSDT checksum verification failed");
-        return;
+        info!("{} checksum verification failed", E::SIGNATURE);
+        return Err(AcpiError::ChecksumFailed);
     }
 
-    // テーブルエントリ数を計算（ヘッダ以降が32ビットアドレスの配列）
+    // テーブルエントリ数を計算
     let header_size = core::mem::size_of::<AcpiTableHeader>();
-    let entry_count = (header.length as usize - header_size) / 4;
+    let entry_count = (header.length as usize - header_size) / E::SIZE;
 
-    info!("RSDT parsed successfully. Tables found: {}", entry_count);
+    info!(
+        "{} parsed successfully. Tables found: {}",
+        E::SIGNATURE,
+        entry_count
+    );
 
     // エントリのアドレス配列にアクセス
-    let entries_ptr = (rsdt_virt_addr + header_size as u64) as *const u32;
+    let entries_base = (sdt_virt_addr + header_size as u64) as *const u8;
 
     for i in 0..entry_count {
         // packed 構造体の後なのでアンアラインドアクセスが必要
-        let table_phys_addr = unsafe { entries_ptr.add(i).read_unaligned() } as u64;
+        let entry_ptr = unsafe { entries_base.add(i * E::SIZE) };
+        let table_phys_addr = unsafe { E::read_address(entry_ptr) };
+
         let table_virt_addr = match phys_to_virt(table_phys_addr) {
             Ok(addr) => addr,
             Err(_) => continue,
@@ -398,31 +408,31 @@ fn parse_rsdt(rsdt_phys_addr: u64) {
             table_phys_addr
         );
 
-        // APIC (MADT) テーブルを見つけたら解析
-        // MADTは必須ではないのでエラー時はログ出力して継続
-        if table_header.signature_str() == "APIC" {
-            if let Err(e) = parse_madt(table_phys_addr) {
-                info!("MADT parsing failed: {:?}, continuing without MADT", e);
+        // 各ACPIテーブルを解析（必須ではないのでエラー時はログ出力して継続）
+        match table_header.signature_str() {
+            "APIC" => {
+                if let Err(e) = parse_madt(table_phys_addr) {
+                    info!("MADT parsing failed: {:?}, continuing without MADT", e);
+                }
             }
-        }
-        // MCFG テーブルを見つけたら解析
-        // MCFGは必須ではないのでエラー時はログ出力して継続
-        else if table_header.signature_str() == "MCFG" {
-            if let Err(e) = parse_mcfg(table_phys_addr) {
-                info!("MCFG parsing failed: {:?}, continuing without MCFG", e);
+            "MCFG" => {
+                if let Err(e) = parse_mcfg(table_phys_addr) {
+                    info!("MCFG parsing failed: {:?}, continuing without MCFG", e);
+                }
             }
-        }
-        // HPET テーブルを見つけたら解析
-        // HPETは必須ではないのでエラー時はログ出力して継続
-        else if table_header.signature_str() == "HPET" {
-            if let Err(e) = parse_hpet(table_phys_addr) {
-                info!(
-                    "HPET initialization failed: {:?}, continuing without HPET",
-                    e
-                );
+            "HPET" => {
+                if let Err(e) = parse_hpet(table_phys_addr) {
+                    info!(
+                        "HPET initialization failed: {:?}, continuing without HPET",
+                        e
+                    );
+                }
             }
+            _ => {}
         }
     }
+
+    Ok(())
 }
 
 /// MADT (Multiple APIC Description Table) を解析

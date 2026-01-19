@@ -253,8 +253,10 @@ extern "C" fn kernel_main_inner(boot_info_phys_addr: u64) -> ! {
     // タスクシステムを初期化
     task::init();
 
-    // ACPI を初期化
-    acpi::init(&boot_info);
+    // ACPI を初期化（失敗してもカーネルは継続動作可能）
+    if let Err(e) = acpi::init(&boot_info) {
+        info!("ACPI initialization failed: {:?}, continuing without ACPI", e);
+    }
 
     // PCIバスをスキャン
     pci::scan_pci_bus();
