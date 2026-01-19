@@ -4,6 +4,25 @@
 
 use core::arch::asm;
 
+// =============================================================================
+// MTRR (Memory Type Range Registers) 関連 MSR アドレス
+// =============================================================================
+
+/// MTRR Capability Register - MTRRの機能を確認
+pub const IA32_MTRRCAP: u32 = 0xFE;
+
+/// MTRR Default Type Register - デフォルトメモリタイプ
+pub const IA32_MTRR_DEF_TYPE: u32 = 0x2FF;
+
+/// MTRR Physical Base 0 - 可変範囲MTRRのベースアドレス（最初）
+pub const IA32_MTRR_PHYSBASE0: u32 = 0x200;
+
+/// MTRR Physical Mask 0 - 可変範囲MTRRのマスク（最初）
+pub const IA32_MTRR_PHYSMASK0: u32 = 0x201;
+
+/// Page Attribute Table - PAT設定
+pub const IA32_PAT: u32 = 0x277;
+
 /// MSRを読み込む
 ///
 /// # Safety

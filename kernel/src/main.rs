@@ -17,6 +17,7 @@ mod hpet;
 mod idt;
 mod io;
 mod msr;
+mod mtrr;
 mod paging;
 mod pci;
 mod pit;
@@ -271,7 +272,7 @@ extern "C" fn kernel_main_inner(boot_info_phys_addr: u64) -> ! {
     apic::calibrate_timer().expect("Failed to calibrate APIC Timer");
 
     // MTRR/PAT設定をダンプ（デバッグ用）
-    paging::dump_mtrr();
+    mtrr::dump();
 
     // ローカルフレームバッファを初期化
     // 物理アドレスを高位仮想アドレスに変換
