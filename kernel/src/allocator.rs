@@ -20,6 +20,8 @@ struct FreeNode {
 struct SlabCache {
     free_list: UnsafeCell<Option<NonNull<FreeNode>>>,
     block_size: usize,
+    #[cfg(feature = "visualize-allocator")]
+    free_count: UnsafeCell<usize>,
 }
 
 impl SlabCache {
@@ -27,6 +29,8 @@ impl SlabCache {
         Self {
             free_list: UnsafeCell::new(None),
             block_size,
+            #[cfg(feature = "visualize-allocator")]
+            free_count: UnsafeCell::new(0),
         }
     }
 
@@ -39,6 +43,10 @@ impl SlabCache {
                 // フリーリストから取り出す
                 let ptr = node.as_ptr() as *mut u8;
                 *free_list = (*node.as_ptr()).next;
+                #[cfg(feature = "visualize-allocator")]
+                {
+                    *self.free_count.get() -= 1;
+                }
                 NonNull::new(ptr)
             } else {
                 // フリーリストが空の場合はNone（後でラージアロケータにフォールバック）
@@ -56,6 +64,10 @@ impl SlabCache {
             // フリーリストの先頭に追加
             (*node).next = *free_list;
             *free_list = NonNull::new(node);
+            #[cfg(feature = "visualize-allocator")]
+            {
+                *self.free_count.get() += 1;
+            }
         })
     }
 
@@ -190,24 +202,15 @@ impl SlabAllocator {
 // Issue: https://github.com/jugeeeemu-tech/VitrOS/issues/16
 #[cfg(feature = "visualize-allocator")]
 impl SlabAllocator {
-    // デバッグ: サイズクラスごとの空きブロック数をカウント
+    // デバッグ: サイズクラスごとの空きブロック数をカウント（O(1)）
     pub fn count_free_blocks(&self, class_idx: usize) -> usize {
         if class_idx >= NUM_SIZE_CLASSES {
             return 0;
         }
 
-        unsafe {
-            let free_list = &*self.caches[class_idx].free_list.get();
-            let mut count = 0;
-            let mut current = *free_list;
-
-            while let Some(node) = current {
-                count += 1;
-                current = (*node.as_ptr()).next;
-            }
-
-            count
-        }
+        // カウンタを直接参照（O(1)）
+        // 割り込み保護でアトミックな読み取りを保証
+        without_interrupts(|| unsafe { *self.caches[class_idx].free_count.get() })
     }
 
     // デバッグ: 大きなサイズ用領域の使用状況 (使用量, 総量)
