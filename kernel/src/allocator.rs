@@ -147,9 +147,19 @@ impl SlabAllocator {
         info!("Slab Allocator initialized successfully");
     }
 
-    // サイズからサイズクラスのインデックスを取得
+    // サイズからサイズクラスのインデックスを取得（O(1)）
     fn size_to_class(size: usize) -> Option<usize> {
-        SIZE_CLASSES.iter().position(|&s| s >= size)
+        if size == 0 {
+            return Some(0);
+        }
+        if size > 4096 {
+            return None;
+        }
+        // 2のべき乗に切り上げてインデックスを計算
+        // 8=2^3がインデックス0なので、ビット位置から3を引く
+        let bits = usize::BITS - (size - 1).leading_zeros();
+        let class_idx = bits.saturating_sub(3) as usize;
+        Some(class_idx)
     }
 
     // 大きなサイズ用のアロケート（バンプアロケータ）
