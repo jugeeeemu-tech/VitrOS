@@ -4,7 +4,7 @@
 
 use core::arch::asm;
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::hpet;
 use crate::paging::KERNEL_VIRTUAL_BASE;
@@ -35,12 +35,21 @@ impl core::fmt::Display for ApicError {
     }
 }
 
-/// Local APICの物理ベースアドレス
-const APIC_PHYS_BASE: u64 = 0xFEE00000;
+/// Local APICのデフォルト物理ベースアドレス
+const DEFAULT_APIC_PHYS_BASE: u64 = 0xFEE00000;
 
-/// Local APICのベースアドレス（高位仮想アドレス）
-/// 物理アドレス 0xFEE00000 を高位仮想アドレス経由でアクセス
-const APIC_BASE: u64 = KERNEL_VIRTUAL_BASE + APIC_PHYS_BASE;
+/// Local APICの物理ベースアドレス（MADTから動的に設定可能）
+static APIC_PHYS_BASE: AtomicU64 = AtomicU64::new(DEFAULT_APIC_PHYS_BASE);
+
+/// 現在のAPIC物理ベースアドレスを取得
+fn apic_phys_base() -> u64 {
+    APIC_PHYS_BASE.load(Ordering::SeqCst)
+}
+
+/// 現在のAPIC仮想ベースアドレスを取得
+fn apic_virt_base() -> u64 {
+    KERNEL_VIRTUAL_BASE + apic_phys_base()
+}
 
 /// Local APICレジスタのオフセット
 mod registers {
@@ -61,11 +70,10 @@ mod registers {
 /// Local APICレジスタへの書き込み
 ///
 /// # Safety
-/// - APIC_BASEが有効なLocal APICメモリマップドレジスタのベースアドレスであること
+/// - APICが有効化されMMIOマッピングが完了していること（enable_apic()呼び出し後）
 /// - offsetが有効なAPICレジスタオフセットであること
-/// - APICが有効化されていること（enable_apic()呼び出し後）
 unsafe fn write_apic_register(offset: u32, value: u32) {
-    let addr = (APIC_BASE + offset as u64) as *mut u32;
+    let addr = (apic_virt_base() + offset as u64) as *mut u32;
     // SAFETY: 呼び出し元が上記の安全性要件を満たすことを保証する。
     // APICレジスタはメモリマップドI/Oであり、write_volatileで書き込む必要がある。
     unsafe {
@@ -76,10 +84,10 @@ unsafe fn write_apic_register(offset: u32, value: u32) {
 /// Local APICレジスタからの読み込み
 ///
 /// # Safety
-/// - APIC_BASEが有効なLocal APICメモリマップドレジスタのベースアドレスであること
+/// - APICが有効化されMMIOマッピングが完了していること
 /// - offsetが有効なAPICレジスタオフセットであること
 unsafe fn read_apic_register(offset: u32) -> u32 {
-    let addr = (APIC_BASE + offset as u64) as *const u32;
+    let addr = (apic_virt_base() + offset as u64) as *const u32;
     // SAFETY: 呼び出し元が上記の安全性要件を満たすことを保証する。
     // APICレジスタはメモリマップドI/Oであり、read_volatileで読み込む必要がある。
     unsafe { read_volatile(addr) }
@@ -133,24 +141,24 @@ unsafe fn write_msr(msr: u32, value: u64) {
 ///
 /// # Errors
 /// * `PagingError` - APIC MMIOマッピングに失敗した場合
-pub fn enable_apic() -> Result<(), crate::paging::PagingError> {
+fn enable_apic() -> Result<(), crate::paging::PagingError> {
     // APIC MMIO領域をUC属性でマッピング
-    crate::paging::map_mmio(APIC_PHYS_BASE, crate::paging::PAGE_SIZE as u64)?;
+    crate::paging::map_mmio(apic_phys_base(), crate::paging::PAGE_SIZE as u64)?;
 
     // SAFETY: IA32_APIC_BASE MSR (0x1B) はx86_64アーキテクチャで定義された
     // 標準的なMSRであり、APICの有効化に使用される。
     // Spurious Interrupt Vector Registerへの書き込みも、APICが
-    // メモリマップされた標準アドレス(0xFEE00000)に存在する前提で安全。
+    // 設定されたベースアドレスに存在する前提で安全。
     unsafe {
         // IA32_APIC_BASE MSR (0x1B) を読み込み
         const IA32_APIC_BASE_MSR: u32 = 0x1B;
-        let mut apic_base = read_msr(IA32_APIC_BASE_MSR);
+        let mut apic_base_msr = read_msr(IA32_APIC_BASE_MSR);
 
         // APIC Enable bit (bit 11) をセット
-        apic_base |= 1 << 11;
+        apic_base_msr |= 1 << 11;
 
         // MSRに書き戻し
-        write_msr(IA32_APIC_BASE_MSR, apic_base);
+        write_msr(IA32_APIC_BASE_MSR, apic_base_msr);
 
         // Spurious Interrupt Vector Registerを設定してAPICを有効化
         // bit 8: APIC Software Enable/Disable
@@ -375,9 +383,23 @@ fn disable_legacy_pic() {
 
 /// Local APICを初期化
 ///
+/// # Arguments
+/// * `apic_base_addr` - MADTから取得したAPICベースアドレス。Noneの場合はデフォルト値(0xFEE00000)を使用。
+///
 /// # Errors
 /// * `PagingError` - APIC MMIOマッピングに失敗した場合
-pub fn init() -> Result<(), crate::paging::PagingError> {
+pub fn init(apic_base_addr: Option<u64>) -> Result<(), crate::paging::PagingError> {
+    // APICベースアドレスを設定（指定があればMADTの値を使用）
+    if let Some(addr) = apic_base_addr {
+        APIC_PHYS_BASE.store(addr, Ordering::SeqCst);
+        crate::info!("Using APIC base address from MADT: 0x{:X}", addr);
+    } else {
+        crate::info!(
+            "Using default APIC base address: 0x{:X}",
+            DEFAULT_APIC_PHYS_BASE
+        );
+    }
+
     // まずレガシーPICを無効化
     disable_legacy_pic();
     enable_apic()?;

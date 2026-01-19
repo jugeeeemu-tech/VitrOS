@@ -40,6 +40,9 @@ const PAGE_TABLE_ENTRY_COUNT: usize = 512;
 /// ページサイズ（4KB）
 pub const PAGE_SIZE: usize = 4096;
 
+/// 1つのPage Tableがカバーする領域サイズ（2MB = 512 * 4KB）
+const PAGE_TABLE_COVERAGE: u64 = (PAGE_TABLE_ENTRY_COUNT * PAGE_SIZE) as u64;
+
 /// ページオフセットマスク（下位12ビット）
 const PAGE_OFFSET_MASK: u64 = 0xFFF;
 
@@ -195,7 +198,6 @@ impl PageTable {
 }
 
 /// CR3レジスタを読み取る
-#[allow(dead_code)]
 pub fn read_cr3() -> u64 {
     let value: u64;
     unsafe {
@@ -217,7 +219,6 @@ pub fn write_cr3(pml4_addr: u64) {
 ///
 /// # TODO: マルチコア対応
 /// マルチコア環境では他CPUへのIPIによるTLB shootdownが必要。
-#[allow(dead_code)]
 pub fn reload_cr3() {
     let cr3 = read_cr3();
     write_cr3(cr3);
@@ -227,11 +228,17 @@ pub fn reload_cr3() {
 ///
 /// UEFIメモリマップに基づいて、EFI_MEMORY_MAPPED_IOまたは
 /// EFI_MEMORY_MAPPED_IO_PORT_SPACEタイプの領域に含まれるかを確認する。
-fn is_mmio_region(phys_addr: u64, boot_info: &vitros_common::boot_info::BootInfo) -> bool {
+///
+/// # Arguments
+/// * `phys_addr` - 判定する物理アドレス
+/// * `memory_regions` - UEFIメモリマップのスライス（有効範囲のみ）
+fn is_mmio_region(
+    phys_addr: u64,
+    memory_regions: &[vitros_common::boot_info::MemoryRegion],
+) -> bool {
     use vitros_common::uefi::{EFI_MEMORY_MAPPED_IO, EFI_MEMORY_MAPPED_IO_PORT_SPACE};
 
-    for i in 0..boot_info.memory_map_count.min(boot_info.memory_map.len()) {
-        let region = &boot_info.memory_map[i];
+    for region in memory_regions {
         let region_end = region.start + region.size;
 
         if phys_addr >= region.start && phys_addr < region_end {
@@ -326,7 +333,7 @@ pub fn init(boot_info: &vitros_common::boot_info::BootInfo) -> Result<(), Paging
 
     // 必要なPD数とPT数を計算
     // 1 PT = 512 * 4KB = 2MB
-    let required_pt_count = ((actual_max + (2 << 20) - 1) / (2 << 20)) as usize;
+    let required_pt_count = ((actual_max + PAGE_TABLE_COVERAGE - 1) / PAGE_TABLE_COVERAGE) as usize;
     let required_pd_count = (required_pt_count + 511) / 512;
 
     use crate::info;
@@ -388,12 +395,15 @@ pub fn init(boot_info: &vitros_common::boot_info::BootInfo) -> Result<(), Paging
         // === 必要なページのみマッピング（高位のみ）===
         // MMIO領域はスキップし、後でmap_mmio()でUC属性でマッピングする
         let mut skipped_mmio_pages = 0usize;
+        // メモリマップのスライスをループ外で一度だけ作成
+        let memory_region_count = boot_info.memory_map_count.min(boot_info.memory_map.len());
+        let memory_regions = &boot_info.memory_map[..memory_region_count];
         for pt_idx in 0..required_pt_count {
             for page_idx in 0..PAGE_TABLE_ENTRY_COUNT {
                 let physical_addr =
                     ((pt_idx * PAGE_TABLE_ENTRY_COUNT + page_idx) * PAGE_SIZE) as u64;
                 if physical_addr < actual_max {
-                    if is_mmio_region(physical_addr, boot_info) {
+                    if is_mmio_region(physical_addr, memory_regions) {
                         // MMIO領域はスキップ（Present=0のまま）
                         skipped_mmio_pages += 1;
                     } else {
@@ -438,21 +448,24 @@ pub fn init(boot_info: &vitros_common::boot_info::BootInfo) -> Result<(), Paging
             .entry(page_idx_in_pt)
             .set(guard_page_phys_addr, 0);
 
-        // デバッグ: Guard Page設定を確認
-        info!("Guard Page setup:");
-        info!("  Virtual address: 0x{:016X}", guard_page_virt_addr);
-        info!("  Physical offset: 0x{:X}", physical_offset);
-        info!("  Page number: {}", page_num);
-        info!("  PT array index: {}", pt_array_idx);
-        info!("  Entry in PT: {}", page_idx_in_pt);
-        info!(
-            "  Entry value: 0x{:016X}",
-            (*pt_high)[pt_array_idx].entry(page_idx_in_pt).get_raw()
-        );
-        info!(
-            "  Entry is Present: {}",
-            (*pt_high)[pt_array_idx].entry(page_idx_in_pt).get_raw() & 1 != 0
-        );
+        // デバッグ: Guard Page設定を確認（リリースビルドでは省略）
+        #[cfg(debug_assertions)]
+        {
+            info!("Guard Page setup:");
+            info!("  Virtual address: 0x{:016X}", guard_page_virt_addr);
+            info!("  Physical offset: 0x{:X}", physical_offset);
+            info!("  Page number: {}", page_num);
+            info!("  PT array index: {}", pt_array_idx);
+            info!("  Entry in PT: {}", page_idx_in_pt);
+            info!(
+                "  Entry value: 0x{:016X}",
+                (*pt_high)[pt_array_idx].entry(page_idx_in_pt).get_raw()
+            );
+            info!(
+                "  Entry is Present: {}",
+                (*pt_high)[pt_array_idx].entry(page_idx_in_pt).get_raw() & 1 != 0
+            );
+        }
 
         // CR3レジスタにPML4のアドレスを設定
         let pml4_addr = (*pml4).physical_address()?;

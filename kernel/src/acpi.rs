@@ -4,8 +4,52 @@
 //! UEFI ブートローダーから RSDP アドレスを受け取り、XSDT/RSDT を解析します。
 
 use crate::info;
-use crate::paging::phys_to_virt;
+use crate::paging::{PagingError, phys_to_virt};
+use core::sync::atomic::{AtomicU64, Ordering};
 use vitros_common::boot_info::BootInfo;
+
+/// ACPIテーブル解析時のエラー型
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcpiError {
+    /// アドレス変換に失敗
+    AddressConversionFailed,
+    /// チェックサム検証に失敗
+    ChecksumFailed,
+    /// サポートされていない形式
+    NotSupported,
+    /// ページング操作に失敗
+    PagingError(PagingError),
+}
+
+impl From<PagingError> for AcpiError {
+    fn from(e: PagingError) -> Self {
+        AcpiError::PagingError(e)
+    }
+}
+
+impl core::fmt::Display for AcpiError {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        match self {
+            AcpiError::AddressConversionFailed => write!(f, "Address conversion failed"),
+            AcpiError::ChecksumFailed => write!(f, "Checksum verification failed"),
+            AcpiError::NotSupported => write!(f, "Not supported"),
+            AcpiError::PagingError(e) => write!(f, "Paging error: {}", e),
+        }
+    }
+}
+
+/// MADTから取得したLocal APICの物理アドレス
+/// 0の場合はMADT未解析またはアドレス未取得
+static LOCAL_APIC_ADDRESS: AtomicU64 = AtomicU64::new(0);
+
+/// MADTから取得したLocal APICアドレスを返す
+///
+/// ACPIテーブル解析後に呼び出すこと。
+/// MADTが見つかっていない場合や解析前はNoneを返す。
+pub fn get_local_apic_address() -> Option<u64> {
+    let addr = LOCAL_APIC_ADDRESS.load(Ordering::SeqCst);
+    if addr == 0 { None } else { Some(addr) }
+}
 
 /// RSDP (Root System Description Pointer) - ACPI 1.0
 #[repr(C, packed)]
@@ -389,6 +433,9 @@ fn parse_madt(madt_phys_addr: u64) {
     let flags = madt.flags;
     let table_length = madt.header.length;
 
+    // Local APICアドレスをグローバル変数に保存
+    LOCAL_APIC_ADDRESS.store(local_apic_addr as u64, Ordering::SeqCst);
+
     info!("MADT found:");
     info!("  Local APIC Address: 0x{:08X}", local_apic_addr);
     info!("  Flags: 0x{:08X}", flags);
@@ -518,19 +565,19 @@ fn parse_mcfg(mcfg_phys_addr: u64) {
 /// HPET (High Precision Event Timer) テーブルを解析
 ///
 /// # Errors
-/// * `PagingError` - HPETのMMIOマッピングに失敗した場合
-fn parse_hpet(hpet_phys_addr: u64) -> Result<(), crate::paging::PagingError> {
+/// * `AcpiError::AddressConversionFailed` - HPETテーブルのアドレス変換に失敗した場合
+/// * `AcpiError::ChecksumFailed` - チェックサム検証に失敗した場合
+/// * `AcpiError::NotSupported` - HPETがI/O空間にある場合（未サポート）
+/// * `AcpiError::PagingError` - HPETのMMIOマッピングに失敗した場合
+fn parse_hpet(hpet_phys_addr: u64) -> Result<(), AcpiError> {
     // 物理アドレスを高位仮想アドレスに変換（0チェックも含む）
-    let hpet_virt_addr = match phys_to_virt(hpet_phys_addr) {
-        Ok(addr) => addr,
-        Err(_) => return Ok(()),
-    };
+    let hpet_virt_addr =
+        phys_to_virt(hpet_phys_addr).map_err(|_| AcpiError::AddressConversionFailed)?;
     let hpet = unsafe { &*(hpet_virt_addr as *const HpetTable) };
 
     // チェックサムを検証
     if !hpet.header.verify_checksum() {
-        info!("HPET checksum verification failed");
-        return Ok(());
+        return Err(AcpiError::ChecksumFailed);
     }
 
     // packed struct のフィールドはローカル変数にコピー
@@ -546,8 +593,7 @@ fn parse_hpet(hpet_phys_addr: u64) -> Result<(), crate::paging::PagingError> {
 
     // メモリ空間のみサポート
     if address_space != 0 {
-        info!("  HPET in I/O space not supported");
-        return Ok(());
+        return Err(AcpiError::NotSupported);
     }
 
     // HPETモジュールを初期化

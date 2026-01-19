@@ -259,8 +259,10 @@ extern "C" fn kernel_main_inner(boot_info_phys_addr: u64) -> ! {
 
     // Local APICを初期化
     // APICは必須なので失敗時はpanic
+    // MADTから取得したAPICアドレスを使用（取得できなければデフォルト値を使用）
     info!("Initializing Local APIC...");
-    apic::init().expect("Failed to initialize Local APIC");
+    let apic_base = acpi::get_local_apic_address();
+    apic::init(apic_base).expect("Failed to initialize Local APIC");
     info!("Local APIC initialized");
 
     // APIC Timerをキャリブレーション（割り込み無効状態で実行）
