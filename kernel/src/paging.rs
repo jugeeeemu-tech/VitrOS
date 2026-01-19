@@ -215,6 +215,28 @@ pub fn reload_cr3() {
     write_cr3(cr3);
 }
 
+/// 指定した物理アドレスがMMIO領域かどうかを判定
+///
+/// UEFIメモリマップに基づいて、EFI_MEMORY_MAPPED_IOまたは
+/// EFI_MEMORY_MAPPED_IO_PORT_SPACEタイプの領域に含まれるかを確認する。
+fn is_mmio_region(phys_addr: u64, boot_info: &vitros_common::boot_info::BootInfo) -> bool {
+    use vitros_common::uefi::{EFI_MEMORY_MAPPED_IO, EFI_MEMORY_MAPPED_IO_PORT_SPACE};
+
+    for i in 0..boot_info.memory_map_count.min(boot_info.memory_map.len()) {
+        let region = &boot_info.memory_map[i];
+        let region_end = region.start + region.size;
+
+        if phys_addr >= region.start && phys_addr < region_end {
+            if region.region_type == EFI_MEMORY_MAPPED_IO
+                || region.region_type == EFI_MEMORY_MAPPED_IO_PORT_SPACE
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// カーネル専用スタック（64KB）
 /// クレート内でのみ公開（kernel_mainから参照するため）
 #[allow(dead_code)]
@@ -356,14 +378,24 @@ pub fn init(boot_info: &vitros_common::boot_info::BootInfo) -> Result<(), Paging
         }
 
         // === 必要なページのみマッピング（高位のみ）===
+        // MMIO領域はスキップし、後でmap_mmio()でUC属性でマッピングする
+        let mut skipped_mmio_pages = 0usize;
         for pt_idx in 0..required_pt_count {
             for page_idx in 0..PAGE_TABLE_ENTRY_COUNT {
                 let physical_addr =
                     ((pt_idx * PAGE_TABLE_ENTRY_COUNT + page_idx) * PAGE_SIZE) as u64;
                 if physical_addr < actual_max {
-                    (*pt_high)[pt_idx].entry(page_idx).set(physical_addr, flags);
+                    if is_mmio_region(physical_addr, boot_info) {
+                        // MMIO領域はスキップ（Present=0のまま）
+                        skipped_mmio_pages += 1;
+                    } else {
+                        (*pt_high)[pt_idx].entry(page_idx).set(physical_addr, flags);
+                    }
                 }
             }
+        }
+        if skipped_mmio_pages > 0 {
+            info!("Skipped {} pages as MMIO regions", skipped_mmio_pages);
         }
 
         // === Guard Page の設定 ===
@@ -562,4 +594,79 @@ pub fn dump_mtrr() {
             info!("  PAT[{}] = {}", i, mem_type.as_str());
         }
     }
+}
+
+// =============================================================================
+// MMIO マッピング関連
+// =============================================================================
+
+/// MMIO領域をUC（Uncacheable）属性でマッピングする
+///
+/// init()でスキップされたMMIO領域を、デバイス使用前に動的にマッピングする。
+/// キャッシュ無効（UC）属性でマッピングされるため、MMIOレジスタへのアクセスが
+/// 正しく行われることが保証される。
+///
+/// # Arguments
+/// * `phys_addr` - マッピングする物理アドレス（4KB境界にアライメントされている必要がある）
+/// * `size` - マッピングするサイズ（バイト単位、4KB単位に切り上げられる）
+///
+/// # Returns
+/// マッピングされた仮想アドレス、またはエラー
+///
+/// # Errors
+/// * `PagingError::InvalidAddress` - アドレスが4KB境界にアライメントされていない場合
+/// * `PagingError::PageTableInitFailed` - ページテーブルのインデックスが範囲外の場合
+pub fn map_mmio(phys_addr: u64, size: u64) -> Result<u64, PagingError> {
+    use crate::info;
+
+    // 4KB境界アライメントチェック
+    if phys_addr & 0xFFF != 0 {
+        return Err(PagingError::InvalidAddress);
+    }
+
+    // 必要なページ数を計算（切り上げ）
+    let page_count = ((size + PAGE_SIZE as u64 - 1) / PAGE_SIZE as u64) as usize;
+
+    // UC属性フラグ: Present | Writable | CacheDisable
+    let uc_flags = PageTableFlags::Present as u64
+        | PageTableFlags::Writable as u64
+        | PageTableFlags::CacheDisable as u64;
+
+    unsafe {
+        let pt_high = addr_of_mut!(KERNEL_PT_HIGH);
+
+        for i in 0..page_count {
+            let addr = phys_addr + (i * PAGE_SIZE) as u64;
+
+            // ページ番号を計算
+            let page_num = (addr >> 12) as usize;
+
+            // PT配列内のインデックスとPT内のエントリ番号を計算
+            let pt_array_idx = page_num / PAGE_TABLE_ENTRY_COUNT;
+            let page_idx_in_pt = page_num % PAGE_TABLE_ENTRY_COUNT;
+
+            // インデックスの範囲検証
+            if pt_array_idx >= PT_COUNT {
+                return Err(PagingError::PageTableInitFailed);
+            }
+
+            // UC属性でページテーブルエントリを設定
+            (*pt_high)[pt_array_idx]
+                .entry(page_idx_in_pt)
+                .set(addr, uc_flags);
+        }
+
+        // TLBフラッシュ
+        reload_cr3();
+    }
+
+    // 仮想アドレスを計算して返す
+    let virt_addr = phys_to_virt(phys_addr)?;
+
+    info!(
+        "MMIO mapped: phys=0x{:X} -> virt=0x{:X} ({} pages, UC)",
+        phys_addr, virt_addr, page_count
+    );
+
+    Ok(virt_addr)
 }

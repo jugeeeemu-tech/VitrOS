@@ -58,6 +58,9 @@ unsafe fn write_hpet_reg(offset: u64, value: u64) {
 /// # Arguments
 /// * `base_phys_addr` - HPETレジスタの物理ベースアドレス
 pub fn init(base_phys_addr: u64) {
+    // HPET MMIO領域をUC属性でマッピング
+    crate::paging::map_mmio(base_phys_addr, 0x1000).expect("Failed to map HPET MMIO");
+
     // 物理アドレスを仮想アドレスに変換
     let base_virt = KERNEL_VIRTUAL_BASE + base_phys_addr;
     HPET_BASE.store(base_virt, Ordering::SeqCst);

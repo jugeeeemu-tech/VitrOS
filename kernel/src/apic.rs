@@ -35,9 +35,12 @@ impl core::fmt::Display for ApicError {
     }
 }
 
+/// Local APICの物理ベースアドレス
+const APIC_PHYS_BASE: u64 = 0xFEE00000;
+
 /// Local APICのベースアドレス（高位仮想アドレス）
 /// 物理アドレス 0xFEE00000 を高位仮想アドレス経由でアクセス
-const APIC_BASE: u64 = KERNEL_VIRTUAL_BASE + 0xFEE00000;
+const APIC_BASE: u64 = KERNEL_VIRTUAL_BASE + APIC_PHYS_BASE;
 
 /// Local APICレジスタのオフセット
 mod registers {
@@ -128,6 +131,9 @@ unsafe fn write_msr(msr: u32, value: u64) {
 
 /// Local APICを有効化
 pub fn enable_apic() {
+    // APIC MMIO領域をUC属性でマッピング
+    crate::paging::map_mmio(APIC_PHYS_BASE, 0x1000).expect("Failed to map APIC MMIO");
+
     // SAFETY: IA32_APIC_BASE MSR (0x1B) はx86_64アーキテクチャで定義された
     // 標準的なMSRであり、APICの有効化に使用される。
     // Spurious Interrupt Vector Registerへの書き込みも、APICが
