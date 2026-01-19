@@ -52,11 +52,10 @@ fn apic_phys_base() -> u64 {
 
 /// 現在のAPIC仮想ベースアドレスを取得
 ///
-/// # Panics (debug build only)
+/// # Panics
 /// enable_apic()が呼び出される前にこの関数を呼び出すとパニックする
 fn apic_virt_base() -> u64 {
-    #[cfg(debug_assertions)]
-    debug_assert!(
+    assert!(
         APIC_MMIO_MAPPED.load(Ordering::SeqCst),
         "apic_virt_base() called before enable_apic()"
     );

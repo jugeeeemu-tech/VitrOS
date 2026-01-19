@@ -483,11 +483,10 @@ pub fn init(boot_info: &vitros_common::boot_info::BootInfo) -> Result<(), Paging
 // MMIO マッピング関連
 // =============================================================================
 
-/// 割り込みが無効であることを確認（デバッグビルドのみ）
+/// 割り込みが無効であることを確認
 ///
 /// スレッドセーフティのため、ページテーブル操作は割り込み無効状態で
 /// 行われることを検証する。
-#[cfg(debug_assertions)]
 fn assert_interrupts_disabled(context: &str) {
     let rflags: u64;
     // SAFETY: RFLAGSレジスタをスタックにプッシュしてから読み取る標準的な方法。
@@ -496,7 +495,7 @@ fn assert_interrupts_disabled(context: &str) {
         asm!("pushfq; pop {}", out(reg) rflags, options(nomem, preserves_flags));
     }
     // IF (Interrupt Flag) はbit 9
-    debug_assert!(
+    assert!(
         (rflags & 0x200) == 0,
         "{}: must be called with interrupts disabled",
         context
@@ -531,8 +530,7 @@ fn assert_interrupts_disabled(context: &str) {
 pub fn map_mmio(phys_addr: u64, size: u64) -> Result<u64, PagingError> {
     use crate::info;
 
-    // デバッグビルド時：割り込みが無効であることを確認
-    #[cfg(debug_assertions)]
+    // 割り込みが無効であることを確認
     assert_interrupts_disabled("map_mmio");
 
     // 4KB境界アライメントチェック
