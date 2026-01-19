@@ -157,11 +157,9 @@ impl TaskWriter {
         }
 
         // 蓄積中のテキストをDrawStringとして追加
-        // clone()でテキストをコピーし、clear()で元バッファを再利用
+        // mem::take()で所有権を移動し、pending_textを空のStringで置換
         // これによりpending_textの容量は維持される（リアロケーション防止）
-        // 注: DrawCommandがStringを所有するため、新規Stringの作成は避けられない
-        let text = self.pending_text.clone();
-        self.pending_text.clear();
+        let text = core::mem::take(&mut self.pending_text);
         self.local_commands.push(DrawCommand::DrawString {
             x: self.pending_x,
             y: self.pending_y,
