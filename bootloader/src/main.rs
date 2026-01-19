@@ -524,7 +524,7 @@ extern "efiapi" fn efi_main(
     // カーネルの高位仮想アドレスを計算（kernel_entryは物理アドレス）
     let kernel_high_addr = kernel_entry + KERNEL_VMA;
 
-    // カーネルにジャンプ (低位アドレスにコピーしたBOOT_INFOの物理アドレスを渡す)
+    // カーネルにジャンプ（BOOT_INFOの物理アドレスを渡す）
     type KernelEntry = extern "efiapi" fn(u64) -> !;
     let kernel_fn: KernelEntry = unsafe { core::mem::transmute(kernel_high_addr as *const ()) };
     kernel_fn(boot_info_phys_addr);
