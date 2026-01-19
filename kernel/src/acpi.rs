@@ -8,6 +8,13 @@ use crate::paging::{PagingError, phys_to_virt};
 use core::sync::atomic::{AtomicU64, Ordering};
 use vitros_common::boot_info::BootInfo;
 
+/// ACPIテーブル長の最大値（100MB）
+/// 悪意あるデータや破損データによる範囲外アクセスを防ぐ
+const MAX_ACPI_TABLE_LENGTH: u32 = 100 * 1024 * 1024;
+
+/// ACPIテーブル長の最小値（ヘッダサイズ）
+const MIN_ACPI_TABLE_LENGTH: usize = core::mem::size_of::<AcpiTableHeader>();
+
 /// ACPIテーブル解析時のエラー型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AcpiError {
@@ -147,9 +154,14 @@ impl AcpiTableHeader {
     /// - selfが有効なACPIテーブルヘッダを指していること
     /// - self.lengthバイトのメモリが読み取り可能であること
     unsafe fn verify_checksum(&self) -> bool {
-        let length = self.length;
-        let bytes =
-            unsafe { core::slice::from_raw_parts(self as *const _ as *const u8, length as usize) };
+        let length = self.length as usize;
+
+        // テーブル長の検証（破損データや悪意あるデータからの保護）
+        if length < MIN_ACPI_TABLE_LENGTH || self.length > MAX_ACPI_TABLE_LENGTH {
+            return false;
+        }
+
+        let bytes = unsafe { core::slice::from_raw_parts(self as *const _ as *const u8, length) };
 
         let sum: u8 = bytes.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
         sum == 0
