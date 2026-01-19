@@ -46,6 +46,10 @@ const PAGE_TABLE_COVERAGE: u64 = (PAGE_TABLE_ENTRY_COUNT * PAGE_SIZE) as u64;
 /// ページオフセットマスク（下位12ビット）
 const PAGE_OFFSET_MASK: u64 = 0xFFF;
 
+/// ページテーブルエントリから物理アドレスを抽出するためのマスク
+/// ビット12〜51が物理アドレス（4KB境界アライメント、最大52ビット物理アドレス対応）
+const PHYSICAL_ADDRESS_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+
 /// カーネル空間のPML4エントリインデックス (0xFFFF_8000_0000_0000に対応)
 /// x86_64では仮想アドレスのビット47:39がPML4インデックスとなる
 const PML4_KERNEL_INDEX: usize = 256;
@@ -132,7 +136,7 @@ impl PageTableEntry {
     #[allow(dead_code)]
     pub fn set_address(&mut self, addr: u64) {
         // 下位12ビットをクリア（4KBアライメント）
-        let addr_masked = addr & 0x000F_FFFF_FFFF_F000;
+        let addr_masked = addr & PHYSICAL_ADDRESS_MASK;
         // フラグをクリアして新しいアドレスを設定
         self.entry = (self.entry & PAGE_OFFSET_MASK) | addr_masked;
     }
@@ -140,14 +144,14 @@ impl PageTableEntry {
     /// エントリを完全に設定（アドレス + フラグ）
     pub fn set(&mut self, addr: u64, flags: u64) {
         // 既存のエントリを完全にクリアしてから設定
-        let addr_masked = addr & 0x000F_FFFF_FFFF_F000;
+        let addr_masked = addr & PHYSICAL_ADDRESS_MASK;
         self.entry = addr_masked | flags;
     }
 
     /// 物理アドレスを取得
     #[allow(dead_code)]
     pub fn get_address(&self) -> u64 {
-        self.entry & 0x000F_FFFF_FFFF_F000
+        self.entry & PHYSICAL_ADDRESS_MASK
     }
 
     /// エントリの生の値を取得（デバッグ用）
