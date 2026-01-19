@@ -38,6 +38,9 @@ impl core::fmt::Display for ApicError {
 /// Local APICのデフォルト物理ベースアドレス
 const DEFAULT_APIC_PHYS_BASE: u64 = 0xFEE00000;
 
+/// ページアライメントマスク（4KB境界）
+const PAGE_ALIGNMENT_MASK: u64 = 0xFFF;
+
 /// Local APICの物理ベースアドレス（MADTから動的に設定可能）
 static APIC_PHYS_BASE: AtomicU64 = AtomicU64::new(DEFAULT_APIC_PHYS_BASE);
 
@@ -361,8 +364,20 @@ fn disable_legacy_pic() {
 pub fn init(apic_base_addr: Option<u64>) -> Result<(), crate::paging::PagingError> {
     // APICベースアドレスを設定（指定があればMADTの値を使用）
     if let Some(addr) = apic_base_addr {
-        APIC_PHYS_BASE.store(addr, Ordering::SeqCst);
-        crate::info!("Using APIC base address from MADT: 0x{:X}", addr);
+        // 4KB境界アライメントを検証
+        if addr & PAGE_ALIGNMENT_MASK != 0 {
+            crate::warn!(
+                "APIC base address 0x{:X} is not 4KB aligned, using default",
+                addr
+            );
+            crate::info!(
+                "Using default APIC base address: 0x{:X}",
+                DEFAULT_APIC_PHYS_BASE
+            );
+        } else {
+            APIC_PHYS_BASE.store(addr, Ordering::SeqCst);
+            crate::info!("Using APIC base address from MADT: 0x{:X}", addr);
+        }
     } else {
         crate::info!(
             "Using default APIC base address: 0x{:X}",
