@@ -90,12 +90,6 @@ impl<O: CompositorObserver> Compositor<O> {
         // オブザーバーに通知
         self.observer.on_buffer_registered(buffer_index, &buffer);
 
-        // 可視化モード: バッファインデックスを設定
-        #[cfg(feature = "visualize-pipeline")]
-        {
-            buffer.lock().set_vis_buffer_index(buffer_index);
-        }
-
         buffer
     }
 
@@ -209,11 +203,9 @@ fn render_commands_to(shadow_buffer: &mut ShadowBuffer, region: &Region, command
     }
 }
 
-// グローバルCompositor型エイリアス（featureフラグで切り替え）
-#[cfg(feature = "visualize-pipeline")]
-type GlobalCompositor = Compositor<crate::pipeline_visualization::PipelineVisualizationObserver>;
-
-#[cfg(not(feature = "visualize-pipeline"))]
+// グローバルCompositor型エイリアス
+// オブザーバーパターン移行により、常にNoOpObserverを使用
+// 可視化ロジックはフック関数経由でpipeline_visualization側で処理
 type GlobalCompositor = Compositor<NoOpObserver>;
 
 // グローバルCompositorインスタンス
@@ -232,14 +224,11 @@ pub fn init_compositor(config: CompositorConfig) {
     SCREEN_WIDTH.store(config.fb_width, Ordering::Relaxed);
     SCREEN_HEIGHT.store(config.fb_height, Ordering::Relaxed);
 
-    #[cfg(feature = "visualize-pipeline")]
-    let observer = crate::pipeline_visualization::PipelineVisualizationObserver::new();
-
-    #[cfg(not(feature = "visualize-pipeline"))]
-    let observer = NoOpObserver;
+    // 可視化フック: fb_baseをObserver側に通知
+    notify_compositor_init(config.fb_base);
 
     let mut comp = COMPOSITOR.lock();
-    *comp = Some(Compositor::new(config, observer));
+    *comp = Some(Compositor::new(config, NoOpObserver));
 }
 
 /// フレームカウントを取得
@@ -260,16 +249,6 @@ pub fn screen_size() -> (u32, u32) {
     )
 }
 
-/// フレームバッファのベースアドレスを取得
-///
-/// # Returns
-/// フレームバッファのベースアドレス。Compositorが未初期化なら0
-#[cfg(feature = "visualize-pipeline")]
-pub fn fb_base() -> u64 {
-    let comp = COMPOSITOR.lock();
-    comp.as_ref().map(|c| c.get_config().fb_base).unwrap_or(0)
-}
-
 /// 新しいWriterを登録（タスク作成時に呼ばれる）
 ///
 /// # Arguments
@@ -282,10 +261,6 @@ pub fn fb_base() -> u64 {
 /// 割り込みを無効化してロックを取得することで、
 /// ロック保持中にプリエンプトされることを防ぎます。
 pub fn register_writer(region: Region) -> Option<SharedBuffer> {
-    // 可視化モード: 現在のタスクIDを取得
-    #[cfg(feature = "visualize-pipeline")]
-    let task_id = crate::sched::current_task_id().as_u64();
-
     // 割り込みを無効化してロック取得（スピンロック競合回避）
     let flags = unsafe {
         let flags: u64;
@@ -299,9 +274,15 @@ pub fn register_writer(region: Region) -> Option<SharedBuffer> {
         flags
     };
 
-    let result = {
+    let (result, buffer_index) = {
         let mut comp = COMPOSITOR.lock();
-        comp.as_mut().map(|c| c.register_writer(region))
+        match comp.as_mut() {
+            Some(c) => {
+                let idx = c.get_buffers_snapshot().len();
+                (Some(c.register_writer(region)), idx)
+            }
+            None => (None, 0),
+        }
     };
 
     // 割り込みを元の状態に復元
@@ -311,12 +292,10 @@ pub fn register_writer(region: Region) -> Option<SharedBuffer> {
         }
     }
 
-    // 可視化モード: バッファに所有タスクIDを設定
-    #[cfg(feature = "visualize-pipeline")]
-    if let Some(ref buffer) = result {
-        if let Some(mut buf) = buffer.try_lock() {
-            buf.set_owner_task_id(task_id);
-        }
+    // 可視化フック: バッファ登録を通知（タスクIDとバッファインデックス）
+    if result.is_some() {
+        let task_id = crate::sched::current_task_id().as_u64();
+        notify_buffer_registered(buffer_index, task_id);
     }
 
     result
@@ -408,15 +387,8 @@ pub extern "C" fn compositor_task() -> ! {
         // Phase 2+3: 各バッファから直接レンダリング（アロケーションフリー）
         // ロックを取得したままレンダリングし、終わったらクリア
 
-        // NOTE: オブザーバーパターン導入済み（Issue #16）
-        // PipelineVisualizationObserverで可視化ロジックを実装
-        // ジェネリクス + ZSTでゼロコスト抽象化を実現
-        #[cfg(feature = "visualize-pipeline")]
-        if crate::pipeline_visualization::process_frame_if_visualization(
-            &buffers_snapshot,
-            config.fb_width,
-            config.fb_height,
-        ) {
+        // 可視化フック: フレーム開始を通知（可視化モードなら処理をスキップ）
+        if notify_frame_start(&buffers_snapshot, config.fb_width, config.fb_height) {
             FRAME_COUNT.fetch_add(1, Ordering::Relaxed);
             crate::sched::sleep_ms(16);
             continue;
@@ -443,4 +415,45 @@ pub extern "C" fn compositor_task() -> ! {
         // 次のリフレッシュまで待機（約60fps = 16ms間隔）
         crate::sched::sleep_ms(16);
     }
+}
+
+// =============================================================================
+// 可視化フック関数（featureフラグで有効版/no-op版を切り替え）
+// =============================================================================
+
+/// Compositor初期化時の通知
+#[cfg(feature = "visualize-pipeline")]
+#[inline(always)]
+fn notify_compositor_init(fb_base: u64) {
+    crate::pipeline_visualization::on_compositor_init_hook(fb_base);
+}
+
+#[cfg(not(feature = "visualize-pipeline"))]
+#[inline(always)]
+fn notify_compositor_init(_fb_base: u64) {}
+
+/// バッファ登録時の通知
+#[cfg(feature = "visualize-pipeline")]
+#[inline(always)]
+fn notify_buffer_registered(buffer_index: usize, task_id: u64) {
+    crate::pipeline_visualization::on_buffer_registered_hook(buffer_index, task_id);
+}
+
+#[cfg(not(feature = "visualize-pipeline"))]
+#[inline(always)]
+fn notify_buffer_registered(_buffer_index: usize, _task_id: u64) {}
+
+/// フレーム開始時の通知
+///
+/// 可視化モードの場合trueを返し、呼び出し元は通常の描画処理をスキップする
+#[cfg(feature = "visualize-pipeline")]
+#[inline(always)]
+fn notify_frame_start(buffers: &Arc<Vec<SharedBuffer>>, width: u32, height: u32) -> bool {
+    crate::pipeline_visualization::on_frame_start_hook(buffers, width, height)
+}
+
+#[cfg(not(feature = "visualize-pipeline"))]
+#[inline(always)]
+fn notify_frame_start(_buffers: &Arc<Vec<SharedBuffer>>, _width: u32, _height: u32) -> bool {
+    false
 }

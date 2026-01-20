@@ -121,8 +121,127 @@ const ANIM_SPEED_BUFFER_COPY: f32 = 0.12;
 // グローバル可視化状態（Compositor連携用）
 // =============================================================================
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use spin::Mutex as SpinMutex;
+
+// =============================================================================
+// バッファ追跡用状態管理（Observer側で状態を保持）
+// =============================================================================
+
+/// バッファごとの追跡情報
+struct BufferTrackingInfo {
+    /// 所有タスクID
+    owner_task_id: Option<u64>,
+    /// 可視化用バッファインデックス（登録順）
+    buffer_index: Option<usize>,
+}
+
+impl BufferTrackingInfo {
+    const fn new() -> Self {
+        Self {
+            owner_task_id: None,
+            buffer_index: None,
+        }
+    }
+}
+
+/// バッファ追跡情報（最大4バッファ）
+static BUFFER_TRACKING: SpinMutex<[BufferTrackingInfo; 4]> = SpinMutex::new([
+    BufferTrackingInfo::new(),
+    BufferTrackingInfo::new(),
+    BufferTrackingInfo::new(),
+    BufferTrackingInfo::new(),
+]);
+
+/// フレームバッファベースアドレス（Observer側で保持）
+static FB_BASE: AtomicU64 = AtomicU64::new(0);
+
+/// 登録されたバッファ数
+static BUFFER_COUNT: AtomicU64 = AtomicU64::new(0);
+
+// =============================================================================
+// フック関数（Compositor/Writer本体から呼び出される）
+// =============================================================================
+
+/// Compositor初期化時のフック
+///
+/// fb_baseを保存し、可視化モードで使用できるようにする
+pub fn on_compositor_init_hook(fb_base: u64) {
+    FB_BASE.store(fb_base, Ordering::Relaxed);
+}
+
+/// バッファ登録時のフック
+///
+/// タスクIDとバッファインデックスを追跡情報に保存
+pub fn on_buffer_registered_hook(buffer_index: usize, task_id: u64) {
+    if buffer_index < 4 {
+        let mut tracking = BUFFER_TRACKING.lock();
+        tracking[buffer_index].owner_task_id = Some(task_id);
+        tracking[buffer_index].buffer_index = Some(buffer_index);
+
+        // バッファ数を更新
+        let current_count = BUFFER_COUNT.load(Ordering::Relaxed) as usize;
+        if buffer_index >= current_count {
+            BUFFER_COUNT.store((buffer_index + 1) as u64, Ordering::Relaxed);
+        }
+    }
+}
+
+/// フレーム開始時のフック
+///
+/// 可視化モードの場合、可視化処理を行いtrueを返す
+pub fn on_frame_start_hook(
+    buffers: &alloc::sync::Arc<alloc::vec::Vec<crate::graphics::buffer::SharedBuffer>>,
+    width: u32,
+    height: u32,
+) -> bool {
+    process_frame_if_visualization(buffers, width, height)
+}
+
+/// flush時のフック
+///
+/// バッファにコマンドが追加されたことを可視化状態に反映
+pub fn on_flush_hook(
+    buffer_index: usize,
+    command_count: usize,
+    command_types: [Option<&'static str>; 5],
+) {
+    update_buffer_on_flush(buffer_index, command_count, command_types);
+}
+
+/// sync_flush開始時のフック
+///
+/// タスクをブロック状態にする
+pub fn on_sync_flush_start_hook() {
+    crate::sched::block_current_task();
+}
+
+/// バッファインデックスから所有タスクIDを取得
+pub fn get_owner_task_id(buffer_index: usize) -> Option<u64> {
+    if buffer_index < 4 {
+        let tracking = BUFFER_TRACKING.lock();
+        tracking[buffer_index].owner_task_id
+    } else {
+        None
+    }
+}
+
+/// 保存されたフレームバッファベースアドレスを取得
+pub fn fb_base() -> u64 {
+    FB_BASE.load(Ordering::Relaxed)
+}
+
+/// 現在のタスクIDからバッファインデックスを逆引き
+pub fn get_buffer_index_for_current_task() -> Option<usize> {
+    let current_task_id = crate::sched::current_task_id().as_u64();
+    let tracking = BUFFER_TRACKING.lock();
+    for (idx, info) in tracking.iter().enumerate() {
+        if info.owner_task_id == Some(current_task_id) {
+            return Some(idx);
+        }
+    }
+    None
+}
 
 /// パイプラインフェーズ
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -689,11 +808,10 @@ fn process_frame_visualization_internal(
                 // バッファを再ロックしてクリア
                 if let Some(mut buf) = buffer.try_lock() {
                     buf.clear_commands();
-                    // 所有タスクを起床
-                    if let Some(id) = buf.owner_task_id() {
-                        drop(buf);
-                        crate::sched::unblock_task(crate::sched::TaskId::from_u64(id));
-                    }
+                }
+                // 所有タスクを起床（Observer側の状態から取得）
+                if let Some(id) = get_owner_task_id(buffer_idx) {
+                    crate::sched::unblock_task(crate::sched::TaskId::from_u64(id));
                 }
             }
         }
@@ -1099,7 +1217,8 @@ extern "C" fn demo_task1() -> ! {
             &mut writer,
             format_args!("[Task1] Count:{} Tick:{}", counter, tick),
         );
-        writer.sync_flush();
+        writer.flush();
+        crate::sched::block_current_task(); // Compositorがコマンドを処理するまで待機
         counter += 1;
     }
 }
@@ -1121,7 +1240,8 @@ extern "C" fn demo_task2() -> ! {
             &mut writer,
             format_args!("[Task2 Med ] Count: {}", counter),
         );
-        writer.sync_flush();
+        writer.flush();
+        crate::sched::block_current_task(); // Compositorがコマンドを処理するまで待機
         counter += 1;
     }
 }
@@ -1143,7 +1263,8 @@ extern "C" fn demo_task3() -> ! {
             &mut writer,
             format_args!("[Task3 Low ] Count: {}", counter),
         );
-        writer.sync_flush();
+        writer.flush();
+        crate::sched::block_current_task(); // Compositorがコマンドを処理するまで待機
         counter += 1;
     }
 }
@@ -1191,8 +1312,8 @@ pub extern "C" fn visualization_ui_task() -> ! {
     // 画面サイズを取得
     let (screen_width, screen_height) = crate::graphics::compositor::screen_size();
 
-    // フレームバッファ情報を取得
-    let fb_base = crate::graphics::compositor::fb_base();
+    // フレームバッファ情報を取得（Observer側で保持）
+    let fb_base = fb_base();
 
     if fb_base == 0 {
         crate::error!("[VisualizationUI] Failed to get framebuffer base");
