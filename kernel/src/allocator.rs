@@ -247,6 +247,13 @@ pub unsafe fn init_heap(heap_start: usize, heap_size: usize) {
 /// # Arguments
 /// * `class_idx` - サイズクラスのインデックス
 /// * `ptr` - 割り当てられたポインタ
+///
+/// # Safety Contract
+/// この関数は`without_interrupts`ブロックの外で呼び出される。
+/// フック先（allocator_visualization::on_allocate_hook）はAtomicUsize操作のみ
+/// を使用するため、割り込みセーフである。
+/// 将来の変更で割り込みを必要とする操作を追加する場合は、
+/// 呼び出し側も適切に保護する必要がある。
 #[cfg(feature = "visualize-allocator")]
 #[inline(always)]
 pub(crate) fn notify_allocate(class_idx: usize, ptr: *mut u8) {
@@ -263,6 +270,13 @@ pub(crate) fn notify_allocate(_class_idx: usize, _ptr: *mut u8) {}
 /// # Arguments
 /// * `class_idx` - サイズクラスのインデックス
 /// * `ptr` - 解放されるポインタ
+///
+/// # Safety Contract
+/// この関数は`without_interrupts`ブロックの外で呼び出される。
+/// フック先（allocator_visualization::on_deallocate_hook）はAtomicUsize操作のみ
+/// を使用するため、割り込みセーフである。
+/// 将来の変更で割り込みを必要とする操作を追加する場合は、
+/// 呼び出し側も適切に保護する必要がある。
 #[cfg(feature = "visualize-allocator")]
 #[inline(always)]
 pub(crate) fn notify_deallocate(class_idx: usize, ptr: *mut u8) {

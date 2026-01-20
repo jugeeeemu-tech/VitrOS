@@ -52,6 +52,10 @@ static SCREEN_HEIGHT: AtomicU64 = AtomicU64::new(0);
 /// # Arguments
 /// * `class_idx` - サイズクラスのインデックス
 /// * `ptr` - 割り当てられたポインタ
+///
+/// # Safety Contract
+/// - 割り込み有効状態（`without_interrupts`の外）で呼び出される
+/// - ロックフリー操作（AtomicUsize）のため、割り込みセーフ
 #[inline(always)]
 pub fn on_allocate_hook(class_idx: usize, _ptr: *mut u8) {
     if class_idx < USED_COUNTS.len() {
@@ -64,13 +68,22 @@ pub fn on_allocate_hook(class_idx: usize, _ptr: *mut u8) {
 /// # Arguments
 /// * `class_idx` - サイズクラスのインデックス
 /// * `ptr` - 解放されるポインタ
+///
+/// # Safety Contract
+/// - 割り込み有効状態（`without_interrupts`の外）で呼び出される
+/// - ロックフリー操作（AtomicUsize）のため、割り込みセーフ
 #[inline(always)]
 pub fn on_deallocate_hook(class_idx: usize, _ptr: *mut u8) {
     if class_idx < USED_COUNTS.len() {
-        let _ =
+        let result =
             USED_COUNTS[class_idx].fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_sub(1)
             });
+        debug_assert!(
+            result.is_ok(),
+            "Allocator underflow: class_idx={}, possible double-free",
+            class_idx
+        );
     }
 }
 
