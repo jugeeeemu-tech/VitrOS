@@ -8,6 +8,9 @@ use crate::io::{port_read_u8, port_write_u8};
 /// PIT周波数（Hz）
 const PIT_FREQUENCY: u32 = 1193182;
 
+/// ポーリングループの最大イテレーション数（タイムアウト用）
+const MAX_POLL_ITERATIONS: u32 = 100_000;
+
 /// PITのI/Oポート
 mod ports {
     /// Channel 0 data port (read/write)
@@ -52,8 +55,14 @@ fn sleep_1ms() {
         port_write_u8(ports::COMMAND, 0x00);
         let mut last_count = read_current_count();
 
-        // カウントダウンが完了するまで待つ
+        // カウントダウンが完了するまで待つ（タイムアウト付き）
+        let mut iterations = 0u32;
         loop {
+            if iterations >= MAX_POLL_ITERATIONS {
+                break; // タイムアウト
+            }
+            iterations += 1;
+
             port_write_u8(ports::COMMAND, 0x00); // latch command
             let current_count = read_current_count();
 
@@ -107,8 +116,14 @@ pub fn udelay(us: u32) {
         port_write_u8(ports::CHANNEL_0, (count & 0xFF) as u8);
         port_write_u8(ports::CHANNEL_0, ((count >> 8) & 0xFF) as u8);
 
-        // カウントが0になるまで待つ
+        // カウントが0になるまで待つ（タイムアウト付き）
+        let mut iterations = 0u32;
         loop {
+            if iterations >= MAX_POLL_ITERATIONS {
+                break; // タイムアウト
+            }
+            iterations += 1;
+
             port_write_u8(ports::COMMAND, 0x00); // latch
             let low = port_read_u8(ports::CHANNEL_0) as u16;
             let high = port_read_u8(ports::CHANNEL_0) as u16;
