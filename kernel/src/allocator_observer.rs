@@ -35,25 +35,6 @@ pub trait AllocatorObserver: Send + Sync {
     /// * `class_idx` - サイズクラスのインデックス
     /// * `ptr` - 解放されるポインタ
     fn on_deallocate(&self, _class_idx: usize, _ptr: *mut u8) {}
-
-    /// 指定サイズクラスの空きブロック数を取得
-    ///
-    /// # Arguments
-    /// * `class_idx` - サイズクラスのインデックス
-    ///
-    /// # Returns
-    /// 空きブロック数
-    fn count_free_blocks(&self, _class_idx: usize) -> usize {
-        0
-    }
-
-    /// 大きなサイズ用領域の使用状況を取得
-    ///
-    /// # Returns
-    /// (使用量, 総容量) のタプル
-    fn large_alloc_usage(&self) -> (usize, usize) {
-        (0, 0)
-    }
 }
 
 /// No-op アロケータオブザーバー（ZST - メモリ消費ゼロ）

@@ -7,7 +7,7 @@ use crate::info;
 use crate::io::without_interrupts;
 
 // サイズクラス（8バイト～4096バイト）
-const SIZE_CLASSES: &[usize] = &[8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096];
+pub const SIZE_CLASSES: &[usize] = &[8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096];
 const NUM_SIZE_CLASSES: usize = SIZE_CLASSES.len();
 
 // 空きブロックのリンクリストノード
@@ -20,8 +20,6 @@ struct FreeNode {
 struct SlabCache {
     free_list: UnsafeCell<Option<NonNull<FreeNode>>>,
     block_size: usize,
-    #[cfg(feature = "visualize-allocator")]
-    free_count: UnsafeCell<usize>,
 }
 
 impl SlabCache {
@@ -29,8 +27,6 @@ impl SlabCache {
         Self {
             free_list: UnsafeCell::new(None),
             block_size,
-            #[cfg(feature = "visualize-allocator")]
-            free_count: UnsafeCell::new(0),
         }
     }
 
@@ -43,10 +39,6 @@ impl SlabCache {
                 // フリーリストから取り出す
                 let ptr = node.as_ptr() as *mut u8;
                 *free_list = (*node.as_ptr()).next;
-                #[cfg(feature = "visualize-allocator")]
-                {
-                    *self.free_count.get() -= 1;
-                }
                 NonNull::new(ptr)
             } else {
                 // フリーリストが空の場合はNone（後でラージアロケータにフォールバック）
@@ -64,10 +56,6 @@ impl SlabCache {
             // フリーリストの先頭に追加
             (*node).next = *free_list;
             *free_list = NonNull::new(node);
-            #[cfg(feature = "visualize-allocator")]
-            {
-                *self.free_count.get() += 1;
-            }
         })
     }
 
@@ -90,8 +78,6 @@ pub struct SlabAllocator {
     // TODO: 大きなサイズ用のバンプアロケータ（解放不可）
     // 将来的にはバディアロケータまたはリンクリストアロケータに置き換える
     // Issue: https://github.com/jugeeeemu-tech/vitrOS/issues/1
-    #[cfg(feature = "visualize-allocator")]
-    large_alloc_start: UnsafeCell<usize>,
     large_alloc_next: UnsafeCell<usize>,
     large_alloc_end: UnsafeCell<usize>,
 }
@@ -111,8 +97,6 @@ impl SlabAllocator {
                 SlabCache::new(SIZE_CLASSES[8]),
                 SlabCache::new(SIZE_CLASSES[9]),
             ],
-            #[cfg(feature = "visualize-allocator")]
-            large_alloc_start: UnsafeCell::new(0),
             large_alloc_next: UnsafeCell::new(0),
             large_alloc_end: UnsafeCell::new(0),
         }
@@ -148,10 +132,6 @@ impl SlabAllocator {
 
         // 大きなサイズ用の領域を初期化
         unsafe {
-            #[cfg(feature = "visualize-allocator")]
-            {
-                *self.large_alloc_start.get() = large_region_start;
-            }
             *self.large_alloc_next.get() = large_region_start;
             *self.large_alloc_end.get() = heap_start + heap_size;
         }
@@ -193,41 +173,6 @@ impl SlabAllocator {
     }
 }
 
-// =============================================================================
-// 可視化機能専用のメソッド
-// cargo build --features visualize でビルドした場合のみ有効
-// =============================================================================
-// NOTE: AllocatorObserverパターンを導入済み（Issue #16）
-// SlabAllocatorはconst fn new()が必要なためジェネリクス化できないが、
-// フック関数 + 条件付きコンパイルでオブザーバーパターンを実現
-#[cfg(feature = "visualize-allocator")]
-impl SlabAllocator {
-    // デバッグ: サイズクラスごとの空きブロック数をカウント（O(1)）
-    pub fn count_free_blocks(&self, class_idx: usize) -> usize {
-        if class_idx >= NUM_SIZE_CLASSES {
-            return 0;
-        }
-
-        // カウンタを直接参照（O(1)）
-        // 割り込み保護でアトミックな読み取りを保証
-        without_interrupts(|| unsafe { *self.caches[class_idx].free_count.get() })
-    }
-
-    // デバッグ: 大きなサイズ用領域の使用状況 (使用量, 総量)
-    pub fn large_alloc_usage(&self) -> (usize, usize) {
-        unsafe {
-            let start = *self.large_alloc_start.get();
-            let next = *self.large_alloc_next.get();
-            let end = *self.large_alloc_end.get();
-
-            let used = next - start; // 使用済み
-            let total = end - start; // 総容量
-
-            (used, total)
-        }
-    }
-}
-
 // GlobalAlloc トレイトを実装
 unsafe impl GlobalAlloc for SlabAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
@@ -237,6 +182,7 @@ unsafe impl GlobalAlloc for SlabAllocator {
         if let Some(class_idx) = Self::size_to_class(size)
             && let Some(ptr) = unsafe { self.caches[class_idx].allocate() }
         {
+            notify_allocate(class_idx, ptr.as_ptr());
             return ptr.as_ptr();
         }
 
@@ -257,6 +203,7 @@ unsafe impl GlobalAlloc for SlabAllocator {
 
         // サイズクラスに該当する場合は解放
         if let Some(class_idx) = Self::size_to_class(size) {
+            notify_deallocate(class_idx, ptr);
             unsafe {
                 self.caches[class_idx].deallocate(ptr);
             }
@@ -288,20 +235,6 @@ pub unsafe fn init_heap(heap_start: usize, heap_size: usize) {
     unsafe {
         ALLOCATOR.init(heap_start, heap_size);
     }
-}
-
-// =============================================================================
-// 可視化機能専用の内部アクセス関数
-// visualization.rsからのみ呼ばれる想定
-// =============================================================================
-#[cfg(feature = "visualize-allocator")]
-pub(crate) fn get_allocator_internal() -> &'static SlabAllocator {
-    &ALLOCATOR
-}
-
-#[cfg(feature = "visualize-allocator")]
-pub(crate) fn get_size_classes_internal() -> &'static [usize] {
-    SIZE_CLASSES
 }
 
 // =============================================================================

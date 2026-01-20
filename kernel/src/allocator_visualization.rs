@@ -9,13 +9,33 @@
 
 extern crate alloc;
 
-use crate::allocator::{self, SlabAllocator};
+use crate::allocator;
 use crate::allocator_observer::AllocatorObserver;
 use crate::graphics::{FramebufferWriter, draw_rect, draw_string};
 use crate::info;
 use alloc::format;
 use core::arch::asm;
 use core::fmt::Write;
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+// =============================================================================
+// Observer側での状態管理
+// アロケータからの通知を受けて使用中ブロック数を追跡
+// =============================================================================
+
+/// 各サイズクラスの使用中ブロック数
+static USED_COUNTS: [AtomicUsize; 10] = [
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+];
 
 // =============================================================================
 // AllocatorObserver フック関数
@@ -28,9 +48,10 @@ use core::fmt::Write;
 /// * `class_idx` - サイズクラスのインデックス
 /// * `ptr` - 割り当てられたポインタ
 #[inline(always)]
-pub fn on_allocate_hook(class_idx: usize, ptr: *mut u8) {
-    // 現在は統計収集のみ（将来的にリアルタイム可視化を追加可能）
-    let _ = (class_idx, ptr);
+pub fn on_allocate_hook(class_idx: usize, _ptr: *mut u8) {
+    if class_idx < USED_COUNTS.len() {
+        USED_COUNTS[class_idx].fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// デアロケート時のフック関数
@@ -39,9 +60,20 @@ pub fn on_allocate_hook(class_idx: usize, ptr: *mut u8) {
 /// * `class_idx` - サイズクラスのインデックス
 /// * `ptr` - 解放されるポインタ
 #[inline(always)]
-pub fn on_deallocate_hook(class_idx: usize, ptr: *mut u8) {
-    // 現在は統計収集のみ（将来的にリアルタイム可視化を追加可能）
-    let _ = (class_idx, ptr);
+pub fn on_deallocate_hook(class_idx: usize, _ptr: *mut u8) {
+    if class_idx < USED_COUNTS.len() {
+        USED_COUNTS[class_idx].fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// 指定サイズクラスの空きブロック数を計算
+///
+/// # Arguments
+/// * `class_idx` - サイズクラスのインデックス
+/// * `total_blocks` - サイズクラスの総ブロック数
+fn count_free_blocks(class_idx: usize, total_blocks: usize) -> usize {
+    let used = USED_COUNTS[class_idx].load(Ordering::Relaxed);
+    total_blocks.saturating_sub(used)
 }
 
 // =============================================================================
@@ -69,26 +101,6 @@ impl AllocatorObserver for AllocatorVisualizationObserver {
     fn on_deallocate(&self, class_idx: usize, ptr: *mut u8) {
         on_deallocate_hook(class_idx, ptr);
     }
-
-    fn count_free_blocks(&self, class_idx: usize) -> usize {
-        get_allocator().count_free_blocks(class_idx)
-    }
-
-    fn large_alloc_usage(&self) -> (usize, usize) {
-        get_allocator().large_alloc_usage()
-    }
-}
-
-// =============================================================================
-// アロケータへのアクセス関数
-// =============================================================================
-
-pub fn get_allocator() -> &'static SlabAllocator {
-    allocator::get_allocator_internal()
-}
-
-pub fn get_size_classes() -> &'static [usize] {
-    allocator::get_size_classes_internal()
 }
 
 // =============================================================================
@@ -140,8 +152,7 @@ pub fn draw_code_snippet(writer: &mut FramebufferWriter, code_lines: &[&str]) {
 
 // 複数のサイズクラスをコンパクトに並べて表示
 pub fn draw_memory_grids_multi(writer: &mut FramebufferWriter, title: &str) {
-    let allocator = get_allocator();
-    let size_classes = get_size_classes();
+    let size_classes = allocator::SIZE_CLASSES;
 
     let fb_base = writer.fb_base;
     let screen_width = writer.width;
@@ -177,8 +188,8 @@ pub fn draw_memory_grids_multi(writer: &mut FramebufferWriter, title: &str) {
         let aligned_size = align_down(slab_size, size);
         let total_blocks = aligned_size / size;
 
-        let free_count = allocator.count_free_blocks(class_idx);
-        let used_count = total_blocks - free_count;
+        let free_count = count_free_blocks(class_idx, total_blocks);
+        let used_count = total_blocks.saturating_sub(free_count);
 
         // グリッドの位置を計算（3列レイアウト）
         let col = class_idx % 3;
@@ -423,6 +434,9 @@ pub fn run_visualization_tests(writer: &mut FramebufferWriter) {
     info!("All blocks freed");
     crate::hpet::delay_ms(5000);
     loop {
+        // SAFETY: hlt命令はCPUを低消費電力状態にする特権命令。
+        // 次の割り込みで復帰するため、メモリ安全性に影響しない。
+        // カーネルモード（Ring 0）で実行されることが前提。
         unsafe {
             asm!("hlt");
         }
