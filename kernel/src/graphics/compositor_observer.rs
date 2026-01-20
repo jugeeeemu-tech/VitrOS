@@ -25,13 +25,27 @@ use super::region::Region;
 /// }
 /// ```
 pub trait CompositorObserver: Send + Sync {
+    /// Compositor初期化時に呼ばれる
+    ///
+    /// # Arguments
+    /// * `fb_base` - フレームバッファのベースアドレス
+    #[inline(always)]
+    fn on_init(&mut self, _fb_base: u64) {}
+
     /// バッファ登録時に呼ばれる
     ///
     /// # Arguments
     /// * `buffer_index` - 登録されたバッファのインデックス
     /// * `buffer` - 登録されたバッファへの参照
+    /// * `task_id` - 登録したタスクのID
     #[inline(always)]
-    fn on_buffer_registered(&mut self, _buffer_index: usize, _buffer: &SharedBuffer) {}
+    fn on_buffer_registered(
+        &mut self,
+        _buffer_index: usize,
+        _buffer: &SharedBuffer,
+        _task_id: u64,
+    ) {
+    }
 
     /// フレーム処理開始時に呼ばれる
     ///

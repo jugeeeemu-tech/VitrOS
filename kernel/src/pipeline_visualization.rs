@@ -32,7 +32,25 @@ impl PipelineVisualizationObserver {
 }
 
 impl CompositorObserver for PipelineVisualizationObserver {
-    fn on_buffer_registered(&mut self, buffer_index: usize, buffer: &SharedBuffer) {
+    fn on_init(&mut self, fb_base: u64) {
+        // フレームバッファベースアドレスを保存
+        FB_BASE.store(fb_base, Ordering::Relaxed);
+    }
+
+    fn on_buffer_registered(&mut self, buffer_index: usize, buffer: &SharedBuffer, task_id: u64) {
+        // バッファ追跡情報を更新
+        if buffer_index < 4 {
+            let mut tracking = BUFFER_TRACKING.lock();
+            tracking[buffer_index].owner_task_id = Some(task_id);
+            tracking[buffer_index].buffer_index = Some(buffer_index);
+
+            // バッファ数を更新
+            let current_count = BUFFER_COUNT.load(Ordering::Relaxed) as usize;
+            if buffer_index >= current_count {
+                BUFFER_COUNT.store((buffer_index + 1) as u64, Ordering::Relaxed);
+            }
+        }
+
         // 可視化状態にバッファを登録
         if let Some(ref mut state) = *MINI_VIS_STATE.lock() {
             if buffer_index < 4 {
@@ -163,30 +181,6 @@ static BUFFER_COUNT: AtomicU64 = AtomicU64::new(0);
 // フック関数（Compositor/Writer本体から呼び出される）
 // =============================================================================
 
-/// Compositor初期化時のフック
-///
-/// fb_baseを保存し、可視化モードで使用できるようにする
-pub fn on_compositor_init_hook(fb_base: u64) {
-    FB_BASE.store(fb_base, Ordering::Relaxed);
-}
-
-/// バッファ登録時のフック
-///
-/// タスクIDとバッファインデックスを追跡情報に保存
-pub fn on_buffer_registered_hook(buffer_index: usize, task_id: u64) {
-    if buffer_index < 4 {
-        let mut tracking = BUFFER_TRACKING.lock();
-        tracking[buffer_index].owner_task_id = Some(task_id);
-        tracking[buffer_index].buffer_index = Some(buffer_index);
-
-        // バッファ数を更新
-        let current_count = BUFFER_COUNT.load(Ordering::Relaxed) as usize;
-        if buffer_index >= current_count {
-            BUFFER_COUNT.store((buffer_index + 1) as u64, Ordering::Relaxed);
-        }
-    }
-}
-
 /// フレーム開始時のフック
 ///
 /// 可視化モードの場合、可視化処理を行いtrueを返す
@@ -207,13 +201,6 @@ pub fn on_flush_hook(
     command_types: [Option<&'static str>; 5],
 ) {
     update_buffer_on_flush(buffer_index, command_count, command_types);
-}
-
-/// sync_flush開始時のフック
-///
-/// タスクをブロック状態にする
-pub fn on_sync_flush_start_hook() {
-    crate::sched::block_current_task();
 }
 
 /// バッファインデックスから所有タスクIDを取得
