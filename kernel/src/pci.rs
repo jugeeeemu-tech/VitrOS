@@ -181,7 +181,13 @@ fn is_mmconfig_available(bus: u8) -> bool {
 /// MMCONFIG経由でPCI Configuration Spaceから32ビット値を読み込む
 ///
 /// # Safety
-/// この関数はMMCONFIGが有効な場合のみ呼び出すべきです
+///
+/// 呼び出し元は以下を保証する必要があります:
+/// - `is_mmconfig_available(bus)` が `true` を返すこと
+/// - `device` < 32, `function` < 8
+/// - `offset` < 4096 かつ 4バイト境界にアラインされていること
+/// - 対象のPCI Configuration Spaceがカーネル空間にマッピング済みであること
+///   （`KERNEL_VIRTUAL_BASE`を使用した直接マッピングが有効なこと）
 unsafe fn mmconfig_read_u32(bus: u8, device: u8, function: u8, offset: u16) -> u32 {
     let base = MMCONFIG_BASE.load(Ordering::SeqCst);
 
@@ -200,28 +206,28 @@ unsafe fn mmconfig_read_u32(bus: u8, device: u8, function: u8, offset: u16) -> u
 }
 
 /// 統合されたPCI Configuration Space読み込み（MMCONFIG優先、フォールバック対応）
+///
+/// `PCI_CONFIG`のメソッドを呼び出すラッパー関数。
+#[allow(dead_code)]
+#[inline]
 fn pci_unified_read_u32(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
-    if is_mmconfig_available(bus) {
-        // MMCONFIG利用可能 - こちらを優先
-        unsafe { mmconfig_read_u32(bus, device, function, offset as u16) }
-    } else {
-        // レガシーI/Oポートにフォールバック
-        pci_config_read_u32(bus, device, function, offset)
-    }
+    PCI_CONFIG.read_u32(bus, device, function, offset as u16)
 }
 
 /// 統合されたPCI Configuration Space から16ビット値を読み込む
+///
+/// `PCI_CONFIG`のメソッドを呼び出すラッパー関数。
+#[inline]
 fn pci_unified_read_u16(bus: u8, device: u8, function: u8, offset: u8) -> u16 {
-    let data = pci_unified_read_u32(bus, device, function, offset & 0xFC);
-    let shift = (offset & 0x02) * 8;
-    ((data >> shift) & 0xFFFF) as u16
+    PCI_CONFIG.read_u16(bus, device, function, offset as u16)
 }
 
 /// 統合されたPCI Configuration Space から8ビット値を読み込む
+///
+/// `PCI_CONFIG`のメソッドを呼び出すラッパー関数。
+#[inline]
 fn pci_unified_read_u8(bus: u8, device: u8, function: u8, offset: u8) -> u8 {
-    let data = pci_unified_read_u32(bus, device, function, offset & 0xFC);
-    let shift = (offset & 0x03) * 8;
-    ((data >> shift) & 0xFF) as u8
+    PCI_CONFIG.read_u8(bus, device, function, offset as u16)
 }
 
 /// PCIバスをスキャンしてデバイスを列挙
@@ -286,6 +292,7 @@ fn print_device(dev: &PciDevice) {
 // ============================================================================
 
 /// PCI Configuration Spaceアクセスの抽象化
+#[allow(dead_code)]
 pub trait PciConfigAccess {
     fn read_u32(&self, bus: u8, device: u8, function: u8, offset: u16) -> u32;
     fn write_u32(&self, bus: u8, device: u8, function: u8, offset: u16, value: u32);
@@ -318,19 +325,29 @@ pub trait PciConfigAccess {
 }
 
 /// レガシーI/Oポートアクセス
+#[allow(dead_code)]
 pub struct LegacyPciConfig;
 
 impl PciConfigAccess for LegacyPciConfig {
     fn read_u32(&self, bus: u8, device: u8, function: u8, offset: u16) -> u32 {
+        if offset >= 256 {
+            // Extended Configuration Space（256-4095）はレガシーI/Oポートでは非対応
+            return 0xFFFFFFFF;
+        }
         pci_config_read_u32(bus, device, function, offset as u8)
     }
 
     fn write_u32(&self, bus: u8, device: u8, function: u8, offset: u16, value: u32) {
+        if offset >= 256 {
+            // Extended Configuration Space（256-4095）はレガシーI/Oポートでは非対応
+            return;
+        }
         pci_config_write_u32(bus, device, function, offset as u8, value);
     }
 }
 
 /// MMCONFIG/Legacy統合アクセス
+#[allow(dead_code)]
 pub struct UnifiedPciConfig;
 
 impl PciConfigAccess for UnifiedPciConfig {
@@ -354,6 +371,7 @@ impl PciConfigAccess for UnifiedPciConfig {
 }
 
 /// グローバルPCIアクセスインスタンス（統合方式）
+#[allow(dead_code)]
 pub static PCI_CONFIG: UnifiedPciConfig = UnifiedPciConfig;
 
 // ============================================================================
@@ -361,6 +379,7 @@ pub static PCI_CONFIG: UnifiedPciConfig = UnifiedPciConfig;
 // ============================================================================
 
 /// レガシーI/OポートでPCI Configuration Spaceに32ビット値を書き込む
+#[allow(dead_code)]
 fn pci_config_write_u32(bus: u8, device: u8, function: u8, offset: u8, value: u32) {
     let address: u32 = (1 << 31)
         | ((bus as u32) << 16)
@@ -390,7 +409,15 @@ fn pci_config_write_u32(bus: u8, device: u8, function: u8, offset: u8, value: u3
 /// MMCONFIG経由でPCI Configuration Spaceに32ビット値を書き込む
 ///
 /// # Safety
-/// この関数はMMCONFIGが有効な場合のみ呼び出すべきです
+///
+/// 呼び出し元は以下を保証する必要があります:
+/// - `is_mmconfig_available(bus)` が `true` を返すこと
+/// - `device` < 32, `function` < 8
+/// - `offset` < 4096 かつ 4バイト境界にアラインされていること
+/// - 対象のPCI Configuration Spaceがカーネル空間にマッピング済みであること
+///   （`KERNEL_VIRTUAL_BASE`を使用した直接マッピングが有効なこと）
+/// - 書き込み対象のレジスタが書き込み可能であること
+#[allow(dead_code)]
 unsafe fn mmconfig_write_u32(bus: u8, device: u8, function: u8, offset: u16, value: u32) {
     let base = MMCONFIG_BASE.load(Ordering::SeqCst);
 
