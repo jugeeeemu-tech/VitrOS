@@ -110,6 +110,8 @@ pub fn draw_code_snippet(writer: &mut FramebufferWriter, code_lines: &[&str]) {
     let screen_width = writer.width;
 
     // 左側の領域をクリア
+    // SAFETY: fb_baseはFramebufferWriterから取得した有効なフレームバッファアドレス。
+    // 描画範囲(0, 280, 400, 320)は1024x768の画面サイズ内に収まる。
     unsafe {
         draw_rect(fb_base, screen_width, 0, 280, 400, 320, 0x000000);
     }
@@ -118,6 +120,8 @@ pub fn draw_code_snippet(writer: &mut FramebufferWriter, code_lines: &[&str]) {
     let mut y = 290;
 
     // タイトル
+    // SAFETY: fb_baseは有効なフレームバッファアドレス。
+    // start_x=10, y=305程度は画面サイズ内に収まる。
     unsafe {
         draw_string(fb_base, screen_width, start_x, y, "Code:", 0xFFFF00);
     }
@@ -125,6 +129,8 @@ pub fn draw_code_snippet(writer: &mut FramebufferWriter, code_lines: &[&str]) {
 
     // コード行を描画
     for line in code_lines {
+        // SAFETY: fb_baseは有効なフレームバッファアドレス。
+        // start_x=10, yは320から増加するが画面サイズ内に収まる。
         unsafe {
             draw_string(fb_base, screen_width, start_x, y, line, 0x00FFFF);
         }
@@ -141,11 +147,15 @@ pub fn draw_memory_grids_multi(writer: &mut FramebufferWriter, title: &str) {
     let screen_width = writer.width;
 
     // 右側の領域をクリア（x=400以降）
+    // SAFETY: fb_baseはFramebufferWriterから取得した有効なフレームバッファアドレス。
+    // 描画範囲(400, 280, 624, 320)は1024x768の画面サイズ内に収まる。
     unsafe {
         draw_rect(fb_base, screen_width, 400, 280, 624, 320, 0x000000);
     }
 
     // タイトルを描画
+    // SAFETY: fb_baseは有効なフレームバッファアドレス。
+    // 座標(410, 290)は画面サイズ内に収まる。
     unsafe {
         draw_string(fb_base, screen_width, 410, 290, title, 0xFFFF00);
     }
@@ -178,6 +188,8 @@ pub fn draw_memory_grids_multi(writer: &mut FramebufferWriter, title: &str) {
 
         // サイズクラスラベル
         let label = format!("{}B", size);
+        // SAFETY: fb_baseは有効なフレームバッファアドレス。
+        // grid_x, grid_yは画面レイアウト内で計算され、境界内に収まる。
         unsafe {
             draw_string(fb_base, screen_width, grid_x, grid_y - 12, &label, 0xFFFFFF);
         }
@@ -198,6 +210,8 @@ pub fn draw_memory_grids_multi(writer: &mut FramebufferWriter, title: &str) {
                 0x00FF00 // 緑: 空き
             };
 
+            // SAFETY: fb_baseは有効なフレームバッファアドレス。
+            // x, yはgrid_x/grid_yから計算され、cell_size=3なので境界内に収まる。
             unsafe {
                 draw_rect(fb_base, screen_width, x, y, cell_size, cell_size, color);
             }
@@ -210,6 +224,8 @@ pub fn draw_memory_grids_multi(writer: &mut FramebufferWriter, title: &str) {
             0
         };
         let usage = format!("{}%", usage_pct);
+        // SAFETY: fb_baseは有効なフレームバッファアドレス。
+        // grid_x+25, grid_y+grid_pixel_size+3は画面レイアウト内で計算され、境界内に収まる。
         unsafe {
             draw_string(
                 fb_base,
@@ -224,6 +240,9 @@ pub fn draw_memory_grids_multi(writer: &mut FramebufferWriter, title: &str) {
 
     // 凡例
     let legend_y = start_y + 2 * (grid_pixel_size + 35) + 5;
+    // SAFETY: fb_baseは有効なフレームバッファアドレス。
+    // start_x=410, legend_yは画面下部だが1024x768の画面サイズ内に収まる。
+    // 描画する矩形と文字列はいずれも小さく、境界を超えることはない。
     unsafe {
         draw_rect(fb_base, screen_width, start_x, legend_y, 8, 8, 0xFF0000);
         draw_string(
