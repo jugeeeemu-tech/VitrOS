@@ -10,13 +10,11 @@
 extern crate alloc;
 
 use crate::allocator;
-use crate::allocator_observer::AllocatorObserver;
-use crate::graphics::{FramebufferWriter, draw_rect, draw_string};
+use crate::graphics::{draw_rect, draw_string};
 use crate::info;
 use alloc::format;
 use core::arch::asm;
-use core::fmt::Write;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 // =============================================================================
 // Observer側での状態管理
@@ -36,6 +34,13 @@ static USED_COUNTS: [AtomicUsize; 10] = [
     AtomicUsize::new(0),
     AtomicUsize::new(0),
 ];
+
+/// フレームバッファベースアドレス
+static FB_BASE: AtomicU64 = AtomicU64::new(0);
+/// 画面幅
+static SCREEN_WIDTH: AtomicU64 = AtomicU64::new(0);
+/// 画面高さ
+static SCREEN_HEIGHT: AtomicU64 = AtomicU64::new(0);
 
 // =============================================================================
 // AllocatorObserver フック関数
@@ -62,7 +67,10 @@ pub fn on_allocate_hook(class_idx: usize, _ptr: *mut u8) {
 #[inline(always)]
 pub fn on_deallocate_hook(class_idx: usize, _ptr: *mut u8) {
     if class_idx < USED_COUNTS.len() {
-        USED_COUNTS[class_idx].fetch_sub(1, Ordering::Relaxed);
+        let _ =
+            USED_COUNTS[class_idx].fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_sub(1)
+            });
     }
 }
 
@@ -77,30 +85,33 @@ fn count_free_blocks(class_idx: usize, total_blocks: usize) -> usize {
 }
 
 // =============================================================================
-// AllocatorVisualizationObserver - AllocatorObserver実装
+// Framebuffer Observer フック関数
+// main.rsから呼び出される
 // =============================================================================
 
-/// アロケータ可視化オブザーバー
+/// フレームバッファ初期化フック
 ///
-/// AllocatorObserverトレイトを実装し、アロケータの統計情報を提供します。
-#[derive(Debug, Clone, Copy, Default)]
-pub struct AllocatorVisualizationObserver;
-
-impl AllocatorVisualizationObserver {
-    /// 新しいAllocatorVisualizationObserverを作成
-    pub fn new() -> Self {
-        Self
-    }
+/// # Arguments
+/// * `fb_base` - フレームバッファベースアドレス
+/// * `width` - 画面幅
+/// * `height` - 画面高さ
+pub fn on_framebuffer_init_hook(fb_base: u64, width: u32, height: u32) {
+    FB_BASE.store(fb_base, Ordering::Relaxed);
+    SCREEN_WIDTH.store(width as u64, Ordering::Relaxed);
+    SCREEN_HEIGHT.store(height as u64, Ordering::Relaxed);
 }
 
-impl AllocatorObserver for AllocatorVisualizationObserver {
-    fn on_allocate(&self, class_idx: usize, ptr: *mut u8) {
-        on_allocate_hook(class_idx, ptr);
-    }
+/// フレームバッファベースアドレスを取得
+fn fb_base() -> u64 {
+    FB_BASE.load(Ordering::Relaxed)
+}
 
-    fn on_deallocate(&self, class_idx: usize, ptr: *mut u8) {
-        on_deallocate_hook(class_idx, ptr);
-    }
+/// 画面サイズを取得
+fn screen_size() -> (u32, u32) {
+    (
+        SCREEN_WIDTH.load(Ordering::Relaxed) as u32,
+        SCREEN_HEIGHT.load(Ordering::Relaxed) as u32,
+    )
 }
 
 // =============================================================================
@@ -117,9 +128,9 @@ fn align_down(addr: usize, align: usize) -> usize {
 // =============================================================================
 
 // 画面左側にコードスニペットを表示
-pub fn draw_code_snippet(writer: &mut FramebufferWriter, code_lines: &[&str]) {
-    let fb_base = writer.fb_base;
-    let screen_width = writer.width;
+pub fn draw_code_snippet(code_lines: &[&str]) {
+    let fb_base = fb_base();
+    let (screen_width, _) = screen_size();
 
     // 左側の領域をクリア
     // SAFETY: fb_baseはFramebufferWriterから取得した有効なフレームバッファアドレス。
@@ -151,11 +162,11 @@ pub fn draw_code_snippet(writer: &mut FramebufferWriter, code_lines: &[&str]) {
 }
 
 // 複数のサイズクラスをコンパクトに並べて表示
-pub fn draw_memory_grids_multi(writer: &mut FramebufferWriter, title: &str) {
+pub fn draw_memory_grids_multi(title: &str) {
     let size_classes = allocator::SIZE_CLASSES;
 
-    let fb_base = writer.fb_base;
-    let screen_width = writer.width;
+    let fb_base = fb_base();
+    let (screen_width, _) = screen_size();
 
     // 右側の領域をクリア（x=400以降）
     // SAFETY: fb_baseはFramebufferWriterから取得した有効なフレームバッファアドレス。
@@ -289,13 +300,13 @@ pub fn draw_memory_grids_multi(writer: &mut FramebufferWriter, title: &str) {
 // =============================================================================
 
 /// メモリアロケータの可視化テストを実行
-pub fn run_visualization_tests(writer: &mut FramebufferWriter) {
+pub fn run_visualization_tests() {
     // スラブアロケータの可視化（複数サイズクラス表示）
-    let _ = writeln!(writer, "=== Memory Allocator Visualization ===");
+    info!("=== Memory Allocator Visualization ===");
 
     // 初期状態を表示
-    draw_code_snippet(writer, &["// Initial state", "// No allocations yet"]);
-    draw_memory_grids_multi(writer, "Initial State");
+    draw_code_snippet(&["// Initial state", "// No allocations yet"]);
+    draw_memory_grids_multi("Initial State");
     crate::hpet::delay_ms(5000);
 
     // テスト1: 16Bクラス
@@ -303,17 +314,14 @@ pub fn run_visualization_tests(writer: &mut FramebufferWriter) {
 
     let vec1: alloc::vec::Vec<u8> = (0..12).collect();
 
-    draw_code_snippet(
-        writer,
-        &[
-            "let vec1: Vec<u8>",
-            "  = (0..12).collect();",
-            "",
-            "// 12 x u8 = 12B",
-            "// -> 16B size class",
-        ],
-    );
-    draw_memory_grids_multi(writer, "After 16B alloc");
+    draw_code_snippet(&[
+        "let vec1: Vec<u8>",
+        "  = (0..12).collect();",
+        "",
+        "// 12 x u8 = 12B",
+        "// -> 16B size class",
+    ]);
+    draw_memory_grids_multi("After 16B alloc");
     info!("Allocated Vec<u8> (12 elements = 12B -> 16B)");
     crate::hpet::delay_ms(5000);
 
@@ -322,17 +330,14 @@ pub fn run_visualization_tests(writer: &mut FramebufferWriter) {
 
     let vec2: alloc::vec::Vec<u8> = (0..50).collect();
 
-    draw_code_snippet(
-        writer,
-        &[
-            "let vec2: Vec<u8>",
-            "  = (0..50).collect();",
-            "",
-            "// 50 x u8 = 50B",
-            "// -> 64B size class",
-        ],
-    );
-    draw_memory_grids_multi(writer, "After 16B + 64B");
+    draw_code_snippet(&[
+        "let vec2: Vec<u8>",
+        "  = (0..50).collect();",
+        "",
+        "// 50 x u8 = 50B",
+        "// -> 64B size class",
+    ]);
+    draw_memory_grids_multi("After 16B + 64B");
     info!("Allocated Vec<u8> (50 elements = 50B -> 64B)");
     crate::hpet::delay_ms(5000);
 
@@ -341,17 +346,14 @@ pub fn run_visualization_tests(writer: &mut FramebufferWriter) {
 
     let vec3: alloc::vec::Vec<u64> = (0..10).collect();
 
-    draw_code_snippet(
-        writer,
-        &[
-            "let vec3: Vec<u64>",
-            "  = (0..10).collect();",
-            "",
-            "// 10 x u64 = 80B",
-            "// -> 128B size class",
-        ],
-    );
-    draw_memory_grids_multi(writer, "16B+64B+128B");
+    draw_code_snippet(&[
+        "let vec3: Vec<u64>",
+        "  = (0..10).collect();",
+        "",
+        "// 10 x u64 = 80B",
+        "// -> 128B size class",
+    ]);
+    draw_memory_grids_multi("16B+64B+128B");
     info!("Allocated Vec<u64> (10 elements = 80B -> 128B)");
     crate::hpet::delay_ms(5000);
 
@@ -360,17 +362,14 @@ pub fn run_visualization_tests(writer: &mut FramebufferWriter) {
 
     let vec4: alloc::vec::Vec<u8> = (0..25).collect();
 
-    draw_code_snippet(
-        writer,
-        &[
-            "let vec4: Vec<u64>",
-            "  = (0..25).collect();",
-            "",
-            "// 25 x u64 = 200B",
-            "// -> 256B size class",
-        ],
-    );
-    draw_memory_grids_multi(writer, "8B+16B+64B+128B");
+    draw_code_snippet(&[
+        "let vec4: Vec<u64>",
+        "  = (0..25).collect();",
+        "",
+        "// 25 x u64 = 200B",
+        "// -> 256B size class",
+    ]);
+    draw_memory_grids_multi("8B+16B+64B+128B");
     info!("Allocated Vec<u8> (25 elements = 200B -> 256B)");
     crate::hpet::delay_ms(5000);
 
@@ -379,17 +378,14 @@ pub fn run_visualization_tests(writer: &mut FramebufferWriter) {
 
     let vec5: alloc::vec::Vec<u8> = (0..8).collect();
 
-    draw_code_snippet(
-        writer,
-        &[
-            "let vec5: Vec<u8>",
-            "  = (0..8).collect();",
-            "",
-            "// 8 x u8 = 8B",
-            "// -> 8B size class",
-        ],
-    );
-    draw_memory_grids_multi(writer, "All 5 sizes");
+    draw_code_snippet(&[
+        "let vec5: Vec<u8>",
+        "  = (0..8).collect();",
+        "",
+        "// 8 x u8 = 8B",
+        "// -> 8B size class",
+    ]);
+    draw_memory_grids_multi("All 5 sizes");
     info!("Allocated Vec<u64> (8 elements = 8B -> 8B)");
     crate::hpet::delay_ms(5000);
 
@@ -399,17 +395,14 @@ pub fn run_visualization_tests(writer: &mut FramebufferWriter) {
     drop(vec2);
     drop(vec4);
 
-    draw_code_snippet(
-        writer,
-        &[
-            "drop(vec2);",
-            "drop(vec4);",
-            "",
-            "// Freed 64B and 256B",
-            "// 8B + 16B + 128B remain",
-        ],
-    );
-    draw_memory_grids_multi(writer, "After freeing 2");
+    draw_code_snippet(&[
+        "drop(vec2);",
+        "drop(vec4);",
+        "",
+        "// Freed 64B and 256B",
+        "// 8B + 16B + 128B remain",
+    ]);
+    draw_memory_grids_multi("After freeing 2");
     info!("Freed 64B and 256B blocks");
     crate::hpet::delay_ms(5000);
 
@@ -420,17 +413,14 @@ pub fn run_visualization_tests(writer: &mut FramebufferWriter) {
     drop(vec3);
     drop(vec5);
 
-    draw_code_snippet(
-        writer,
-        &[
-            "drop(vec1);",
-            "drop(vec3);",
-            "drop(vec5);",
-            "",
-            "// All freed!",
-        ],
-    );
-    draw_memory_grids_multi(writer, "All freed");
+    draw_code_snippet(&[
+        "drop(vec1);",
+        "drop(vec3);",
+        "drop(vec5);",
+        "",
+        "// All freed!",
+    ]);
+    draw_memory_grids_multi("All freed");
     info!("All blocks freed");
     crate::hpet::delay_ms(5000);
     loop {
