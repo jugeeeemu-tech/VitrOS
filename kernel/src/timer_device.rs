@@ -38,13 +38,13 @@ pub trait TimerDevice {
     #[allow(dead_code)]
     #[inline]
     fn delay_us(&self, us: u64) {
-        self.delay_ns(us * 1_000);
+        self.delay_ns(us.saturating_mul(1_000));
     }
 
     /// 指定されたミリ秒だけ待機する
     #[inline]
     fn delay_ms(&self, ms: u64) {
-        self.delay_ns(ms * 1_000_000);
+        self.delay_ns(ms.saturating_mul(1_000_000));
     }
 }
 
