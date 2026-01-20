@@ -3,8 +3,7 @@
 //! Compositorの各フェーズを監視するオブザーバーパターンを実装。
 //! ジェネリクス + ZST（ゼロサイズ型）によるゼロコスト抽象化を実現。
 
-use super::buffer::{DrawCommand, SharedBuffer};
-use super::region::Region;
+use super::buffer::SharedBuffer;
 
 /// Compositorの各フェーズを監視するオブザーバートレイト
 ///
@@ -18,9 +17,8 @@ use super::region::Region;
 /// struct MyObserver;
 ///
 /// impl CompositorObserver for MyObserver {
-///     fn on_frame_start(&mut self, buffers: &[SharedBuffer], width: u32, height: u32) -> bool {
-///         // カスタム処理
-///         false
+///     fn on_frame_start(&mut self, buffers: &[SharedBuffer], width: u32, height: u32) {
+///         // カスタム処理（状態更新のみ、制御フローは変更しない）
 ///     }
 /// }
 /// ```
@@ -53,22 +51,8 @@ pub trait CompositorObserver: Send + Sync {
     /// * `buffers` - 全バッファのスライス
     /// * `width` - 画面幅
     /// * `height` - 画面高さ
-    ///
-    /// # Returns
-    /// `true`を返すと通常のレンダリング処理をスキップする（可視化モード用）
     #[inline(always)]
-    fn on_frame_start(&mut self, _buffers: &[SharedBuffer], _width: u32, _height: u32) -> bool {
-        false
-    }
-
-    /// コマンド処理時に呼ばれる
-    ///
-    /// # Arguments
-    /// * `buffer_idx` - 処理中のバッファインデックス
-    /// * `region` - 描画領域
-    /// * `cmd` - 描画コマンド
-    #[inline(always)]
-    fn on_command_processed(&mut self, _buffer_idx: usize, _region: &Region, _cmd: &DrawCommand) {}
+    fn on_frame_start(&mut self, _buffers: &[SharedBuffer], _width: u32, _height: u32) {}
 
     /// Blit完了時に呼ばれる
     #[inline(always)]

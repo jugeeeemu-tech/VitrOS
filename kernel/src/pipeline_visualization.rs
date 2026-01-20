@@ -67,24 +67,9 @@ impl CompositorObserver for PipelineVisualizationObserver {
         let _ = buffer; // 未使用警告を抑制
     }
 
-    fn on_frame_start(&mut self, buffers: &[SharedBuffer], width: u32, height: u32) -> bool {
-        // 可視化モードでなければ通常処理
-        if !is_visualization_mode() {
-            return false;
-        }
-
-        // バッファのスナップショットをArcでラップして既存関数に渡す
-        let buffers_arc =
-            alloc::sync::Arc::new(buffers.iter().cloned().collect::<alloc::vec::Vec<_>>());
-
-        // 既存の可視化処理を呼び出す
-        process_frame_visualization_internal(&buffers_arc, width, height)
-    }
-
-    fn on_command_processed(&mut self, buffer_idx: usize, region: &Region, cmd: &DrawCommand) {
-        // コマンド処理の可視化（既存関数を呼び出す）
-        let (width, height) = crate::graphics::compositor::screen_size();
-        let _ = process_command_visualization(buffer_idx, 0, region, cmd, width, height);
+    fn on_frame_start(&mut self, _buffers: &[SharedBuffer], _width: u32, _height: u32) {
+        // オブザーバーは状態更新のみを行う（制御フローは変更しない）
+        // 可視化モードの判定と処理はCompositor側で#[cfg]分岐により行われる
     }
 
     fn on_blit_complete(&mut self) {
@@ -180,17 +165,6 @@ static BUFFER_COUNT: AtomicU64 = AtomicU64::new(0);
 // =============================================================================
 // フック関数（Compositor/Writer本体から呼び出される）
 // =============================================================================
-
-/// フレーム開始時のフック
-///
-/// 可視化モードの場合、可視化処理を行いtrueを返す
-pub fn on_frame_start_hook(
-    buffers: &alloc::sync::Arc<alloc::vec::Vec<crate::graphics::buffer::SharedBuffer>>,
-    width: u32,
-    height: u32,
-) -> bool {
-    process_frame_if_visualization(buffers, width, height)
-}
 
 /// flush時のフック
 ///

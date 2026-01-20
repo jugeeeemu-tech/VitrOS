@@ -396,8 +396,14 @@ pub extern "C" fn compositor_task() -> ! {
         // Phase 2+3: 各バッファから直接レンダリング（アロケーションフリー）
         // ロックを取得したままレンダリングし、終わったらクリア
 
-        // 可視化フック: フレーム開始を通知（可視化モードなら処理をスキップ）
-        if notify_frame_start(&buffers_snapshot, config.fb_width, config.fb_height) {
+        // 可視化モード: 可視化処理を実行して通常レンダリングをスキップ
+        #[cfg(feature = "visualize-pipeline")]
+        if crate::pipeline_visualization::is_visualization_mode() {
+            crate::pipeline_visualization::process_frame_if_visualization(
+                &buffers_snapshot,
+                config.fb_width,
+                config.fb_height,
+            );
             FRAME_COUNT.fetch_add(1, Ordering::Relaxed);
             crate::sched::sleep_ms(16);
             continue;
@@ -426,21 +432,3 @@ pub extern "C" fn compositor_task() -> ! {
     }
 }
 
-// =============================================================================
-// 可視化フック関数（featureフラグで有効版/no-op版を切り替え）
-// =============================================================================
-
-/// フレーム開始時の通知
-///
-/// 可視化モードの場合trueを返し、呼び出し元は通常の描画処理をスキップする
-#[cfg(feature = "visualize-pipeline")]
-#[inline(always)]
-fn notify_frame_start(buffers: &Arc<Vec<SharedBuffer>>, width: u32, height: u32) -> bool {
-    crate::pipeline_visualization::on_frame_start_hook(buffers, width, height)
-}
-
-#[cfg(not(feature = "visualize-pipeline"))]
-#[inline(always)]
-fn notify_frame_start(_buffers: &Arc<Vec<SharedBuffer>>, _width: u32, _height: u32) -> bool {
-    false
-}
