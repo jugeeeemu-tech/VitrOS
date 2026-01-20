@@ -292,21 +292,54 @@ fn print_device(dev: &PciDevice) {
 // ============================================================================
 
 /// PCI Configuration Spaceアクセスの抽象化
+///
+/// このトレイトは、PCI Configuration Spaceへの読み書きを抽象化します。
+/// レガシーI/Oポート(0xCF8/0xCFC)やMMCONFIG(PCIe)など、
+/// 異なるアクセス方式を統一的に扱うことができます。
+///
+/// # パラメータの有効範囲
+///
+/// - `bus`: 0-255
+/// - `device`: 0-31
+/// - `function`: 0-7
+/// - `offset`: 0-255 (Legacy) または 0-4095 (MMCONFIG/Extended)
+///
+/// # スレッド安全性
+///
+/// **注意**: このトレイトの実装はスレッドセーフではありません。
+/// 同じPCIデバイスへの並行アクセスはデータ競合を引き起こす可能性があります。
+/// 呼び出し元は適切な排他制御（SpinLockなど）を行う必要があります。
+///
+/// # エラー動作
+///
+/// 存在しないデバイスまたは無効なオフセットへの読み込みは`0xFFFFFFFF`を返します。
 #[allow(dead_code)]
 pub trait PciConfigAccess {
+    /// 32ビット値を読み込む
+    ///
+    /// `offset`は4バイト境界にアラインされている必要があります。
     fn read_u32(&self, bus: u8, device: u8, function: u8, offset: u16) -> u32;
+
+    /// 32ビット値を書き込む
+    ///
+    /// `offset`は4バイト境界にアラインされている必要があります。
     fn write_u32(&self, bus: u8, device: u8, function: u8, offset: u16, value: u32);
 
+    /// 16ビット値を読み込む
     fn read_u16(&self, bus: u8, device: u8, function: u8, offset: u16) -> u16 {
         let data = self.read_u32(bus, device, function, offset & 0xFFFC);
         ((data >> ((offset & 0x02) * 8)) & 0xFFFF) as u16
     }
 
+    /// 8ビット値を読み込む
     fn read_u8(&self, bus: u8, device: u8, function: u8, offset: u16) -> u8 {
         let data = self.read_u32(bus, device, function, offset & 0xFFFC);
         ((data >> ((offset & 0x03) * 8)) & 0xFF) as u8
     }
 
+    /// 16ビット値を書き込む
+    ///
+    /// **注意**: Read-Modify-Write操作のためアトミックではありません。
     fn write_u16(&self, bus: u8, device: u8, function: u8, offset: u16, value: u16) {
         let aligned = offset & 0xFFFC;
         let shift = (offset & 0x02) * 8;
@@ -315,6 +348,9 @@ pub trait PciConfigAccess {
         self.write_u32(bus, device, function, aligned, new_val);
     }
 
+    /// 8ビット値を書き込む
+    ///
+    /// **注意**: Read-Modify-Write操作のためアトミックではありません。
     fn write_u8(&self, bus: u8, device: u8, function: u8, offset: u16, value: u8) {
         let aligned = offset & 0xFFFC;
         let shift = (offset & 0x03) * 8;

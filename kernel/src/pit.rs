@@ -9,6 +9,10 @@ use crate::io::{port_read_u8, port_write_u8};
 const PIT_FREQUENCY: u32 = 1193182;
 
 /// ポーリングループの最大イテレーション数（タイムアウト用）
+///
+/// PITカウンタは約1.19MHzで動作し、1回のループで数サイクルを消費する。
+/// 100,000回のイテレーションは、通常の動作では十分な待機時間を提供し、
+/// ハードウェア障害時の無限ループを防止する。
 const MAX_POLL_ITERATIONS: u32 = 100_000;
 
 /// PITのI/Oポート
@@ -35,6 +39,10 @@ pub fn sleep_ms(ms: u32) {
 
 /// 1ミリ秒待機（内部関数）
 fn sleep_1ms() {
+    // SAFETY:
+    // - PITのI/Oポート(0x40-0x43)はx86標準のハードウェアポート
+    // - カーネルモードでは特権I/O命令が許可されている
+    // - port_write_u8/port_read_u8はio.rsで定義された安全なI/Oラッパー
     unsafe {
         // 1ms = 1193 カウント（PIT_FREQUENCY / 1000）
         let count: u16 = (PIT_FREQUENCY / 1000) as u16;
@@ -90,6 +98,10 @@ unsafe fn read_current_count() -> u16 {
 /// * `count` - カウント数
 #[allow(dead_code)]
 pub fn oneshot(count: u16) {
+    // SAFETY:
+    // - PITのI/Oポート(0x40-0x43)はx86標準のハードウェアポート
+    // - カーネルモードでは特権I/O命令が許可されている
+    // - port_write_u8はio.rsで定義された安全なI/Oラッパー
     unsafe {
         // Channel 0, Interrupt on terminal count (mode 0), binary counter
         // Command: 0x30 = 0011 0000
@@ -110,6 +122,10 @@ pub fn udelay(us: u32) {
     // 1マイクロ秒 = PIT_FREQUENCY / 1_000_000 カウント
     let count = ((PIT_FREQUENCY as u64 * us as u64) / 1_000_000) as u16;
 
+    // SAFETY:
+    // - PITのI/Oポート(0x40-0x43)はx86標準のハードウェアポート
+    // - カーネルモードでは特権I/O命令が許可されている
+    // - port_write_u8/port_read_u8はio.rsで定義された安全なI/Oラッパー
     unsafe {
         // One-shot mode
         port_write_u8(ports::COMMAND, 0x30);
@@ -162,7 +178,8 @@ impl TimerDevice for Pit {
     }
 
     fn delay_ms(&self, ms: u64) {
-        sleep_ms(ms as u32);
+        let ms_clamped = ms.min(u32::MAX as u64) as u32;
+        sleep_ms(ms_clamped);
     }
 }
 
