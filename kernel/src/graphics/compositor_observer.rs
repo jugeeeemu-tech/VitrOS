@@ -24,7 +24,7 @@ use super::region::Region;
 ///     }
 /// }
 /// ```
-pub trait CompositorObserver {
+pub trait CompositorObserver: Send + Sync {
     /// バッファ登録時に呼ばれる
     ///
     /// # Arguments
