@@ -5,10 +5,75 @@
 
 extern crate alloc;
 
-use crate::graphics::buffer::DrawCommand;
+use crate::graphics::buffer::{DrawCommand, SharedBuffer};
+use crate::graphics::compositor_observer::CompositorObserver;
 use crate::graphics::region::Region;
 use crate::graphics::{draw_char, draw_rect, draw_rect_outline, draw_string};
 use alloc::vec::Vec;
+
+// =============================================================================
+// PipelineVisualizationObserver - CompositorObserver実装
+// =============================================================================
+
+/// パイプライン可視化オブザーバー
+///
+/// CompositorObserverトレイトを実装し、パイプラインの各フェーズで
+/// 可視化状態を更新します。ZST（ゼロサイズ型）ではありませんが、
+/// 状態はグローバル変数(`MINI_VIS_STATE`)で管理されるため、
+/// オブザーバー自体は軽量です。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PipelineVisualizationObserver;
+
+impl PipelineVisualizationObserver {
+    /// 新しいPipelineVisualizationObserverを作成
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl CompositorObserver for PipelineVisualizationObserver {
+    fn on_buffer_registered(&mut self, buffer_index: usize, buffer: &SharedBuffer) {
+        // 可視化状態にバッファを登録
+        if let Some(ref mut state) = *MINI_VIS_STATE.lock() {
+            if buffer_index < 4 {
+                let name = match buffer_index {
+                    0 => "Buffer0",
+                    1 => "Buffer1",
+                    2 => "Buffer2",
+                    _ => "Buffer3",
+                };
+                state.buffer_queues[buffer_index].name = name;
+                state.buffer_count = state.buffer_count.max(buffer_index + 1);
+            }
+        }
+        let _ = buffer; // 未使用警告を抑制
+    }
+
+    fn on_frame_start(&mut self, buffers: &[SharedBuffer], width: u32, height: u32) -> bool {
+        // 可視化モードでなければ通常処理
+        if !is_visualization_mode() {
+            return false;
+        }
+
+        // バッファのスナップショットをArcでラップして既存関数に渡す
+        let buffers_arc =
+            alloc::sync::Arc::new(buffers.iter().cloned().collect::<alloc::vec::Vec<_>>());
+
+        // 既存の可視化処理を呼び出す
+        process_frame_visualization_internal(&buffers_arc, width, height)
+    }
+
+    fn on_command_processed(&mut self, buffer_idx: usize, region: &Region, cmd: &DrawCommand) {
+        // コマンド処理の可視化（既存関数を呼び出す）
+        let (width, height) = crate::graphics::compositor::screen_size();
+        let _ = process_command_visualization(buffer_idx, 0, region, cmd, width, height);
+    }
+
+    fn on_blit_complete(&mut self) {
+        // Blit完了時の処理
+        set_phase_idle();
+    }
+}
 
 // =============================================================================
 // 色定義
@@ -561,24 +626,22 @@ pub fn set_phase_idle() {
     }
 }
 
-/// 可視化モードでのフレーム処理
+/// 可視化モードでのフレーム処理（内部実装）
 ///
-/// Compositorから呼び出され、可視化モード時の全フレーム処理を担当。
-/// 通常のシャドウバッファへの描画の代わりに、ミニバッファへの描画と
-/// アニメーション制御を行う。
+/// オブザーバーおよび従来の関数から呼び出される共通実装。
+///
+/// # Arguments
+/// * `buffers_snapshot` - バッファのスナップショット
+/// * `screen_width` - 画面幅
+/// * `screen_height` - 画面高さ
 ///
 /// # Returns
-/// 可視化モードで処理した場合は`true`、可視化モードでない場合は`false`
-pub fn process_frame_if_visualization(
+/// 常に`true`（可視化処理を行った）
+fn process_frame_visualization_internal(
     buffers_snapshot: &alloc::sync::Arc<alloc::vec::Vec<crate::graphics::buffer::SharedBuffer>>,
     screen_width: u32,
     screen_height: u32,
 ) -> bool {
-    // 可視化モードでなければ早期リターン
-    if !is_visualization_mode() {
-        return false;
-    }
-
     // バッファ数を更新
     update_buffer_count(buffers_snapshot.len());
 
@@ -642,6 +705,27 @@ pub fn process_frame_if_visualization(
     set_phase_idle();
 
     true
+}
+
+/// 可視化モードでのフレーム処理
+///
+/// Compositorから呼び出され、可視化モード時の全フレーム処理を担当。
+/// 通常のシャドウバッファへの描画の代わりに、ミニバッファへの描画と
+/// アニメーション制御を行う。
+///
+/// # Returns
+/// 可視化モードで処理した場合は`true`、可視化モードでない場合は`false`
+pub fn process_frame_if_visualization(
+    buffers_snapshot: &alloc::sync::Arc<alloc::vec::Vec<crate::graphics::buffer::SharedBuffer>>,
+    screen_width: u32,
+    screen_height: u32,
+) -> bool {
+    // 可視化モードでなければ早期リターン
+    if !is_visualization_mode() {
+        return false;
+    }
+
+    process_frame_visualization_internal(buffers_snapshot, screen_width, screen_height)
 }
 
 /// タスクのflush()から呼ばれる: バッファ内のコマンド情報を更新

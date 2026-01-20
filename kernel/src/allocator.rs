@@ -197,9 +197,9 @@ impl SlabAllocator {
 // 可視化機能専用のメソッド
 // cargo build --features visualize でビルドした場合のみ有効
 // =============================================================================
-// TODO: オブザーバーパターン導入で可視化ロジックを分離する
-// アロケータ本体から可視化専用コードを削除し、AllocatorObserverトレイトで実装
-// Issue: https://github.com/jugeeeemu-tech/VitrOS/issues/16
+// NOTE: AllocatorObserverパターンを導入済み（Issue #16）
+// SlabAllocatorはconst fn new()が必要なためジェネリクス化できないが、
+// フック関数 + 条件付きコンパイルでオブザーバーパターンを実現
 #[cfg(feature = "visualize-allocator")]
 impl SlabAllocator {
     // デバッグ: サイズクラスごとの空きブロック数をカウント（O(1)）
@@ -303,3 +303,40 @@ pub(crate) fn get_allocator_internal() -> &'static SlabAllocator {
 pub(crate) fn get_size_classes_internal() -> &'static [usize] {
     SIZE_CLASSES
 }
+
+// =============================================================================
+// アロケータオブザーバーフック関数
+// 可視化機能が有効な場合のみ通知を行う
+// =============================================================================
+
+/// アロケート通知フック
+///
+/// # Arguments
+/// * `class_idx` - サイズクラスのインデックス
+/// * `ptr` - 割り当てられたポインタ
+#[cfg(feature = "visualize-allocator")]
+#[inline(always)]
+pub(crate) fn notify_allocate(class_idx: usize, ptr: *mut u8) {
+    crate::allocator_visualization::on_allocate_hook(class_idx, ptr);
+}
+
+/// アロケート通知フック（no-op版）
+#[cfg(not(feature = "visualize-allocator"))]
+#[inline(always)]
+pub(crate) fn notify_allocate(_class_idx: usize, _ptr: *mut u8) {}
+
+/// デアロケート通知フック
+///
+/// # Arguments
+/// * `class_idx` - サイズクラスのインデックス
+/// * `ptr` - 解放されるポインタ
+#[cfg(feature = "visualize-allocator")]
+#[inline(always)]
+pub(crate) fn notify_deallocate(class_idx: usize, ptr: *mut u8) {
+    crate::allocator_visualization::on_deallocate_hook(class_idx, ptr);
+}
+
+/// デアロケート通知フック（no-op版）
+#[cfg(not(feature = "visualize-allocator"))]
+#[inline(always)]
+pub(crate) fn notify_deallocate(_class_idx: usize, _ptr: *mut u8) {}

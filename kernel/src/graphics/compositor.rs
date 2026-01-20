@@ -16,6 +16,7 @@ static SCREEN_WIDTH: AtomicU32 = AtomicU32::new(0);
 static SCREEN_HEIGHT: AtomicU32 = AtomicU32::new(0);
 
 use super::buffer::{DrawCommand, SharedBuffer};
+use super::compositor_observer::{CompositorObserver, NoOpObserver};
 use super::region::Region;
 use super::shadow_buffer::ShadowBuffer;
 
@@ -38,22 +39,30 @@ pub struct CompositorConfig {
 /// 全てのWriterバッファを管理します。
 /// シャドウバッファはcompositor_task()内でローカルに所有し、
 /// トリプルバッファリングを実現します。
-pub struct Compositor {
+///
+/// # 型パラメータ
+/// * `O` - CompositorObserverトレイトを実装するオブザーバー型
+///   デフォルトはNoOpObserver（ZST）で、ゼロコスト抽象化を実現
+pub struct Compositor<O: CompositorObserver = NoOpObserver> {
     /// 設定
     config: CompositorConfig,
     /// 登録されたバッファのリスト（Copy-on-Write方式でスナップショット取得可能）
     buffers: Arc<Vec<SharedBuffer>>,
+    /// オブザーバー
+    observer: O,
 }
 
-impl Compositor {
+impl<O: CompositorObserver> Compositor<O> {
     /// 新しいCompositorを作成
     ///
     /// # Arguments
     /// * `config` - Compositorの設定
-    pub fn new(config: CompositorConfig) -> Self {
+    /// * `observer` - コンポジタのイベントを監視するオブザーバー
+    pub fn new(config: CompositorConfig, observer: O) -> Self {
         Self {
             config,
             buffers: Arc::new(Vec::new()),
+            observer,
         }
     }
 
@@ -74,10 +83,12 @@ impl Compositor {
 
         // Copy-on-Write: 新しいVecを作成して追加
         let mut new_buffers = Vec::clone(&self.buffers);
-        #[cfg(feature = "visualize-pipeline")]
         let buffer_index = new_buffers.len();
         new_buffers.push(Arc::clone(&buffer));
         self.buffers = Arc::new(new_buffers);
+
+        // オブザーバーに通知
+        self.observer.on_buffer_registered(buffer_index, &buffer);
 
         // 可視化モード: バッファインデックスを設定
         #[cfg(feature = "visualize-pipeline")]
@@ -100,6 +111,11 @@ impl Compositor {
     /// フレームバッファ設定を取得
     pub fn get_config(&self) -> &CompositorConfig {
         &self.config
+    }
+
+    /// オブザーバーへの可変参照を取得
+    pub fn observer_mut(&mut self) -> &mut O {
+        &mut self.observer
     }
 }
 
@@ -193,11 +209,18 @@ fn render_commands_to(shadow_buffer: &mut ShadowBuffer, region: &Region, command
     }
 }
 
+// グローバルCompositor型エイリアス（featureフラグで切り替え）
+#[cfg(feature = "visualize-pipeline")]
+type GlobalCompositor = Compositor<crate::pipeline_visualization::PipelineVisualizationObserver>;
+
+#[cfg(not(feature = "visualize-pipeline"))]
+type GlobalCompositor = Compositor<NoOpObserver>;
+
 // グローバルCompositorインスタンス
 lazy_static! {
     /// グローバルCompositorインスタンス
     /// 初期化前はNone
-    static ref COMPOSITOR: SpinMutex<Option<Compositor>> = SpinMutex::new(None);
+    static ref COMPOSITOR: SpinMutex<Option<GlobalCompositor>> = SpinMutex::new(None);
 }
 
 /// Compositorを初期化
@@ -209,8 +232,14 @@ pub fn init_compositor(config: CompositorConfig) {
     SCREEN_WIDTH.store(config.fb_width, Ordering::Relaxed);
     SCREEN_HEIGHT.store(config.fb_height, Ordering::Relaxed);
 
+    #[cfg(feature = "visualize-pipeline")]
+    let observer = crate::pipeline_visualization::PipelineVisualizationObserver::new();
+
+    #[cfg(not(feature = "visualize-pipeline"))]
+    let observer = NoOpObserver;
+
     let mut comp = COMPOSITOR.lock();
-    *comp = Some(Compositor::new(config));
+    *comp = Some(Compositor::new(config, observer));
 }
 
 /// フレームカウントを取得
@@ -379,9 +408,9 @@ pub extern "C" fn compositor_task() -> ! {
         // Phase 2+3: 各バッファから直接レンダリング（アロケーションフリー）
         // ロックを取得したままレンダリングし、終わったらクリア
 
-        // TODO: オブザーバーパターン導入で可視化ロジックを分離する
+        // NOTE: オブザーバーパターン導入済み（Issue #16）
+        // PipelineVisualizationObserverで可視化ロジックを実装
         // ジェネリクス + ZSTでゼロコスト抽象化を実現
-        // Issue: https://github.com/jugeeeemu-tech/VitrOS/issues/16
         #[cfg(feature = "visualize-pipeline")]
         if crate::pipeline_visualization::process_frame_if_visualization(
             &buffers_snapshot,

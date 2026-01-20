@@ -2,6 +2,7 @@ mod font;
 
 pub mod buffer;
 pub mod compositor;
+pub mod compositor_observer;
 pub mod draw_target;
 pub mod region;
 pub mod shadow_buffer;

@@ -2,15 +2,82 @@
 // メモリアロケータ可視化機能
 // cargo build --release --features visualize-allocator でビルドした場合のみ有効
 // =============================================================================
+//
+// AllocatorObserverパターンを実装し、アロケータからの通知を受け取ります。
+// SlabAllocatorはconst fn new()が必要なためジェネリクス化できませんが、
+// フック関数 + 条件付きコンパイルでオブザーバーパターンを実現しています。
 
 extern crate alloc;
 
 use crate::allocator::{self, SlabAllocator};
+use crate::allocator_observer::AllocatorObserver;
 use crate::graphics::{FramebufferWriter, draw_rect, draw_string};
 use crate::info;
 use alloc::format;
 use core::arch::asm;
 use core::fmt::Write;
+
+// =============================================================================
+// AllocatorObserver フック関数
+// allocator.rsから呼び出される
+// =============================================================================
+
+/// アロケート時のフック関数
+///
+/// # Arguments
+/// * `class_idx` - サイズクラスのインデックス
+/// * `ptr` - 割り当てられたポインタ
+#[inline(always)]
+pub fn on_allocate_hook(class_idx: usize, ptr: *mut u8) {
+    // 現在は統計収集のみ（将来的にリアルタイム可視化を追加可能）
+    let _ = (class_idx, ptr);
+}
+
+/// デアロケート時のフック関数
+///
+/// # Arguments
+/// * `class_idx` - サイズクラスのインデックス
+/// * `ptr` - 解放されるポインタ
+#[inline(always)]
+pub fn on_deallocate_hook(class_idx: usize, ptr: *mut u8) {
+    // 現在は統計収集のみ（将来的にリアルタイム可視化を追加可能）
+    let _ = (class_idx, ptr);
+}
+
+// =============================================================================
+// AllocatorVisualizationObserver - AllocatorObserver実装
+// =============================================================================
+
+/// アロケータ可視化オブザーバー
+///
+/// AllocatorObserverトレイトを実装し、アロケータの統計情報を提供します。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AllocatorVisualizationObserver;
+
+impl AllocatorVisualizationObserver {
+    /// 新しいAllocatorVisualizationObserverを作成
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl AllocatorObserver for AllocatorVisualizationObserver {
+    fn on_allocate(&self, class_idx: usize, ptr: *mut u8) {
+        on_allocate_hook(class_idx, ptr);
+    }
+
+    fn on_deallocate(&self, class_idx: usize, ptr: *mut u8) {
+        on_deallocate_hook(class_idx, ptr);
+    }
+
+    fn count_free_blocks(&self, class_idx: usize) -> usize {
+        get_allocator().count_free_blocks(class_idx)
+    }
+
+    fn large_alloc_usage(&self) -> (usize, usize) {
+        get_allocator().large_alloc_usage()
+    }
+}
 
 // =============================================================================
 // アロケータへのアクセス関数

@@ -9,6 +9,7 @@ extern crate alloc;
 mod acpi;
 mod addr;
 mod allocator;
+mod allocator_observer;
 mod apic;
 mod debug_overlay;
 mod gdt;
