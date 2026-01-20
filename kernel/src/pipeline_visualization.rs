@@ -5,10 +5,78 @@
 
 extern crate alloc;
 
-use crate::graphics::buffer::DrawCommand;
+use crate::graphics::buffer::{DrawCommand, SharedBuffer};
+use crate::graphics::compositor_observer::CompositorObserver;
 use crate::graphics::region::Region;
 use crate::graphics::{draw_char, draw_rect, draw_rect_outline, draw_string};
 use alloc::vec::Vec;
+
+// =============================================================================
+// PipelineVisualizationObserver - CompositorObserver実装
+// =============================================================================
+
+/// パイプライン可視化オブザーバー
+///
+/// CompositorObserverトレイトを実装し、パイプラインの各フェーズで
+/// 可視化状態を更新します。ZST（ゼロサイズ型）であり、
+/// 状態はグローバル変数(`MINI_VIS_STATE`)で管理されるため、
+/// オブザーバー自体は軽量です。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PipelineVisualizationObserver;
+
+impl PipelineVisualizationObserver {
+    /// 新しいPipelineVisualizationObserverを作成
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl CompositorObserver for PipelineVisualizationObserver {
+    fn on_init(&mut self, fb_base: u64) {
+        // フレームバッファベースアドレスを保存
+        FB_BASE.store(fb_base, Ordering::Relaxed);
+    }
+
+    fn on_buffer_registered(&mut self, buffer_index: usize, buffer: &SharedBuffer, task_id: u64) {
+        // バッファ追跡情報を更新
+        if buffer_index < 4 {
+            let mut tracking = BUFFER_TRACKING.lock();
+            tracking[buffer_index].owner_task_id = Some(task_id);
+            tracking[buffer_index].buffer_index = Some(buffer_index);
+
+            // バッファ数を更新
+            let current_count = BUFFER_COUNT.load(Ordering::Relaxed) as usize;
+            if buffer_index >= current_count {
+                BUFFER_COUNT.store((buffer_index + 1) as u64, Ordering::Relaxed);
+            }
+        }
+
+        // 可視化状態にバッファを登録
+        if let Some(ref mut state) = *MINI_VIS_STATE.lock() {
+            if buffer_index < 4 {
+                let name = match buffer_index {
+                    0 => "Buffer0",
+                    1 => "Buffer1",
+                    2 => "Buffer2",
+                    _ => "Buffer3",
+                };
+                state.buffer_queues[buffer_index].name = name;
+                state.buffer_count = state.buffer_count.max(buffer_index + 1);
+            }
+        }
+        let _ = buffer; // 未使用警告を抑制
+    }
+
+    fn on_frame_start(&mut self, _buffers: &[SharedBuffer], _width: u32, _height: u32) {
+        // オブザーバーは状態更新のみを行う（制御フローは変更しない）
+        // 可視化モードの判定と処理はCompositor側で#[cfg]分岐により行われる
+    }
+
+    fn on_blit_complete(&mut self) {
+        // Blit完了時の処理
+        set_phase_idle();
+    }
+}
 
 // =============================================================================
 // 色定義
@@ -56,8 +124,85 @@ const ANIM_SPEED_BUFFER_COPY: f32 = 0.12;
 // グローバル可視化状態（Compositor連携用）
 // =============================================================================
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use spin::Mutex as SpinMutex;
+
+// =============================================================================
+// バッファ追跡用状態管理（Observer側で状態を保持）
+// =============================================================================
+
+/// バッファごとの追跡情報
+struct BufferTrackingInfo {
+    /// 所有タスクID
+    owner_task_id: Option<u64>,
+    /// 可視化用バッファインデックス（登録順）
+    buffer_index: Option<usize>,
+}
+
+impl BufferTrackingInfo {
+    const fn new() -> Self {
+        Self {
+            owner_task_id: None,
+            buffer_index: None,
+        }
+    }
+}
+
+/// バッファ追跡情報（最大4バッファ）
+static BUFFER_TRACKING: SpinMutex<[BufferTrackingInfo; 4]> = SpinMutex::new([
+    BufferTrackingInfo::new(),
+    BufferTrackingInfo::new(),
+    BufferTrackingInfo::new(),
+    BufferTrackingInfo::new(),
+]);
+
+/// フレームバッファベースアドレス（Observer側で保持）
+static FB_BASE: AtomicU64 = AtomicU64::new(0);
+
+/// 登録されたバッファ数
+static BUFFER_COUNT: AtomicU64 = AtomicU64::new(0);
+
+// =============================================================================
+// フック関数（Compositor/Writer本体から呼び出される）
+// =============================================================================
+
+/// flush時のフック
+///
+/// バッファにコマンドが追加されたことを可視化状態に反映
+pub fn on_flush_hook(
+    buffer_index: usize,
+    command_count: usize,
+    command_types: [Option<&'static str>; 5],
+) {
+    update_buffer_on_flush(buffer_index, command_count, command_types);
+}
+
+/// バッファインデックスから所有タスクIDを取得
+pub fn get_owner_task_id(buffer_index: usize) -> Option<u64> {
+    if buffer_index < 4 {
+        let tracking = BUFFER_TRACKING.lock();
+        tracking[buffer_index].owner_task_id
+    } else {
+        None
+    }
+}
+
+/// 保存されたフレームバッファベースアドレスを取得
+pub fn fb_base() -> u64 {
+    FB_BASE.load(Ordering::Relaxed)
+}
+
+/// 現在のタスクIDからバッファインデックスを逆引き
+pub fn get_buffer_index_for_current_task() -> Option<usize> {
+    let current_task_id = crate::sched::current_task_id().as_u64();
+    let tracking = BUFFER_TRACKING.lock();
+    for (idx, info) in tracking.iter().enumerate() {
+        if info.owner_task_id == Some(current_task_id) {
+            return Some(idx);
+        }
+    }
+    None
+}
 
 /// パイプラインフェーズ
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -561,24 +706,22 @@ pub fn set_phase_idle() {
     }
 }
 
-/// 可視化モードでのフレーム処理
+/// 可視化モードでのフレーム処理（内部実装）
 ///
-/// Compositorから呼び出され、可視化モード時の全フレーム処理を担当。
-/// 通常のシャドウバッファへの描画の代わりに、ミニバッファへの描画と
-/// アニメーション制御を行う。
+/// オブザーバーおよび従来の関数から呼び出される共通実装。
+///
+/// # Arguments
+/// * `buffers_snapshot` - バッファのスナップショット
+/// * `screen_width` - 画面幅
+/// * `screen_height` - 画面高さ
 ///
 /// # Returns
-/// 可視化モードで処理した場合は`true`、可視化モードでない場合は`false`
-pub fn process_frame_if_visualization(
+/// 常に`true`（可視化処理を行った）
+fn process_frame_visualization_internal(
     buffers_snapshot: &alloc::sync::Arc<alloc::vec::Vec<crate::graphics::buffer::SharedBuffer>>,
     screen_width: u32,
     screen_height: u32,
 ) -> bool {
-    // 可視化モードでなければ早期リターン
-    if !is_visualization_mode() {
-        return false;
-    }
-
     // バッファ数を更新
     update_buffer_count(buffers_snapshot.len());
 
@@ -626,11 +769,10 @@ pub fn process_frame_if_visualization(
                 // バッファを再ロックしてクリア
                 if let Some(mut buf) = buffer.try_lock() {
                     buf.clear_commands();
-                    // 所有タスクを起床
-                    if let Some(id) = buf.owner_task_id() {
-                        drop(buf);
-                        crate::sched::unblock_task(crate::sched::TaskId::from_u64(id));
-                    }
+                }
+                // 所有タスクを起床（Observer側の状態から取得）
+                if let Some(id) = get_owner_task_id(buffer_idx) {
+                    crate::sched::unblock_task(crate::sched::TaskId::from_u64(id));
                 }
             }
         }
@@ -642,6 +784,27 @@ pub fn process_frame_if_visualization(
     set_phase_idle();
 
     true
+}
+
+/// 可視化モードでのフレーム処理
+///
+/// Compositorから呼び出され、可視化モード時の全フレーム処理を担当。
+/// 通常のシャドウバッファへの描画の代わりに、ミニバッファへの描画と
+/// アニメーション制御を行う。
+///
+/// # Returns
+/// 可視化モードで処理した場合は`true`、可視化モードでない場合は`false`
+pub fn process_frame_if_visualization(
+    buffers_snapshot: &alloc::sync::Arc<alloc::vec::Vec<crate::graphics::buffer::SharedBuffer>>,
+    screen_width: u32,
+    screen_height: u32,
+) -> bool {
+    // 可視化モードでなければ早期リターン
+    if !is_visualization_mode() {
+        return false;
+    }
+
+    process_frame_visualization_internal(buffers_snapshot, screen_width, screen_height)
 }
 
 /// タスクのflush()から呼ばれる: バッファ内のコマンド情報を更新
@@ -1015,7 +1178,8 @@ extern "C" fn demo_task1() -> ! {
             &mut writer,
             format_args!("[Task1] Count:{} Tick:{}", counter, tick),
         );
-        writer.sync_flush();
+        writer.flush();
+        crate::sched::block_current_task(); // Compositorがコマンドを処理するまで待機
         counter += 1;
     }
 }
@@ -1037,7 +1201,8 @@ extern "C" fn demo_task2() -> ! {
             &mut writer,
             format_args!("[Task2 Med ] Count: {}", counter),
         );
-        writer.sync_flush();
+        writer.flush();
+        crate::sched::block_current_task(); // Compositorがコマンドを処理するまで待機
         counter += 1;
     }
 }
@@ -1059,7 +1224,8 @@ extern "C" fn demo_task3() -> ! {
             &mut writer,
             format_args!("[Task3 Low ] Count: {}", counter),
         );
-        writer.sync_flush();
+        writer.flush();
+        crate::sched::block_current_task(); // Compositorがコマンドを処理するまで待機
         counter += 1;
     }
 }
@@ -1107,8 +1273,8 @@ pub extern "C" fn visualization_ui_task() -> ! {
     // 画面サイズを取得
     let (screen_width, screen_height) = crate::graphics::compositor::screen_size();
 
-    // フレームバッファ情報を取得
-    let fb_base = crate::graphics::compositor::fb_base();
+    // フレームバッファ情報を取得（Observer側で保持）
+    let fb_base = fb_base();
 
     if fb_base == 0 {
         crate::error!("[VisualizationUI] Failed to get framebuffer base");
@@ -1684,144 +1850,6 @@ fn draw_blit_animation(fb_base: u64, fb_width: u32, blit_anim: &BlitAnimation) {
         let inner_x = (current_x as isize - 1).max(0) as usize;
         let inner_y = (current_y as isize - 1).max(0) as usize;
         draw_rect_outline(fb_base, fb_width, inner_x, inner_y, dw + 2, dh + 2, color);
-    }
-}
-
-/// 各タスクのキューをパイプとして表示（左から右へ流れる）
-///
-/// [Task1] ─[C][S]───> ┐
-/// [Task2] ─[C][S]───> ├──> [Compositor]
-/// [Task3] ─[C][S]───> ┘
-fn draw_pipe_queue(
-    fb_base: u64,
-    fb_width: u32,
-    buffer_queues: &[BufferQueueInfo; 4],
-    buffer_count: usize,
-    flowing_commands: &[Option<FlowingCommand>; 8],
-) {
-    // パイプの位置とサイズ（グローバル定数を使用）
-    const PIPE_HEIGHT: usize = 16;
-    const CMD_BLOCK_WIDTH: usize = 20;
-
-    let count = buffer_count.min(4);
-    if count == 0 {
-        return;
-    }
-
-    // 各バッファのパイプを描画
-    for i in 0..count {
-        let pipe_y =
-            TASK_BOX_Y_START + i * TASK_BOX_SPACING + TASK_BOX_HEIGHT / 2 - PIPE_HEIGHT / 2;
-        let info = &buffer_queues[i];
-
-        // パイプの色（処理中ならハイライト）
-        let pipe_color = if info.is_processing {
-            COLOR_HIGHLIGHT
-        } else {
-            COLOR_QUEUE_BORDER
-        };
-
-        // パイプ本体（水平線、タスクボックス右端からCompositor手前まで）
-        // SAFETY: fb_baseは有効なバッファアドレス。座標はレイアウト定数から計算され、
-        // 1024x768の画面サイズ内に収まる。
-        unsafe {
-            draw_rect(
-                fb_base,
-                fb_width,
-                PIPE_START_X,
-                pipe_y + PIPE_HEIGHT / 2 - 1,
-                PIPE_LENGTH,
-                3,
-                pipe_color,
-            );
-        }
-
-        // 矢印（パイプ終端、右端 → Compositor方向）
-        // SAFETY: fb_baseは有効なバッファアドレス、座標はレイアウト定数で境界内
-        unsafe {
-            draw_char(
-                fb_base,
-                fb_width,
-                PIPE_END_X + 2,
-                pipe_y + PIPE_HEIGHT / 2 - 4,
-                b'>',
-                pipe_color,
-            );
-        }
-    }
-
-    // FlowingCommand を描画（各コマンドの position に基づいて）
-    for cmd_opt in flowing_commands.iter() {
-        if let Some(cmd) = cmd_opt {
-            if cmd.buffer_index >= count {
-                continue;
-            }
-
-            let pipe_y =
-                TASK_BOX_Y_START + cmd.buffer_index * TASK_BOX_SPACING + TASK_BOX_HEIGHT / 2 - 8;
-
-            // position: 1.0 = 左端（開始、タスク側）、0.0 = 右端（終点、Compositor側）
-            // cmd_x = PIPE_START_X + (1.0 - position) * PIPE_LENGTH
-            let progress = 1.0 - cmd.position;
-            let cmd_x = PIPE_START_X + ((progress * PIPE_LENGTH as f32) as usize);
-            let cmd_y = pipe_y;
-
-            // コマンドタイプに応じた色
-            let cmd_color = match cmd.cmd_type {
-                "Clear" => 0xFF4040,      // 赤
-                "FillRect" => 0x40FF40,   // 緑
-                "DrawString" => 0x4040FF, // 青
-                "DrawChar" => 0xFFFF40,   // 黄
-                _ => 0xFFFFFF,            // 白
-            };
-
-            // 到着したコマンドは白で強調（待機中を表現）
-            let final_color = if cmd.arrived {
-                0xFFFFFF // 白で強調
-            } else {
-                cmd_color
-            };
-
-            // コマンドブロック
-            // SAFETY: fb_baseは有効なバッファ、cmd_xはパイプ範囲内で計算される
-            unsafe {
-                draw_rect(
-                    fb_base,
-                    fb_width,
-                    cmd_x,
-                    cmd_y,
-                    CMD_BLOCK_WIDTH,
-                    14,
-                    final_color,
-                );
-            }
-
-            // 頭文字
-            let ch = cmd.cmd_type.as_bytes().first().copied().unwrap_or(b'?');
-            // SAFETY: fb_baseは有効なバッファ、座標はコマンドブロック内
-            unsafe {
-                draw_char(fb_base, fb_width, cmd_x + 6, cmd_y + 3, ch, 0x000000);
-            }
-        }
-    }
-
-    // 合流点を示す縦線（Compositor手前）
-    if count > 1 {
-        let merge_x = PIPE_END_X + 12;
-        let merge_y_start = TASK_BOX_Y_START + TASK_BOX_HEIGHT / 2;
-        let merge_y_end = TASK_BOX_Y_START + (count - 1) * TASK_BOX_SPACING + TASK_BOX_HEIGHT / 2;
-        // SAFETY: fb_baseは有効なバッファ、座標はレイアウト定数から計算され境界内
-        unsafe {
-            draw_rect(
-                fb_base,
-                fb_width,
-                merge_x,
-                merge_y_start,
-                2,
-                merge_y_end - merge_y_start + 3,
-                COLOR_ARROW,
-            );
-        }
     }
 }
 

@@ -107,44 +107,13 @@ impl TaskWriter {
         }
 
         // 一括転送: drain()を使用してVecの容量を維持（アロケーションフリー）
-        let mut buf = self.buffer.lock();
-        buf.extend_commands(self.local_commands.drain(..));
-
-        // 可視化モード: flush時に即座に可視化状態を更新
-        #[cfg(feature = "visualize-pipeline")]
         {
-            if let Some(buffer_index) = buf.vis_buffer_index() {
-                let commands = buf.commands();
-                let command_count = commands.len();
-                let mut command_types: [Option<&'static str>; 5] = [None; 5];
-                for (i, cmd) in commands.iter().enumerate().take(5) {
-                    command_types[i] = Some(match cmd {
-                        DrawCommand::Clear { .. } => "Clear",
-                        DrawCommand::FillRect { .. } => "FillRect",
-                        DrawCommand::DrawString { .. } => "String",
-                        DrawCommand::DrawChar { .. } => "Char",
-                    });
-                }
-                drop(buf); // ロック解放してから可視化状態を更新
-                crate::pipeline_visualization::update_buffer_on_flush(
-                    buffer_index,
-                    command_count,
-                    command_types,
-                );
-            }
+            let mut buf = self.buffer.lock();
+            buf.extend_commands(self.local_commands.drain(..));
         }
-    }
 
-    /// 同期フラッシュ: コマンド転送後、Compositorの処理完了を待機（可視化モード用）
-    ///
-    /// flush()を呼んだ後、Compositorがコマンドを処理するまでブロックします。
-    /// これにより、パイプラインの可視化で正確な同期が取れます。
-    #[cfg(feature = "visualize-pipeline")]
-    pub fn sync_flush(&mut self) {
-        self.flush();
-        // Compositorがコマンドを処理してunblock_task()を呼ぶまで待機
-        use super::buffer::SyncFlushExt;
-        self.buffer.sync_flush();
+        // 可視化フック: flush時にバッファ情報を通知
+        notify_flush(&self.buffer);
     }
 
     /// 蓄積中のテキストをDrawStringコマンドにコミット
@@ -168,6 +137,37 @@ impl TaskWriter {
         });
     }
 }
+
+// =============================================================================
+// 可視化フック関数（featureフラグで有効版/no-op版を切り替え）
+// =============================================================================
+
+/// flush時の通知
+#[cfg(feature = "visualize-pipeline")]
+#[inline(always)]
+fn notify_flush(buffer: &SharedBuffer) {
+    // タスクIDからバッファインデックスを逆引き
+    if let Some(buffer_index) = crate::pipeline_visualization::get_buffer_index_for_current_task() {
+        let buf = buffer.lock();
+        let commands = buf.commands();
+        let command_count = commands.len();
+        let mut command_types: [Option<&'static str>; 5] = [None; 5];
+        for (i, cmd) in commands.iter().enumerate().take(5) {
+            command_types[i] = Some(match cmd {
+                DrawCommand::Clear { .. } => "Clear",
+                DrawCommand::FillRect { .. } => "FillRect",
+                DrawCommand::DrawString { .. } => "String",
+                DrawCommand::DrawChar { .. } => "Char",
+            });
+        }
+        drop(buf); // ロック解放してからフック呼び出し
+        crate::pipeline_visualization::on_flush_hook(buffer_index, command_count, command_types);
+    }
+}
+
+#[cfg(not(feature = "visualize-pipeline"))]
+#[inline(always)]
+fn notify_flush(_buffer: &SharedBuffer) {}
 
 impl core::fmt::Write for TaskWriter {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {

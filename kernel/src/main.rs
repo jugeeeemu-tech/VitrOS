@@ -111,16 +111,8 @@ extern "C" fn task1() -> ! {
         let tick = timer::current_tick();
         let _ = write!(writer, "[Task1] Count:{} Tick:{}", counter, tick);
 
-        // 可視化モード: 同期フラッシュ（Compositorの処理完了を待機）
-        #[cfg(feature = "visualize-pipeline")]
-        writer.sync_flush();
-
-        // 通常モード: 非同期フラッシュ + スリープ
-        #[cfg(not(feature = "visualize-pipeline"))]
-        {
-            writer.flush();
-            task::sleep_ms(16);
-        }
+        writer.flush();
+        task::sleep_ms(16);
 
         counter += 1;
     }
@@ -140,16 +132,8 @@ extern "C" fn task2() -> ! {
         writer.clear(0x00000000);
         let _ = write!(writer, "[Task2 Med ] Count: {}", counter);
 
-        // 可視化モード: 同期フラッシュ（Compositorの処理完了を待機）
-        #[cfg(feature = "visualize-pipeline")]
-        writer.sync_flush();
-
-        // 通常モード: 非同期フラッシュ + スリープ
-        #[cfg(not(feature = "visualize-pipeline"))]
-        {
-            writer.flush();
-            task::sleep_ms(16);
-        }
+        writer.flush();
+        task::sleep_ms(16);
 
         counter += 1;
     }
@@ -169,16 +153,8 @@ extern "C" fn task3() -> ! {
         writer.clear(0x00000000);
         let _ = write!(writer, "[Task3 Low ] Count: {}", counter);
 
-        // 可視化モード: 同期フラッシュ（Compositorの処理完了を待機）
-        #[cfg(feature = "visualize-pipeline")]
-        writer.sync_flush();
-
-        // 通常モード: 非同期フラッシュ + スリープ
-        #[cfg(not(feature = "visualize-pipeline"))]
-        {
-            writer.flush();
-            task::sleep_ms(16);
-        }
+        writer.flush();
+        task::sleep_ms(16);
 
         counter += 1;
     }
@@ -355,7 +331,12 @@ extern "C" fn kernel_main_inner(boot_info_phys_addr: u64) -> ! {
         #[cfg(feature = "visualize-allocator")]
         {
             info!("Starting allocator visualization");
-            allocator_visualization::run_visualization_tests(&mut fb_writer);
+            allocator_visualization::on_framebuffer_init_hook(
+                fb_virt_base,
+                boot_info.framebuffer.width,
+                boot_info.framebuffer.height,
+            );
+            allocator_visualization::run_visualization_tests();
         }
 
         info!("Heap initialized successfully");

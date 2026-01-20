@@ -2,6 +2,7 @@ mod font;
 
 pub mod buffer;
 pub mod compositor;
+pub mod compositor_observer;
 pub mod draw_target;
 pub mod region;
 pub mod shadow_buffer;
@@ -248,22 +249,9 @@ pub unsafe fn draw_rect_outline(
 
 // フレームバッファライター（writeln!マクロ対応）
 pub struct FramebufferWriter {
-    // 可視化機能が有効な場合はパブリック、それ以外はプライベート
-    #[cfg(any(feature = "visualize-allocator", feature = "visualize-pipeline"))]
-    pub fb_base: u64,
-    #[cfg(not(any(feature = "visualize-allocator", feature = "visualize-pipeline")))]
     fb_base: u64,
-
-    #[cfg(any(feature = "visualize-allocator", feature = "visualize-pipeline"))]
-    pub width: u32,
-    #[cfg(not(any(feature = "visualize-allocator", feature = "visualize-pipeline")))]
     width: u32,
-
-    #[cfg(any(feature = "visualize-allocator", feature = "visualize-pipeline"))]
-    pub height: u32,
-    #[cfg(not(any(feature = "visualize-allocator", feature = "visualize-pipeline")))]
     height: u32,
-
     x: usize,
     y: usize,
     color: u32,
