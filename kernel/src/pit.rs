@@ -3,10 +3,17 @@
 //! 8254 PITチップを使用してタイミング制御を行います。
 //! 主にAPIC Timerのキャリブレーションに使用します。
 
-use core::arch::asm;
+use crate::io::{port_read_u8, port_write_u8};
 
 /// PIT周波数（Hz）
 const PIT_FREQUENCY: u32 = 1193182;
+
+/// ポーリングループの最大イテレーション数（タイムアウト用）
+///
+/// PITカウンタは約1.19MHzで動作し、1回のループで数サイクルを消費する。
+/// 100,000回のイテレーションは、通常の動作では十分な待機時間を提供し、
+/// ハードウェア障害時の無限ループを防止する。
+const MAX_POLL_ITERATIONS: u32 = 100_000;
 
 /// PITのI/Oポート
 mod ports {
@@ -17,32 +24,6 @@ mod ports {
     pub const CHANNEL_2: u16 = 0x42;
     /// Mode/Command register (write only)
     pub const COMMAND: u16 = 0x43;
-}
-
-/// I/Oポートへの書き込み
-unsafe fn outb(port: u16, value: u8) {
-    unsafe {
-        asm!(
-            "out dx, al",
-            in("dx") port,
-            in("al") value,
-            options(nostack, preserves_flags)
-        );
-    }
-}
-
-/// I/Oポートからの読み込み
-unsafe fn inb(port: u16) -> u8 {
-    let value: u8;
-    unsafe {
-        asm!(
-            "in al, dx",
-            in("dx") port,
-            out("al") value,
-            options(nostack, preserves_flags)
-        );
-    }
-    value
 }
 
 /// PITを使って指定ミリ秒待機
@@ -58,6 +39,10 @@ pub fn sleep_ms(ms: u32) {
 
 /// 1ミリ秒待機（内部関数）
 fn sleep_1ms() {
+    // SAFETY:
+    // - PITのI/Oポート(0x40-0x43)はx86標準のハードウェアポート
+    // - カーネルモードでは特権I/O命令が許可されている
+    // - port_write_u8/port_read_u8はio.rsで定義された安全なI/Oラッパー
     unsafe {
         // 1ms = 1193 カウント（PIT_FREQUENCY / 1000）
         let count: u16 = (PIT_FREQUENCY / 1000) as u16;
@@ -68,19 +53,25 @@ fn sleep_1ms() {
         // - Access mode: lobyte/hibyte (bits 4-5: 11)
         // - Operating mode 0: interrupt on terminal count (bits 1-3: 000)
         // - Binary counter (bit 0: 0)
-        outb(ports::COMMAND, 0x30);
+        port_write_u8(ports::COMMAND, 0x30);
 
         // カウント値を設定（下位バイト、上位バイト）
-        outb(ports::CHANNEL_0, (count & 0xFF) as u8);
-        outb(ports::CHANNEL_0, ((count >> 8) & 0xFF) as u8);
+        port_write_u8(ports::CHANNEL_0, (count & 0xFF) as u8);
+        port_write_u8(ports::CHANNEL_0, ((count >> 8) & 0xFF) as u8);
 
         // 初回の読み取り
-        outb(ports::COMMAND, 0x00);
+        port_write_u8(ports::COMMAND, 0x00);
         let mut last_count = read_current_count();
 
-        // カウントダウンが完了するまで待つ
+        // カウントダウンが完了するまで待つ（タイムアウト付き）
+        let mut iterations = 0u32;
         loop {
-            outb(ports::COMMAND, 0x00); // latch command
+            if iterations >= MAX_POLL_ITERATIONS {
+                break; // タイムアウト
+            }
+            iterations += 1;
+
+            port_write_u8(ports::COMMAND, 0x00); // latch command
             let current_count = read_current_count();
 
             // Mode 0: カウンタが0になるか、再ロードされて大きくなったら終了
@@ -95,8 +86,8 @@ fn sleep_1ms() {
 /// 現在のPITカウント値を読み取る
 unsafe fn read_current_count() -> u16 {
     unsafe {
-        let low = inb(ports::CHANNEL_0) as u16;
-        let high = inb(ports::CHANNEL_0) as u16;
+        let low = port_read_u8(ports::CHANNEL_0) as u16;
+        let high = port_read_u8(ports::CHANNEL_0) as u16;
         (high << 8) | low
     }
 }
@@ -107,14 +98,18 @@ unsafe fn read_current_count() -> u16 {
 /// * `count` - カウント数
 #[allow(dead_code)]
 pub fn oneshot(count: u16) {
+    // SAFETY:
+    // - PITのI/Oポート(0x40-0x43)はx86標準のハードウェアポート
+    // - カーネルモードでは特権I/O命令が許可されている
+    // - port_write_u8はio.rsで定義された安全なI/Oラッパー
     unsafe {
         // Channel 0, Interrupt on terminal count (mode 0), binary counter
         // Command: 0x30 = 0011 0000
-        outb(ports::COMMAND, 0x30);
+        port_write_u8(ports::COMMAND, 0x30);
 
         // カウント値を設定
-        outb(ports::CHANNEL_0, (count & 0xFF) as u8);
-        outb(ports::CHANNEL_0, ((count >> 8) & 0xFF) as u8);
+        port_write_u8(ports::CHANNEL_0, (count & 0xFF) as u8);
+        port_write_u8(ports::CHANNEL_0, ((count >> 8) & 0xFF) as u8);
     }
 }
 
@@ -127,17 +122,27 @@ pub fn udelay(us: u32) {
     // 1マイクロ秒 = PIT_FREQUENCY / 1_000_000 カウント
     let count = ((PIT_FREQUENCY as u64 * us as u64) / 1_000_000) as u16;
 
+    // SAFETY:
+    // - PITのI/Oポート(0x40-0x43)はx86標準のハードウェアポート
+    // - カーネルモードでは特権I/O命令が許可されている
+    // - port_write_u8/port_read_u8はio.rsで定義された安全なI/Oラッパー
     unsafe {
         // One-shot mode
-        outb(ports::COMMAND, 0x30);
-        outb(ports::CHANNEL_0, (count & 0xFF) as u8);
-        outb(ports::CHANNEL_0, ((count >> 8) & 0xFF) as u8);
+        port_write_u8(ports::COMMAND, 0x30);
+        port_write_u8(ports::CHANNEL_0, (count & 0xFF) as u8);
+        port_write_u8(ports::CHANNEL_0, ((count >> 8) & 0xFF) as u8);
 
-        // カウントが0になるまで待つ
+        // カウントが0になるまで待つ（タイムアウト付き）
+        let mut iterations = 0u32;
         loop {
-            outb(ports::COMMAND, 0x00); // latch
-            let low = inb(ports::CHANNEL_0) as u16;
-            let high = inb(ports::CHANNEL_0) as u16;
+            if iterations >= MAX_POLL_ITERATIONS {
+                break; // タイムアウト
+            }
+            iterations += 1;
+
+            port_write_u8(ports::COMMAND, 0x00); // latch
+            let low = port_read_u8(ports::CHANNEL_0) as u16;
+            let high = port_read_u8(ports::CHANNEL_0) as u16;
             let current = (high << 8) | low;
 
             if current == 0 {
@@ -146,3 +151,37 @@ pub fn udelay(us: u32) {
         }
     }
 }
+
+// ============================================================================
+// TimerDevice trait 実装
+// ============================================================================
+
+use crate::timer_device::TimerDevice;
+
+/// PIT タイマーデバイス
+pub struct Pit;
+
+impl TimerDevice for Pit {
+    fn is_available(&self) -> bool {
+        true
+    }
+
+    fn frequency(&self) -> u64 {
+        PIT_FREQUENCY as u64
+    }
+
+    fn delay_ns(&self, ns: u64) {
+        let us = ((ns + 999) / 1_000) as u32;
+        if us > 0 {
+            udelay(us);
+        }
+    }
+
+    fn delay_ms(&self, ms: u64) {
+        let ms_clamped = ms.min(u32::MAX as u64) as u32;
+        sleep_ms(ms_clamped);
+    }
+}
+
+/// グローバルPITインスタンス
+pub static PIT: Pit = Pit;

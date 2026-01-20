@@ -135,7 +135,7 @@ impl ShadowBuffer {
     /// - 転送先には`self.buffer.len() * 4`バイト以上の書き込み可能な領域があること
     /// - 呼び出し元は転送先メモリへの排他的アクセス権を持つこと
     pub unsafe fn blit_to(&mut self, hw_fb_base: u64) -> bool {
-        let dirty = match self.take_dirty_rect() {
+        let dirty = match self.dirty_rect.take() {
             Some(r) => r,
             None => return false, // 変更なし、転送不要
         };
@@ -158,5 +158,86 @@ impl ShadowBuffer {
         }
 
         true // 転送が行われた
+    }
+}
+
+// ============================================================================
+// DrawTarget trait 実装
+// ============================================================================
+
+use super::draw_target::{DirtyTrackingTarget, DrawTarget};
+
+impl DrawTarget for ShadowBuffer {
+    fn base_addr(&self) -> u64 {
+        self.buffer.as_ptr() as u64
+    }
+
+    fn width(&self) -> u32 {
+        self.width
+    }
+
+    fn height(&self) -> u32 {
+        self.height
+    }
+
+    fn fill_rect(&mut self, x: u32, y: u32, w: u32, h: u32, color: u32) {
+        // SAFETY: base_addrは自身のバッファを指す有効なアドレス
+        unsafe {
+            super::draw_rect(
+                self.base_addr(),
+                self.width,
+                x as usize,
+                y as usize,
+                w as usize,
+                h as usize,
+                color,
+            );
+        }
+        self.mark_dirty(&Region::new(x, y, w, h));
+    }
+
+    fn draw_char(&mut self, x: u32, y: u32, ch: u8, color: u32) {
+        // SAFETY: base_addrは自身のバッファを指す有効なアドレス
+        unsafe {
+            super::draw_char(
+                self.base_addr(),
+                self.width,
+                x as usize,
+                y as usize,
+                ch,
+                color,
+            );
+        }
+        self.mark_dirty(&Region::new(x, y, 8, 8));
+    }
+
+    fn draw_string(&mut self, x: u32, y: u32, s: &str, color: u32) {
+        // SAFETY: base_addrは自身のバッファを指す有効なアドレス
+        unsafe {
+            super::draw_string(
+                self.base_addr(),
+                self.width,
+                x as usize,
+                y as usize,
+                s,
+                color,
+            );
+        }
+        let str_width = (s.len() as u32) * 8;
+        self.mark_dirty(&Region::new(x, y, str_width, 8));
+    }
+}
+
+impl DirtyTrackingTarget for ShadowBuffer {
+    fn mark_dirty(&mut self, region: &Region) {
+        ShadowBuffer::mark_dirty(self, region);
+    }
+
+    fn mark_all_dirty(&mut self) {
+        self.dirty_rect = Some(Region::new(0, 0, self.width, self.height));
+    }
+
+    fn take_dirty_rect(&mut self) -> Option<Region> {
+        self.dirty_rect.take()
     }
 }
