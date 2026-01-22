@@ -526,18 +526,24 @@ unsafe impl GlobalAlloc for KernelAllocator {
             return;
         }
 
-        let size = layout.size().max(layout.align());
+        let ptr_addr = ptr as usize;
+        let buddy_start = unsafe { *self.buddy.region_start.get() };
 
-        // サイズクラスに該当する場合はスラブへ解放
-        if let Some(class_idx) = Self::size_to_class(size) {
-            notify_deallocate(class_idx, ptr);
-            unsafe {
-                self.slab_caches[class_idx].deallocate(ptr);
-            }
-        } else {
-            // 4KB超はバディアロケータへ解放
+        // アドレス範囲で解放先を判断
+        // スラブが空でバディにフォールバックした場合も正しく解放できる
+        if ptr_addr >= buddy_start {
+            // バディ領域のアドレスならバディに解放
             unsafe {
                 self.buddy.deallocate(ptr, layout);
+            }
+        } else {
+            // スラブ領域のアドレスならスラブに解放
+            let size = layout.size().max(layout.align());
+            if let Some(class_idx) = Self::size_to_class(size) {
+                notify_deallocate(class_idx, ptr);
+                unsafe {
+                    self.slab_caches[class_idx].deallocate(ptr);
+                }
             }
         }
     }
