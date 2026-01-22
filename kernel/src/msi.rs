@@ -2,7 +2,7 @@
 //!
 //! PCIデバイスのMSI割り込みを設定・管理します。
 
-use crate::pci::{capability_id, PciConfigAccess, PciDevice, PCI_CONFIG};
+use crate::pci::{PCI_CONFIG, PciConfigAccess, PciDevice, capability_id};
 
 /// MSI Capability レジスタオフセット（Capability先頭からの相対）
 mod msi_reg {
@@ -26,16 +26,64 @@ mod message_control {
     pub const ADDR_64BIT: u16 = 1 << 7;
 }
 
+/// MSI-X Capability レジスタオフセット（Capability先頭からの相対）
+mod msix_reg {
+    /// Message Control (2バイト)
+    pub const MESSAGE_CONTROL: u16 = 0x02;
+    /// Table Offset/BIR (4バイト)
+    pub const TABLE_OFFSET_BIR: u16 = 0x04;
+    /// PBA Offset/BIR (4バイト)
+    pub const PBA_OFFSET_BIR: u16 = 0x08;
+}
+
+/// MSI-X Message Control レジスタのビットフィールド
+mod msix_message_control {
+    /// MSI-X Enable ビット
+    pub const ENABLE: u16 = 1 << 15;
+    /// Function Mask ビット
+    pub const FUNCTION_MASK: u16 = 1 << 14;
+    /// Table Size マスク（下位11ビット）
+    pub const TABLE_SIZE_MASK: u16 = 0x07FF;
+}
+
+/// MSI-X テーブルエントリのオフセット
+mod msix_table_entry {
+    /// Message Address (下位32ビット)
+    pub const MSG_ADDR: u32 = 0x00;
+    /// Message Upper Address (上位32ビット)
+    pub const MSG_UPPER_ADDR: u32 = 0x04;
+    /// Message Data
+    pub const MSG_DATA: u32 = 0x08;
+    /// Vector Control
+    pub const VECTOR_CONTROL: u32 = 0x0C;
+    /// エントリサイズ（16バイト）
+    pub const SIZE: u32 = 0x10;
+}
+
+/// Vector Control のビットフィールド
+mod msix_vector_control {
+    /// Mask ビット
+    pub const MASK: u32 = 1 << 0;
+}
+
 /// LAPIC MSI Address ベース (x86/x86_64)
 const LAPIC_MSI_ADDRESS_BASE: u32 = 0xFEE0_0000;
 
-/// MSI設定時のエラー
+/// MSI/MSI-X設定時のエラー
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MsiError {
-    /// デバイスがMSIをサポートしていない
+    /// デバイスがMSI/MSI-Xをサポートしていない
     NotSupported,
     /// 無効なベクタ番号（32-239の範囲外）
     InvalidVector,
+    /// 無効なエントリインデックス（MSI-X）
+    InvalidEntry,
+    /// BAR読み取り失敗（MSI-X）
+    InvalidBar,
+    /// 要求されたベクタ数がテーブルサイズを超過（MSI-X）
+    TooManyVectors,
+    /// MMIOマッピング失敗（MSI-X）
+    MappingFailed,
 }
 
 /// MSI設定情報
@@ -45,6 +93,23 @@ pub struct MsiConfig {
     pub vector: u8,
     /// MSI Capabilityのオフセット
     pub cap_offset: u16,
+}
+
+/// MSI-X Capability情報
+#[derive(Debug, Clone, Copy)]
+pub struct MsixCapability {
+    /// Capabilityのオフセット
+    pub cap_offset: u16,
+    /// テーブルサイズ（エントリ数 = Table Size + 1）
+    pub table_size: u16,
+    /// テーブルのBAR番号 (BIR: BAR Indicator Register)
+    pub table_bir: u8,
+    /// テーブルのオフセット（BAR内）
+    pub table_offset: u32,
+    /// PBAのBAR番号
+    pub pba_bir: u8,
+    /// PBAのオフセット（BAR内）
+    pub pba_offset: u32,
 }
 
 /// PCIデバイスのMSIを設定
@@ -102,7 +167,13 @@ pub fn configure_msi(device: &PciDevice, vector: u8) -> Result<MsiConfig, MsiErr
     // Message Data を設定（ベクタ番号、Edge trigger, Fixed delivery mode）
     let data_offset = if is_64bit {
         // 64ビット対応: Upper Addressを0に設定
-        PCI_CONFIG.write_u32(bus, dev, func, cap_offset + msi_reg::MESSAGE_ADDRESS_UPPER, 0);
+        PCI_CONFIG.write_u32(
+            bus,
+            dev,
+            func,
+            cap_offset + msi_reg::MESSAGE_ADDRESS_UPPER,
+            0,
+        );
         msi_reg::MESSAGE_DATA_64
     } else {
         msi_reg::MESSAGE_DATA_32
@@ -145,6 +216,286 @@ pub fn disable_msi(device: &PciDevice) -> Result<(), MsiError> {
         func,
         cap_offset + msi_reg::MESSAGE_CONTROL,
         msg_ctrl & !message_control::ENABLE,
+    );
+
+    Ok(())
+}
+
+// ============================================================================
+// MSI-X実装
+// ============================================================================
+
+/// PCIデバイスのMSI-X Capabilityを検出
+///
+/// # Arguments
+/// * `device` - 検査するPCIデバイス
+///
+/// # Returns
+/// MSI-X Capabilityが見つかった場合はMsixCapability、なければNone
+pub fn detect_msix(device: &PciDevice) -> Option<MsixCapability> {
+    // MSI-X Capabilityを検索
+    let cap_offset = device.find_capability(capability_id::MSIX)?;
+
+    let bus = device.bus;
+    let dev = device.device;
+    let func = device.function;
+
+    // Message Controlを読み取り
+    let msg_ctrl = PCI_CONFIG.read_u16(bus, dev, func, cap_offset + msix_reg::MESSAGE_CONTROL);
+    let table_size = (msg_ctrl & msix_message_control::TABLE_SIZE_MASK) + 1;
+
+    // Table Offset/BIRを読み取り
+    let table_offset_bir =
+        PCI_CONFIG.read_u32(bus, dev, func, cap_offset + msix_reg::TABLE_OFFSET_BIR);
+    let table_bir = (table_offset_bir & 0x07) as u8;
+    let table_offset = table_offset_bir & 0xFFFF_FFF8;
+
+    // PBA Offset/BIRを読み取り
+    let pba_offset_bir = PCI_CONFIG.read_u32(bus, dev, func, cap_offset + msix_reg::PBA_OFFSET_BIR);
+    let pba_bir = (pba_offset_bir & 0x07) as u8;
+    let pba_offset = pba_offset_bir & 0xFFFF_FFF8;
+
+    Some(MsixCapability {
+        cap_offset,
+        table_size,
+        table_bir,
+        table_offset,
+        pba_bir,
+        pba_offset,
+    })
+}
+
+/// MSI-X設定情報
+///
+/// MSI-Xテーブルへのアクセスを提供します。
+#[derive(Debug, Clone, Copy)]
+pub struct MsixConfig {
+    /// MSI-X Capability情報
+    pub capability: MsixCapability,
+    /// テーブルの仮想アドレス
+    table_virt_addr: u64,
+}
+
+impl MsixConfig {
+    /// 新しいMsixConfigを作成
+    ///
+    /// # Arguments
+    /// * `capability` - MSI-X Capability情報
+    /// * `table_virt_addr` - マッピング済みテーブルの仮想アドレス
+    pub fn new(capability: MsixCapability, table_virt_addr: u64) -> Self {
+        Self {
+            capability,
+            table_virt_addr,
+        }
+    }
+
+    /// テーブルサイズ（エントリ数）を取得
+    pub fn table_size(&self) -> u16 {
+        self.capability.table_size
+    }
+
+    /// エントリにMessage Address/Dataを設定
+    ///
+    /// # Arguments
+    /// * `index` - エントリインデックス（0から始まる）
+    /// * `vector` - 割り込みベクタ番号（32-239）
+    ///
+    /// # Returns
+    /// 成功時はOk(()), 失敗時はMsiError
+    pub fn configure_entry(&self, index: u16, vector: u8) -> Result<(), MsiError> {
+        // インデックスの検証
+        if index >= self.capability.table_size {
+            return Err(MsiError::InvalidEntry);
+        }
+
+        // ベクタ番号の検証
+        if vector < 32 || vector > 239 {
+            return Err(MsiError::InvalidVector);
+        }
+
+        // エントリのアドレスを計算
+        let entry_addr = self.table_virt_addr + (index as u64) * (msix_table_entry::SIZE as u64);
+
+        // SAFETY: table_virt_addrは正しくマッピングされた仮想アドレスであること
+        unsafe {
+            // Message Address (LAPIC向け)
+            let addr_ptr = entry_addr as *mut u32;
+            core::ptr::write_volatile(addr_ptr, LAPIC_MSI_ADDRESS_BASE);
+
+            // Message Upper Address (0)
+            let upper_addr_ptr = (entry_addr + msix_table_entry::MSG_UPPER_ADDR as u64) as *mut u32;
+            core::ptr::write_volatile(upper_addr_ptr, 0);
+
+            // Message Data (ベクタ番号)
+            let data_ptr = (entry_addr + msix_table_entry::MSG_DATA as u64) as *mut u32;
+            core::ptr::write_volatile(data_ptr, vector as u32);
+        }
+
+        Ok(())
+    }
+
+    /// エントリをマスク（割り込みを無効化）
+    ///
+    /// # Arguments
+    /// * `index` - エントリインデックス
+    pub fn mask_entry(&self, index: u16) -> Result<(), MsiError> {
+        if index >= self.capability.table_size {
+            return Err(MsiError::InvalidEntry);
+        }
+
+        let entry_addr = self.table_virt_addr + (index as u64) * (msix_table_entry::SIZE as u64);
+        let ctrl_ptr = (entry_addr + msix_table_entry::VECTOR_CONTROL as u64) as *mut u32;
+
+        // SAFETY: 正しくマッピングされた仮想アドレス
+        unsafe {
+            let ctrl = core::ptr::read_volatile(ctrl_ptr);
+            core::ptr::write_volatile(ctrl_ptr, ctrl | msix_vector_control::MASK);
+        }
+
+        Ok(())
+    }
+
+    /// エントリをアンマスク（割り込みを有効化）
+    ///
+    /// # Arguments
+    /// * `index` - エントリインデックス
+    pub fn unmask_entry(&self, index: u16) -> Result<(), MsiError> {
+        if index >= self.capability.table_size {
+            return Err(MsiError::InvalidEntry);
+        }
+
+        let entry_addr = self.table_virt_addr + (index as u64) * (msix_table_entry::SIZE as u64);
+        let ctrl_ptr = (entry_addr + msix_table_entry::VECTOR_CONTROL as u64) as *mut u32;
+
+        // SAFETY: 正しくマッピングされた仮想アドレス
+        unsafe {
+            let ctrl = core::ptr::read_volatile(ctrl_ptr);
+            core::ptr::write_volatile(ctrl_ptr, ctrl & !msix_vector_control::MASK);
+        }
+
+        Ok(())
+    }
+
+    /// 全エントリをマスク
+    pub fn mask_all(&self) {
+        for i in 0..self.capability.table_size {
+            let _ = self.mask_entry(i);
+        }
+    }
+}
+
+/// MSI-Xを設定して有効化
+///
+/// # Arguments
+/// * `device` - MSI-Xを設定するPCIデバイス
+/// * `vectors` - 設定する割り込みベクタ番号のスライス（各エントリに対応）
+///
+/// # Returns
+/// 成功時はMsixConfig、失敗時はMsiError
+///
+/// # Notes
+/// - vectorsの長さはテーブルサイズ以下である必要があります
+/// - 各ベクタ番号は32-239の範囲内である必要があります
+/// - テーブルのマッピングにはKERNEL_VIRTUAL_BASEを使用した直接マッピングを使用します
+pub fn configure_msix(device: &PciDevice, vectors: &[u8]) -> Result<MsixConfig, MsiError> {
+    use crate::paging::KERNEL_VIRTUAL_BASE;
+
+    // MSI-X Capabilityを検出
+    let capability = detect_msix(device).ok_or(MsiError::NotSupported)?;
+
+    // ベクタ数の検証
+    if vectors.len() > capability.table_size as usize {
+        return Err(MsiError::TooManyVectors);
+    }
+
+    // 各ベクタ番号の検証
+    for &v in vectors {
+        if v < 32 || v > 239 {
+            return Err(MsiError::InvalidVector);
+        }
+    }
+
+    // BARからテーブルの物理アドレスを取得
+    let bar_info = device
+        .read_bar(capability.table_bir)
+        .ok_or(MsiError::InvalidBar)?;
+
+    if !bar_info.is_memory {
+        return Err(MsiError::InvalidBar);
+    }
+
+    // テーブルの物理アドレスを計算
+    let table_phys_addr = bar_info.base_address + capability.table_offset as u64;
+
+    // 仮想アドレスに変換（直接マッピング使用）
+    let table_virt_addr = KERNEL_VIRTUAL_BASE + table_phys_addr;
+
+    let config = MsixConfig::new(capability, table_virt_addr);
+
+    let bus = device.bus;
+    let dev = device.device;
+    let func = device.function;
+
+    // MSI-Xを一旦無効化
+    let msg_ctrl =
+        PCI_CONFIG.read_u16(bus, dev, func, capability.cap_offset + msix_reg::MESSAGE_CONTROL);
+    PCI_CONFIG.write_u16(
+        bus,
+        dev,
+        func,
+        capability.cap_offset + msix_reg::MESSAGE_CONTROL,
+        msg_ctrl & !msix_message_control::ENABLE,
+    );
+
+    // 全エントリをマスク
+    config.mask_all();
+
+    // 各エントリを設定
+    for (i, &vector) in vectors.iter().enumerate() {
+        config.configure_entry(i as u16, vector)?;
+    }
+
+    // 設定したエントリをアンマスク
+    for i in 0..vectors.len() {
+        config.unmask_entry(i as u16)?;
+    }
+
+    // MSI-Xを有効化
+    PCI_CONFIG.write_u16(
+        bus,
+        dev,
+        func,
+        capability.cap_offset + msix_reg::MESSAGE_CONTROL,
+        msg_ctrl | msix_message_control::ENABLE,
+    );
+
+    Ok(config)
+}
+
+/// MSI-Xを無効化
+///
+/// # Arguments
+/// * `device` - MSI-Xを無効化するPCIデバイス
+///
+/// # Returns
+/// 成功時はOk(()), デバイスがMSI-X非対応ならErr(MsiError::NotSupported)
+pub fn disable_msix(device: &PciDevice) -> Result<(), MsiError> {
+    let cap_offset = device
+        .find_capability(capability_id::MSIX)
+        .ok_or(MsiError::NotSupported)?;
+
+    let bus = device.bus;
+    let dev = device.device;
+    let func = device.function;
+
+    // Message Controlを読み取り、Enableビットをクリア
+    let msg_ctrl = PCI_CONFIG.read_u16(bus, dev, func, cap_offset + msix_reg::MESSAGE_CONTROL);
+    PCI_CONFIG.write_u16(
+        bus,
+        dev,
+        func,
+        cap_offset + msix_reg::MESSAGE_CONTROL,
+        msg_ctrl & !msix_message_control::ENABLE,
     );
 
     Ok(())
