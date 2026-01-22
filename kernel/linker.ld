@@ -2,7 +2,7 @@ ENTRY(kernel_main)
 
 /* 仮想アドレス空間の基底 */
 KERNEL_VMA = 0xFFFF800000000000;
-KERNEL_LMA = 0x100000;
+KERNEL_LMA = 0x200000;
 
 SECTIONS
 {

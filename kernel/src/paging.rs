@@ -474,8 +474,11 @@ pub fn init(boot_info: &vitros_common::boot_info::BootInfo) -> Result<(), Paging
         }
 
         // === 必要なページのみマッピング（高位のみ）===
-        // MMIO領域はスキップし、後でmap_mmio()でUC属性でマッピングする
+        // MMIO領域とカーネル領域はスキップ
+        // - MMIO領域: 後でmap_mmio()でUC属性でマッピング
+        // - カーネル領域: 後でsetup_kernel_huge_pages()で2MBヒュージページとしてマッピング
         let mut skipped_mmio_pages = 0usize;
+        let mut skipped_kernel_pages = 0usize;
         // メモリマップからMMIO領域を抽出し、ソート済み配列を作成（ループ前に1回だけ）
         let memory_region_count = boot_info.memory_map_count.min(boot_info.memory_map.len());
         let memory_regions = &boot_info.memory_map[..memory_region_count];
@@ -485,6 +488,13 @@ pub fn init(boot_info: &vitros_common::boot_info::BootInfo) -> Result<(), Paging
                 let physical_addr =
                     ((pt_idx * PAGE_TABLE_ENTRY_COUNT + page_idx) * PAGE_SIZE) as u64;
                 if physical_addr < actual_max {
+                    // カーネル領域はヒュージページ用に予約（4KBマッピングをスキップ）
+                    if physical_addr >= KERNEL_HUGE_PAGE_START
+                        && physical_addr < KERNEL_HUGE_PAGE_END
+                    {
+                        skipped_kernel_pages += 1;
+                        continue;
+                    }
                     if is_mmio_region_binary(physical_addr, &mmio_ranges, mmio_count) {
                         // MMIO領域はスキップ（Present=0のまま）
                         skipped_mmio_pages += 1;
@@ -493,6 +503,12 @@ pub fn init(boot_info: &vitros_common::boot_info::BootInfo) -> Result<(), Paging
                     }
                 }
             }
+        }
+        if skipped_kernel_pages > 0 {
+            info!(
+                "Skipped {} pages for kernel huge page region",
+                skipped_kernel_pages
+            );
         }
         if skipped_mmio_pages > 0 {
             info!("Skipped {} pages as MMIO regions", skipped_mmio_pages);
@@ -546,6 +562,28 @@ pub fn init(boot_info: &vitros_common::boot_info::BootInfo) -> Result<(), Paging
             info!(
                 "  Entry is Present: {}",
                 (*pt_high)[pt_array_idx].entry(page_idx_in_pt).get_raw() & 1 != 0
+            );
+        }
+
+        // === カーネル領域を2MBヒュージページでマッピング ===
+        // write_cr3()前に行わないと、カーネルコード自体がアンマップされてしまう
+        {
+            let huge_flags = PageTableFlags::Present as u64
+                | PageTableFlags::Writable as u64
+                | PageTableFlags::HugePage as u64;
+
+            // 0x200000を2MBヒュージページでマッピング
+            let pd_global_idx = (KERNEL_HUGE_PAGE_START / HUGE_PAGE_SIZE_2MB as u64) as usize;
+            let pd_array_idx = pd_global_idx / PAGE_TABLE_ENTRY_COUNT;
+            let pd_entry_idx = pd_global_idx % PAGE_TABLE_ENTRY_COUNT;
+
+            (*pd_high)[pd_array_idx]
+                .entry(pd_entry_idx)
+                .set(KERNEL_HUGE_PAGE_START, huge_flags);
+
+            info!(
+                "Kernel huge page pre-mapped at 0x{:X} before CR3 switch",
+                KERNEL_HUGE_PAGE_START
             );
         }
 
@@ -929,4 +967,70 @@ pub fn unmap_huge_1gb(phys_addr: u64) -> Result<(), PagingError> {
     info!("Huge 1GB page unmapped: phys=0x{:X}", phys_addr);
 
     Ok(())
+}
+
+/// カーネル物理アドレス開始位置（2MB境界）
+/// init()内でヒュージページマッピングに使用
+const KERNEL_HUGE_PAGE_START: u64 = 0x200000;
+
+/// カーネルヒュージページ領域の終了アドレス（2MB境界）
+/// 最初の2MBヒュージページ領域のみ予約
+const KERNEL_HUGE_PAGE_END: u64 = 0x400000;
+
+// =============================================================================
+// フレームバッファ ヒュージページ設定
+// =============================================================================
+
+/// フレームバッファを可能であれば2MBヒュージページでマッピングする
+///
+/// フレームバッファが2MB境界にアライメントされている場合、ヒュージページで
+/// マッピングしてTLB効率を向上させる。非アラインの場合は通常の4KBページ
+/// （既存のマッピング）を使用する。
+///
+/// # Safety Preconditions
+/// * この関数はinit()の後、割り込み無効状態で呼び出すこと
+///
+/// # Arguments
+/// * `fb_base` - フレームバッファの物理ベースアドレス
+/// * `fb_size` - フレームバッファのサイズ（バイト単位）
+///
+/// # Returns
+/// マッピングされた仮想アドレス、またはエラー
+///
+/// # Errors
+/// * `PagingError::InvalidAddress` - アドレス変換に失敗した場合
+/// * `PagingError::PageTableInitFailed` - ページテーブル設定に失敗した場合
+pub fn map_framebuffer_huge(fb_base: u64, fb_size: u64) -> Result<u64, PagingError> {
+    use crate::info;
+
+    // 割り込みが無効であることを確認
+    assert_interrupts_disabled("map_framebuffer_huge");
+
+    // 2MB境界アライメントチェック
+    if !is_2mb_aligned(fb_base) {
+        info!(
+            "Framebuffer not 2MB aligned (0x{:X}), using 4KB pages",
+            fb_base
+        );
+        // 非アラインの場合はinit()でマッピング済みの4KBページを使用
+        return phys_to_virt(fb_base);
+    }
+
+    // 必要な2MBページ数を計算
+    let huge_page_count =
+        ((fb_size + HUGE_PAGE_SIZE_2MB as u64 - 1) / HUGE_PAGE_SIZE_2MB as u64) as usize;
+
+    info!(
+        "Mapping framebuffer with {} huge 2MB pages: phys=0x{:X}, size={}",
+        huge_page_count, fb_base, fb_size
+    );
+
+    // 各2MBページをマッピング
+    for i in 0..huge_page_count {
+        let page_addr = fb_base + (i as u64 * HUGE_PAGE_SIZE_2MB as u64);
+        map_huge_2mb(page_addr)?;
+    }
+
+    info!("Framebuffer huge page mapping complete");
+    phys_to_virt(fb_base)
 }
