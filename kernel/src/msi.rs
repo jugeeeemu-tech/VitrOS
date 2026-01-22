@@ -445,7 +445,11 @@ impl MsixConfig {
         for i in 0..self.capability.table_size {
             // インデックスは必ずtable_size未満なのでエラーは発生しない
             let result = self.mask_entry(i);
-            debug_assert!(result.is_ok(), "mask_entry failed unexpectedly: {:?}", result);
+            debug_assert!(
+                result.is_ok(),
+                "mask_entry failed unexpectedly: {:?}",
+                result
+            );
         }
     }
 }
