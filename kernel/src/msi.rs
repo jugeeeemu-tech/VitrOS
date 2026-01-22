@@ -69,6 +69,11 @@ mod msix_vector_control {
 /// LAPIC MSI Address ベース (x86/x86_64)
 const LAPIC_MSI_ADDRESS_BASE: u32 = 0xFEE0_0000;
 
+/// x86の例外ベクタ範囲の終端（0-31は例外用）
+const MIN_MSI_VECTOR: u8 = 32;
+/// MSI/MSI-Xで使用可能なベクタの最大値
+const MAX_MSI_VECTOR: u8 = 239;
+
 /// MSI/MSI-X設定時のエラー
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MsiError {
@@ -128,8 +133,8 @@ pub struct MsixCapability {
 /// - 240-254: 予約
 /// - 255: スプリアス割り込み
 pub fn configure_msi(device: &PciDevice, vector: u8) -> Result<MsiConfig, MsiError> {
-    // ベクタ番号の検証（32以上239以下）
-    if vector < 32 || vector > 239 {
+    // ベクタ番号の検証
+    if vector < MIN_MSI_VECTOR || vector > MAX_MSI_VECTOR {
         return Err(MsiError::InvalidVector);
     }
 
@@ -309,14 +314,19 @@ impl MsixConfig {
         }
 
         // ベクタ番号の検証
-        if vector < 32 || vector > 239 {
+        if vector < MIN_MSI_VECTOR || vector > MAX_MSI_VECTOR {
             return Err(MsiError::InvalidVector);
         }
 
         // エントリのアドレスを計算
         let entry_addr = self.table_virt_addr + (index as u64) * (msix_table_entry::SIZE as u64);
 
-        // SAFETY: table_virt_addrは正しくマッピングされた仮想アドレスであること
+        // SAFETY:
+        // - table_virt_addrはconfigure_msix()でBAR物理アドレスから
+        //   phys_to_virt()を使用して生成された仮想アドレス
+        // - MSI-Xテーブルエントリは16バイト境界にアライメントされている（PCI仕様）
+        // - 各フィールドアクセスは4バイト境界にアライメントされている
+        // - インデックスは上記で検証済みでtable_size未満
         unsafe {
             // Message Address (LAPIC向け)
             let addr_ptr = entry_addr as *mut u32;
@@ -346,7 +356,11 @@ impl MsixConfig {
         let entry_addr = self.table_virt_addr + (index as u64) * (msix_table_entry::SIZE as u64);
         let ctrl_ptr = (entry_addr + msix_table_entry::VECTOR_CONTROL as u64) as *mut u32;
 
-        // SAFETY: 正しくマッピングされた仮想アドレス
+        // SAFETY:
+        // - table_virt_addrはconfigure_msix()でBAR物理アドレスから
+        //   phys_to_virt()を使用して生成された仮想アドレス
+        // - ctrl_ptrは4バイト境界にアライメントされている（PCI仕様）
+        // - インデックスは上記で検証済みでtable_size未満
         unsafe {
             let ctrl = core::ptr::read_volatile(ctrl_ptr);
             core::ptr::write_volatile(ctrl_ptr, ctrl | msix_vector_control::MASK);
@@ -367,7 +381,11 @@ impl MsixConfig {
         let entry_addr = self.table_virt_addr + (index as u64) * (msix_table_entry::SIZE as u64);
         let ctrl_ptr = (entry_addr + msix_table_entry::VECTOR_CONTROL as u64) as *mut u32;
 
-        // SAFETY: 正しくマッピングされた仮想アドレス
+        // SAFETY:
+        // - table_virt_addrはconfigure_msix()でBAR物理アドレスから
+        //   phys_to_virt()を使用して生成された仮想アドレス
+        // - ctrl_ptrは4バイト境界にアライメントされている（PCI仕様）
+        // - インデックスは上記で検証済みでtable_size未満
         unsafe {
             let ctrl = core::ptr::read_volatile(ctrl_ptr);
             core::ptr::write_volatile(ctrl_ptr, ctrl & !msix_vector_control::MASK);
@@ -396,9 +414,9 @@ impl MsixConfig {
 /// # Notes
 /// - vectorsの長さはテーブルサイズ以下である必要があります
 /// - 各ベクタ番号は32-239の範囲内である必要があります
-/// - テーブルのマッピングにはKERNEL_VIRTUAL_BASEを使用した直接マッピングを使用します
+/// - テーブルのマッピングにはphys_to_virtを使用した直接マッピングを使用します
 pub fn configure_msix(device: &PciDevice, vectors: &[u8]) -> Result<MsixConfig, MsiError> {
-    use crate::paging::KERNEL_VIRTUAL_BASE;
+    use crate::paging::phys_to_virt;
 
     // MSI-X Capabilityを検出
     let capability = detect_msix(device).ok_or(MsiError::NotSupported)?;
@@ -410,7 +428,7 @@ pub fn configure_msix(device: &PciDevice, vectors: &[u8]) -> Result<MsixConfig, 
 
     // 各ベクタ番号の検証
     for &v in vectors {
-        if v < 32 || v > 239 {
+        if v < MIN_MSI_VECTOR || v > MAX_MSI_VECTOR {
             return Err(MsiError::InvalidVector);
         }
     }
@@ -424,11 +442,14 @@ pub fn configure_msix(device: &PciDevice, vectors: &[u8]) -> Result<MsixConfig, 
         return Err(MsiError::InvalidBar);
     }
 
-    // テーブルの物理アドレスを計算
-    let table_phys_addr = bar_info.base_address + capability.table_offset as u64;
+    // テーブルの物理アドレスを計算（オーバーフローチェック付き）
+    let table_phys_addr = bar_info
+        .base_address
+        .checked_add(capability.table_offset as u64)
+        .ok_or(MsiError::InvalidBar)?;
 
-    // 仮想アドレスに変換（直接マッピング使用）
-    let table_virt_addr = KERNEL_VIRTUAL_BASE + table_phys_addr;
+    // 仮想アドレスに変換（既存関数を使用）
+    let table_virt_addr = phys_to_virt(table_phys_addr).map_err(|_| MsiError::MappingFailed)?;
 
     let config = MsixConfig::new(capability, table_virt_addr);
 
@@ -437,8 +458,12 @@ pub fn configure_msix(device: &PciDevice, vectors: &[u8]) -> Result<MsixConfig, 
     let func = device.function;
 
     // MSI-Xを一旦無効化
-    let msg_ctrl =
-        PCI_CONFIG.read_u16(bus, dev, func, capability.cap_offset + msix_reg::MESSAGE_CONTROL);
+    let msg_ctrl = PCI_CONFIG.read_u16(
+        bus,
+        dev,
+        func,
+        capability.cap_offset + msix_reg::MESSAGE_CONTROL,
+    );
     PCI_CONFIG.write_u16(
         bus,
         dev,
