@@ -1,4 +1,4 @@
-// スラブアロケータ実装（Linuxスタイル）
+// カーネルアロケータ実装（スラブ + バディ、Linuxスタイル）
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
 use core::ptr::{NonNull, null_mut};
