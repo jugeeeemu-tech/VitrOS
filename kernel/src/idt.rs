@@ -535,7 +535,9 @@ extern "C" fn page_fault_handler_inner(error_code: u64) {
 }
 
 /// IDTエントリを設定
-fn set_idt_entry(vector: u8, handler: usize) {
+///
+/// MSIなど外部モジュールから割り込みハンドラを登録するために公開
+pub fn set_idt_entry(vector: u8, handler: usize) {
     let mut idt = IDT.lock();
 
     // カーネルが高位アドレスでリンクされているため、ハンドラアドレスは既に高位

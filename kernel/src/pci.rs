@@ -15,6 +15,23 @@ const CONFIG_ADDRESS: u16 = 0xCF8;
 /// PCI Configuration Data レジスタ (I/Oポート 0xCFC)
 const CONFIG_DATA: u16 = 0xCFC;
 
+/// PCI Status レジスタオフセット
+const PCI_STATUS: u16 = 0x06;
+
+/// PCI Status: Capabilities List ビット
+const PCI_STATUS_CAP_LIST: u16 = 0x10;
+
+/// PCI Capabilities Pointer レジスタオフセット
+const PCI_CAP_POINTER: u16 = 0x34;
+
+/// PCI Capability ID
+pub mod capability_id {
+    /// MSI (Message Signaled Interrupt)
+    pub const MSI: u8 = 0x05;
+    /// MSI-X
+    pub const MSIX: u8 = 0x11;
+}
+
 /// MMCONFIG設定
 /// base_address: MCFGテーブルから取得したベースアドレス（0の場合は未設定）
 static MMCONFIG_BASE: AtomicU64 = AtomicU64::new(0);
@@ -35,6 +52,19 @@ pub struct PciDevice {
     pub prog_if: u8,
     pub revision: u8,
     pub header_type: u8,
+}
+
+/// BAR（Base Address Register）情報
+#[derive(Debug, Clone, Copy)]
+pub struct BarInfo {
+    /// ベースアドレス（物理アドレス、下位ビットをマスク済み）
+    pub base_address: u64,
+    /// メモリ空間かどうか（false = I/O空間）
+    pub is_memory: bool,
+    /// 64ビットアドレスか
+    pub is_64bit: bool,
+    /// プリフェッチ可能か
+    pub prefetchable: bool,
 }
 
 impl PciDevice {
@@ -67,6 +97,126 @@ impl PciDevice {
             revision,
             header_type,
         })
+    }
+
+    /// 指定されたCapability IDを持つCapabilityを検索
+    ///
+    /// # Arguments
+    /// * `cap_id` - 検索するCapability ID（例: `capability_id::MSI`）
+    ///
+    /// # Returns
+    /// Capabilityが見つかった場合はそのオフセット、見つからなければNone
+    pub fn find_capability(&self, cap_id: u8) -> Option<u16> {
+        // Statusレジスタを読んでCapabilities Listの有無を確認
+        let status = PCI_CONFIG.read_u16(self.bus, self.device, self.function, PCI_STATUS);
+        if (status & PCI_STATUS_CAP_LIST) == 0 {
+            return None;
+        }
+
+        // Capabilities Pointerを取得（下位2ビットは常に0）
+        let mut cap_ptr =
+            PCI_CONFIG.read_u8(self.bus, self.device, self.function, PCI_CAP_POINTER) & 0xFC;
+
+        // Capabilityリストを辿る（最大48回でループ防止）
+        for _ in 0..48 {
+            if cap_ptr == 0 {
+                break;
+            }
+
+            let cap_header =
+                PCI_CONFIG.read_u16(self.bus, self.device, self.function, cap_ptr as u16);
+            let current_id = (cap_header & 0xFF) as u8;
+            let next_ptr = ((cap_header >> 8) & 0xFC) as u8;
+
+            if current_id == cap_id {
+                return Some(cap_ptr as u16);
+            }
+
+            cap_ptr = next_ptr;
+        }
+
+        None
+    }
+
+    /// デバイスがMSIをサポートしているか確認
+    pub fn supports_msi(&self) -> bool {
+        self.find_capability(capability_id::MSI).is_some()
+    }
+
+    /// デバイスがMSI-Xをサポートしているか確認
+    pub fn supports_msix(&self) -> bool {
+        self.find_capability(capability_id::MSIX).is_some()
+    }
+
+    /// BARを読み取る
+    ///
+    /// # Arguments
+    /// * `bar_index` - BAR番号 (0-5)
+    ///
+    /// # Returns
+    /// BAR情報。BARが未使用または無効な場合はNone
+    ///
+    /// # Notes
+    /// 64ビットBARの場合、bar_indexは下位BARを指定します。
+    /// 例: BAR0-1が64ビットBARの場合、bar_index=0を指定。
+    pub fn read_bar(&self, bar_index: u8) -> Option<BarInfo> {
+        // Type 0ヘッダのBAR範囲をチェック
+        if bar_index > 5 {
+            return None;
+        }
+
+        // BARレジスタオフセット: 0x10 + bar_index * 4
+        let bar_offset = 0x10 + (bar_index as u16) * 4;
+        let bar_value = PCI_CONFIG.read_u32(self.bus, self.device, self.function, bar_offset);
+
+        // BAR値が0なら未使用
+        if bar_value == 0 {
+            return None;
+        }
+
+        // ビット0: 0=メモリ空間, 1=I/O空間
+        let is_memory = (bar_value & 0x01) == 0;
+
+        if is_memory {
+            // メモリ空間BAR
+            // ビット2-1: タイプ (00=32bit, 10=64bit)
+            // ビット3: プリフェッチ可能
+            let bar_type = (bar_value >> 1) & 0x03;
+            let is_64bit = bar_type == 0x02;
+            let prefetchable = (bar_value & 0x08) != 0;
+
+            let base_address = if is_64bit {
+                // 64ビットBAR: 次のBARと組み合わせる
+                if bar_index > 4 {
+                    // BAR5は64ビットBARになれない
+                    return None;
+                }
+                let bar_upper =
+                    PCI_CONFIG.read_u32(self.bus, self.device, self.function, bar_offset + 4);
+                let low = (bar_value & 0xFFFF_FFF0) as u64;
+                let high = (bar_upper as u64) << 32;
+                high | low
+            } else {
+                // 32ビットBAR
+                (bar_value & 0xFFFF_FFF0) as u64
+            };
+
+            Some(BarInfo {
+                base_address,
+                is_memory: true,
+                is_64bit,
+                prefetchable,
+            })
+        } else {
+            // I/O空間BAR
+            let base_address = (bar_value & 0xFFFF_FFFC) as u64;
+            Some(BarInfo {
+                base_address,
+                is_memory: false,
+                is_64bit: false,
+                prefetchable: false,
+            })
+        }
     }
 
     /// デバイスのクラス名を取得
