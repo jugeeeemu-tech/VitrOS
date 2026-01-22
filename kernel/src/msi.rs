@@ -74,19 +74,25 @@ const MIN_MSI_VECTOR: u8 = 32;
 /// MSI/MSI-Xで使用可能なベクタの最大値
 const MAX_MSI_VECTOR: u8 = 239;
 
+/// PCI Command Registerオフセット
+const PCI_COMMAND: u16 = 0x04;
+
+/// PCI Command Register: Interrupt Disable ビット
+const PCI_COMMAND_INTX_DISABLE: u16 = 1 << 10;
+
 /// MSI/MSI-X設定時のエラー
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MsiError {
     /// デバイスがMSI/MSI-Xをサポートしていない
     NotSupported,
     /// 無効なベクタ番号（32-239の範囲外）
-    InvalidVector,
+    InvalidVector { vector: u8 },
     /// 無効なエントリインデックス（MSI-X）
-    InvalidEntry,
+    InvalidEntry { index: u16, table_size: u16 },
     /// BAR読み取り失敗（MSI-X）
-    InvalidBar,
+    InvalidBar { bar_index: u8 },
     /// 要求されたベクタ数がテーブルサイズを超過（MSI-X）
-    TooManyVectors,
+    TooManyVectors { requested: usize, available: u16 },
     /// MMIOマッピング失敗（MSI-X）
     MappingFailed,
 }
@@ -135,7 +141,7 @@ pub struct MsixCapability {
 pub fn configure_msi(device: &PciDevice, vector: u8) -> Result<MsiConfig, MsiError> {
     // ベクタ番号の検証
     if vector < MIN_MSI_VECTOR || vector > MAX_MSI_VECTOR {
-        return Err(MsiError::InvalidVector);
+        return Err(MsiError::InvalidVector { vector });
     }
 
     // MSI Capabilityを検索
@@ -194,6 +200,16 @@ pub fn configure_msi(device: &PciDevice, vector: u8) -> Result<MsiConfig, MsiErr
         msg_ctrl | message_control::ENABLE,
     );
 
+    // INTx割り込みを無効化（MSI使用時は不要）
+    let command = PCI_CONFIG.read_u16(bus, dev, func, PCI_COMMAND);
+    PCI_CONFIG.write_u16(
+        bus,
+        dev,
+        func,
+        PCI_COMMAND,
+        command | PCI_COMMAND_INTX_DISABLE,
+    );
+
     Ok(MsiConfig { vector, cap_offset })
 }
 
@@ -221,6 +237,16 @@ pub fn disable_msi(device: &PciDevice) -> Result<(), MsiError> {
         func,
         cap_offset + msi_reg::MESSAGE_CONTROL,
         msg_ctrl & !message_control::ENABLE,
+    );
+
+    // INTx割り込みを再有効化
+    let command = PCI_CONFIG.read_u16(bus, dev, func, PCI_COMMAND);
+    PCI_CONFIG.write_u16(
+        bus,
+        dev,
+        func,
+        PCI_COMMAND,
+        command & !PCI_COMMAND_INTX_DISABLE,
     );
 
     Ok(())
@@ -310,12 +336,15 @@ impl MsixConfig {
     pub fn configure_entry(&self, index: u16, vector: u8) -> Result<(), MsiError> {
         // インデックスの検証
         if index >= self.capability.table_size {
-            return Err(MsiError::InvalidEntry);
+            return Err(MsiError::InvalidEntry {
+                index,
+                table_size: self.capability.table_size,
+            });
         }
 
         // ベクタ番号の検証
         if vector < MIN_MSI_VECTOR || vector > MAX_MSI_VECTOR {
-            return Err(MsiError::InvalidVector);
+            return Err(MsiError::InvalidVector { vector });
         }
 
         // エントリのアドレスを計算
@@ -350,7 +379,10 @@ impl MsixConfig {
     /// * `index` - エントリインデックス
     pub fn mask_entry(&self, index: u16) -> Result<(), MsiError> {
         if index >= self.capability.table_size {
-            return Err(MsiError::InvalidEntry);
+            return Err(MsiError::InvalidEntry {
+                index,
+                table_size: self.capability.table_size,
+            });
         }
 
         let entry_addr = self.table_virt_addr + (index as u64) * (msix_table_entry::SIZE as u64);
@@ -375,7 +407,10 @@ impl MsixConfig {
     /// * `index` - エントリインデックス
     pub fn unmask_entry(&self, index: u16) -> Result<(), MsiError> {
         if index >= self.capability.table_size {
-            return Err(MsiError::InvalidEntry);
+            return Err(MsiError::InvalidEntry {
+                index,
+                table_size: self.capability.table_size,
+            });
         }
 
         let entry_addr = self.table_virt_addr + (index as u64) * (msix_table_entry::SIZE as u64);
@@ -423,30 +458,39 @@ pub fn configure_msix(device: &PciDevice, vectors: &[u8]) -> Result<MsixConfig, 
 
     // ベクタ数の検証
     if vectors.len() > capability.table_size as usize {
-        return Err(MsiError::TooManyVectors);
+        return Err(MsiError::TooManyVectors {
+            requested: vectors.len(),
+            available: capability.table_size,
+        });
     }
 
     // 各ベクタ番号の検証
     for &v in vectors {
         if v < MIN_MSI_VECTOR || v > MAX_MSI_VECTOR {
-            return Err(MsiError::InvalidVector);
+            return Err(MsiError::InvalidVector { vector: v });
         }
     }
 
     // BARからテーブルの物理アドレスを取得
     let bar_info = device
         .read_bar(capability.table_bir)
-        .ok_or(MsiError::InvalidBar)?;
+        .ok_or(MsiError::InvalidBar {
+            bar_index: capability.table_bir,
+        })?;
 
     if !bar_info.is_memory {
-        return Err(MsiError::InvalidBar);
+        return Err(MsiError::InvalidBar {
+            bar_index: capability.table_bir,
+        });
     }
 
     // テーブルの物理アドレスを計算（オーバーフローチェック付き）
     let table_phys_addr = bar_info
         .base_address
         .checked_add(capability.table_offset as u64)
-        .ok_or(MsiError::InvalidBar)?;
+        .ok_or(MsiError::InvalidBar {
+            bar_index: capability.table_bir,
+        })?;
 
     // 仮想アドレスに変換（既存関数を使用）
     let table_virt_addr = phys_to_virt(table_phys_addr).map_err(|_| MsiError::MappingFailed)?;
@@ -494,6 +538,16 @@ pub fn configure_msix(device: &PciDevice, vectors: &[u8]) -> Result<MsixConfig, 
         msg_ctrl | msix_message_control::ENABLE,
     );
 
+    // INTx割り込みを無効化（MSI-X使用時は不要）
+    let command = PCI_CONFIG.read_u16(bus, dev, func, PCI_COMMAND);
+    PCI_CONFIG.write_u16(
+        bus,
+        dev,
+        func,
+        PCI_COMMAND,
+        command | PCI_COMMAND_INTX_DISABLE,
+    );
+
     Ok(config)
 }
 
@@ -521,6 +575,16 @@ pub fn disable_msix(device: &PciDevice) -> Result<(), MsiError> {
         func,
         cap_offset + msix_reg::MESSAGE_CONTROL,
         msg_ctrl & !msix_message_control::ENABLE,
+    );
+
+    // INTx割り込みを再有効化
+    let command = PCI_CONFIG.read_u16(bus, dev, func, PCI_COMMAND);
+    PCI_CONFIG.write_u16(
+        bus,
+        dev,
+        func,
+        PCI_COMMAND,
+        command & !PCI_COMMAND_INTX_DISABLE,
     );
 
     Ok(())
