@@ -109,6 +109,12 @@ impl BuddyAllocator {
     // =========================================================================
 
     /// フリーリストの先頭にブロックを追加
+    ///
+    /// # Safety
+    /// - `addr`は有効なメモリアドレスで、MIN_BLOCK_SIZE以上のサイズを持つこと
+    /// - `addr`はBuddyFreeNodeのアライメント要件を満たすこと
+    /// - `addr`は他のフリーリストに含まれていないこと
+    /// - `order`は0..MAX_ORDERの範囲内であること
     unsafe fn add_to_free_list(&self, addr: usize, order: usize) {
         let node = addr as *mut BuddyFreeNode;
         let free_list = &mut *self.free_lists[order].get();
@@ -126,6 +132,10 @@ impl BuddyAllocator {
     }
 
     /// フリーリストの先頭からブロックを取り出し
+    ///
+    /// # Safety
+    /// - `order`は0..MAX_ORDERの範囲内であること
+    /// - フリーリスト内のノードは全て有効なポインタであること
     unsafe fn remove_from_free_list(&self, order: usize) -> Option<NonNull<BuddyFreeNode>> {
         let free_list = &mut *self.free_lists[order].get();
 
@@ -145,6 +155,10 @@ impl BuddyAllocator {
     }
 
     /// 指定したアドレスのノードをフリーリストから削除（O(1)）
+    ///
+    /// # Safety
+    /// - `addr`はこのorder用フリーリストに含まれていること
+    /// - `order`は0..MAX_ORDERの範囲内であること
     unsafe fn remove_node_from_free_list(&self, addr: usize, order: usize) {
         let node = addr as *mut BuddyFreeNode;
         let free_list = &mut *self.free_lists[order].get();
@@ -167,6 +181,10 @@ impl BuddyAllocator {
     }
 
     /// 指定したアドレスがフリーリストに存在するかチェック
+    ///
+    /// # Safety
+    /// - `order`は0..MAX_ORDERの範囲内であること
+    /// - フリーリスト内のノードは全て有効なポインタであること
     ///
     /// # Performance
     /// この関数はO(n)の線形探索を行う。deallocate時のバディ結合で呼び出されるため、
