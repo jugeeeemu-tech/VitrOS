@@ -552,7 +552,11 @@ unsafe impl GlobalAlloc for KernelAllocator {
     }
 }
 
-// Sync を実装（グローバルで使用するため）
+// SAFETY: KernelAllocatorは以下の理由でSyncを安全に実装できる:
+// 1. シングルコアシステムであり、真の並行アクセスは発生しない
+// 2. allocate/deallocateはwithout_interrupts()で保護されており、
+//    割り込みコンテキストからの再入を防いでいる
+// 3. initは起動時に一度だけ呼び出される（シングルスレッド環境）
 unsafe impl Sync for KernelAllocator {}
 
 // アドレスをアラインメントに合わせて切り上げ
