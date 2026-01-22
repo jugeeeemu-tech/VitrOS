@@ -13,7 +13,7 @@ pub const KERNEL_VIRTUAL_BASE: u64 = 0xFFFF_8000_0000_0000;
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PagingError {
-    /// 無効なアドレス（null、範囲外など）
+    /// 無効なアドレス（null、アライメント不正など）
     InvalidAddress,
     /// アドレス変換に失敗
     AddressConversionFailed,
@@ -21,6 +21,10 @@ pub enum PagingError {
     GuardPageSetupFailed,
     /// ページテーブル初期化に失敗
     PageTableInitFailed,
+    /// アドレスがサポート範囲外
+    AddressOutOfRange,
+    /// CPU機能がサポートされていない
+    FeatureNotSupported,
 }
 
 impl core::fmt::Display for PagingError {
@@ -30,6 +34,8 @@ impl core::fmt::Display for PagingError {
             PagingError::AddressConversionFailed => write!(f, "Address conversion failed"),
             PagingError::GuardPageSetupFailed => write!(f, "Guard page setup failed"),
             PagingError::PageTableInitFailed => write!(f, "Page table initialization failed"),
+            PagingError::AddressOutOfRange => write!(f, "Address out of supported range"),
+            PagingError::FeatureNotSupported => write!(f, "CPU feature not supported"),
         }
     }
 }
@@ -45,6 +51,17 @@ pub const HUGE_PAGE_SIZE_2MB: usize = 2 * 1024 * 1024;
 
 /// 1GBヒュージページサイズ
 pub const HUGE_PAGE_SIZE_1GB: usize = 1024 * 1024 * 1024;
+
+/// カーネル物理アドレス開始位置（2MB境界）
+///
+/// **重要**: この値は`kernel/linker.ld`の`KERNEL_LMA`と一致させること。
+/// カーネルが2MB境界に配置されることで、単一のヒュージページでマッピング可能。
+const KERNEL_HUGE_PAGE_START: u64 = 0x200000;
+
+/// カーネルヒュージページ領域の終了アドレス
+///
+/// カーネルサイズが2MBを超える場合は、この値を拡張する必要がある。
+const KERNEL_HUGE_PAGE_END: u64 = KERNEL_HUGE_PAGE_START + HUGE_PAGE_SIZE_2MB as u64;
 
 /// 2MBヒュージページのオフセットマスク（下位21ビット）
 const HUGE_PAGE_2MB_OFFSET_MASK: u64 = 0x1F_FFFF;
@@ -736,15 +753,15 @@ pub fn map_mmio(phys_addr: u64, size: u64) -> Result<u64, PagingError> {
 ///
 /// # Arguments
 /// * `phys_addr` - マッピングする物理アドレス（2MB境界にアライメントされている必要がある）
+/// * `additional_flags` - 追加のページテーブルフラグ（例: CacheDisable）
 ///
 /// # Returns
 /// マッピングされた仮想アドレス、またはエラー
 ///
 /// # Errors
 /// * `PagingError::InvalidAddress` - アドレスが2MB境界にアライメントされていない場合
-/// * `PagingError::PageTableInitFailed` - ページテーブルのインデックスが範囲外の場合
-#[allow(dead_code)]
-pub fn map_huge_2mb(phys_addr: u64) -> Result<u64, PagingError> {
+/// * `PagingError::AddressOutOfRange` - ページテーブルのインデックスが範囲外の場合
+pub fn map_huge_2mb(phys_addr: u64, additional_flags: u64) -> Result<u64, PagingError> {
     use crate::info;
 
     // 割り込みが無効であることを確認
@@ -762,13 +779,14 @@ pub fn map_huge_2mb(phys_addr: u64) -> Result<u64, PagingError> {
 
     // インデックスの範囲検証
     if pd_array_idx >= MAX_SUPPORTED_MEMORY_GB {
-        return Err(PagingError::PageTableInitFailed);
+        return Err(PagingError::AddressOutOfRange);
     }
 
-    // HugePageフラグ: Present | Writable | HugePage
+    // HugePageフラグ: Present | Writable | HugePage + 追加フラグ
     let huge_flags = PageTableFlags::Present as u64
         | PageTableFlags::Writable as u64
-        | PageTableFlags::HugePage as u64;
+        | PageTableFlags::HugePage as u64
+        | additional_flags;
 
     unsafe {
         let pd_high = addr_of_mut!(KERNEL_PD_HIGH);
@@ -808,7 +826,7 @@ pub fn map_huge_2mb(phys_addr: u64) -> Result<u64, PagingError> {
 ///
 /// # Errors
 /// * `PagingError::InvalidAddress` - アドレスが2MB境界にアライメントされていない場合
-/// * `PagingError::PageTableInitFailed` - ページテーブルのインデックスが範囲外の場合
+/// * `PagingError::AddressOutOfRange` - ページテーブルのインデックスが範囲外の場合
 #[allow(dead_code)]
 pub fn unmap_huge_2mb(phys_addr: u64) -> Result<(), PagingError> {
     use crate::info;
@@ -828,7 +846,7 @@ pub fn unmap_huge_2mb(phys_addr: u64) -> Result<(), PagingError> {
 
     // インデックスの範囲検証
     if pd_array_idx >= MAX_SUPPORTED_MEMORY_GB {
-        return Err(PagingError::PageTableInitFailed);
+        return Err(PagingError::AddressOutOfRange);
     }
 
     unsafe {
@@ -849,6 +867,26 @@ pub fn unmap_huge_2mb(phys_addr: u64) -> Result<(), PagingError> {
 // =============================================================================
 // 1GB ヒュージページ マッピング関連
 // =============================================================================
+
+/// 1GBヒュージページがサポートされているか確認
+///
+/// CPUID.80000001H:EDX\[bit 26\] (Page1GB) で確認
+fn supports_1gb_pages() -> bool {
+    let edx: u32;
+    unsafe {
+        // rbxはLLVMが使用するため、push/popで保存・復元する
+        core::arch::asm!(
+            "push rbx",
+            "cpuid",
+            "pop rbx",
+            inout("eax") 0x80000001u32 => _,
+            out("ecx") _,
+            lateout("edx") edx,
+            options(nomem, nostack),
+        );
+    }
+    (edx & (1 << 26)) != 0
+}
 
 /// 1GBヒュージページをマッピングする
 ///
@@ -871,7 +909,8 @@ pub fn unmap_huge_2mb(phys_addr: u64) -> Result<(), PagingError> {
 ///
 /// # Errors
 /// * `PagingError::InvalidAddress` - アドレスが1GB境界にアライメントされていない場合
-/// * `PagingError::PageTableInitFailed` - ページテーブルのインデックスが範囲外の場合
+/// * `PagingError::AddressOutOfRange` - ページテーブルのインデックスが範囲外の場合
+/// * `PagingError::FeatureNotSupported` - CPUが1GBヒュージページをサポートしていない場合
 #[allow(dead_code)]
 pub fn map_huge_1gb(phys_addr: u64) -> Result<u64, PagingError> {
     use crate::info;
@@ -884,12 +923,17 @@ pub fn map_huge_1gb(phys_addr: u64) -> Result<u64, PagingError> {
         return Err(PagingError::InvalidAddress);
     }
 
+    // 1GBヒュージページのCPUサポートチェック
+    if !supports_1gb_pages() {
+        return Err(PagingError::FeatureNotSupported);
+    }
+
     // PDPインデックスを計算（1GB単位）
     let pdp_entry_idx = (phys_addr / HUGE_PAGE_SIZE_1GB as u64) as usize;
 
     // インデックスの範囲検証（MAX_SUPPORTED_MEMORY_GB個のエントリまで）
     if pdp_entry_idx >= MAX_SUPPORTED_MEMORY_GB {
-        return Err(PagingError::PageTableInitFailed);
+        return Err(PagingError::AddressOutOfRange);
     }
 
     // HugePageフラグ: Present | Writable | HugePage
@@ -933,7 +977,7 @@ pub fn map_huge_1gb(phys_addr: u64) -> Result<u64, PagingError> {
 ///
 /// # Errors
 /// * `PagingError::InvalidAddress` - アドレスが1GB境界にアライメントされていない場合
-/// * `PagingError::PageTableInitFailed` - ページテーブルのインデックスが範囲外の場合
+/// * `PagingError::AddressOutOfRange` - ページテーブルのインデックスが範囲外の場合
 #[allow(dead_code)]
 pub fn unmap_huge_1gb(phys_addr: u64) -> Result<(), PagingError> {
     use crate::info;
@@ -951,7 +995,7 @@ pub fn unmap_huge_1gb(phys_addr: u64) -> Result<(), PagingError> {
 
     // インデックスの範囲検証
     if pdp_entry_idx >= MAX_SUPPORTED_MEMORY_GB {
-        return Err(PagingError::PageTableInitFailed);
+        return Err(PagingError::AddressOutOfRange);
     }
 
     unsafe {
@@ -968,14 +1012,6 @@ pub fn unmap_huge_1gb(phys_addr: u64) -> Result<(), PagingError> {
 
     Ok(())
 }
-
-/// カーネル物理アドレス開始位置（2MB境界）
-/// init()内でヒュージページマッピングに使用
-const KERNEL_HUGE_PAGE_START: u64 = 0x200000;
-
-/// カーネルヒュージページ領域の終了アドレス（2MB境界）
-/// 最初の2MBヒュージページ領域のみ予約
-const KERNEL_HUGE_PAGE_END: u64 = 0x400000;
 
 // =============================================================================
 // フレームバッファ ヒュージページ設定
@@ -1025,10 +1061,10 @@ pub fn map_framebuffer_huge(fb_base: u64, fb_size: u64) -> Result<u64, PagingErr
         huge_page_count, fb_base, fb_size
     );
 
-    // 各2MBページをマッピング
+    // 各2MBページをマッピング（MMIO領域のためCacheDisableフラグを設定）
     for i in 0..huge_page_count {
         let page_addr = fb_base + (i as u64 * HUGE_PAGE_SIZE_2MB as u64);
-        map_huge_2mb(page_addr)?;
+        map_huge_2mb(page_addr, PageTableFlags::CacheDisable as u64)?;
     }
 
     info!("Framebuffer huge page mapping complete");
