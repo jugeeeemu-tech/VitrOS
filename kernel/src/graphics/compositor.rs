@@ -431,4 +431,3 @@ pub extern "C" fn compositor_task() -> ! {
         crate::sched::sleep_ms(16);
     }
 }
-
