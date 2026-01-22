@@ -70,8 +70,7 @@ impl BuddyAllocator {
 
     /// バディ領域の開始アドレスを取得
     ///
-    /// # Safety
-    /// 内部でUnsafeCellを読み取る。シングルコアシステムでの使用を前提とする。
+    /// シングルコアシステムでの使用を前提とする。
     pub fn region_start(&self) -> usize {
         // SAFETY: シングルコアシステムのため、データ競合は発生しない
         unsafe { *self.region_start.get() }
