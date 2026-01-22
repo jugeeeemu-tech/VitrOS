@@ -280,6 +280,10 @@ impl BuddyAllocator {
     }
 
     /// 指定オーダーのフリーブロック数をカウント（デバッグ用）
+    ///
+    /// # Safety
+    /// - `order`は0..MAX_ORDERの範囲内であること
+    /// - フリーリスト内のノードは全て有効なポインタであること
     unsafe fn count_free_blocks(&self, order: usize) -> usize {
         let mut count = 0;
         let free_list = *self.free_lists[order].get();
