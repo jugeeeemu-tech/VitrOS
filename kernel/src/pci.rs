@@ -15,6 +15,23 @@ const CONFIG_ADDRESS: u16 = 0xCF8;
 /// PCI Configuration Data レジスタ (I/Oポート 0xCFC)
 const CONFIG_DATA: u16 = 0xCFC;
 
+/// PCI Status レジスタオフセット
+const PCI_STATUS: u16 = 0x06;
+
+/// PCI Status: Capabilities List ビット
+const PCI_STATUS_CAP_LIST: u16 = 0x10;
+
+/// PCI Capabilities Pointer レジスタオフセット
+const PCI_CAP_POINTER: u16 = 0x34;
+
+/// PCI Capability ID
+pub mod capability_id {
+    /// MSI (Message Signaled Interrupt)
+    pub const MSI: u8 = 0x05;
+    /// MSI-X
+    pub const MSIX: u8 = 0x11;
+}
+
 /// MMCONFIG設定
 /// base_address: MCFGテーブルから取得したベースアドレス（0の場合は未設定）
 static MMCONFIG_BASE: AtomicU64 = AtomicU64::new(0);
@@ -67,6 +84,50 @@ impl PciDevice {
             revision,
             header_type,
         })
+    }
+
+    /// 指定されたCapability IDを持つCapabilityを検索
+    ///
+    /// # Arguments
+    /// * `cap_id` - 検索するCapability ID（例: `capability_id::MSI`）
+    ///
+    /// # Returns
+    /// Capabilityが見つかった場合はそのオフセット、見つからなければNone
+    pub fn find_capability(&self, cap_id: u8) -> Option<u16> {
+        // Statusレジスタを読んでCapabilities Listの有無を確認
+        let status = PCI_CONFIG.read_u16(self.bus, self.device, self.function, PCI_STATUS);
+        if (status & PCI_STATUS_CAP_LIST) == 0 {
+            return None;
+        }
+
+        // Capabilities Pointerを取得（下位2ビットは常に0）
+        let mut cap_ptr =
+            PCI_CONFIG.read_u8(self.bus, self.device, self.function, PCI_CAP_POINTER) & 0xFC;
+
+        // Capabilityリストを辿る（最大48回でループ防止）
+        for _ in 0..48 {
+            if cap_ptr == 0 {
+                break;
+            }
+
+            let cap_header =
+                PCI_CONFIG.read_u16(self.bus, self.device, self.function, cap_ptr as u16);
+            let current_id = (cap_header & 0xFF) as u8;
+            let next_ptr = ((cap_header >> 8) & 0xFC) as u8;
+
+            if current_id == cap_id {
+                return Some(cap_ptr as u16);
+            }
+
+            cap_ptr = next_ptr;
+        }
+
+        None
+    }
+
+    /// デバイスがMSIをサポートしているか確認
+    pub fn supports_msi(&self) -> bool {
+        self.find_capability(capability_id::MSI).is_some()
     }
 
     /// デバイスのクラス名を取得

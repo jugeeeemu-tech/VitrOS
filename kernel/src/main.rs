@@ -17,6 +17,7 @@ mod hpet;
 mod idt;
 mod io;
 mod msr;
+mod msi;
 mod mtrr;
 mod paging;
 mod pci;
