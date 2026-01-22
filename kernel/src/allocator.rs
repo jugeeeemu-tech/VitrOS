@@ -10,6 +10,9 @@ use crate::io::without_interrupts;
 pub const SIZE_CLASSES: &[usize] = &[8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096];
 const NUM_SIZE_CLASSES: usize = SIZE_CLASSES.len();
 
+/// MIN_SLAB_SIZEのlog2（8 = 2^3）
+const MIN_SLAB_SIZE_LOG2: u32 = 3;
+
 // =============================================================================
 // バディアロケータ
 // =============================================================================
@@ -531,7 +534,7 @@ impl KernelAllocator {
         // 2のべき乗に切り上げてインデックスを計算
         // 8=2^3がインデックス0なので、ビット位置から3を引く
         let bits = usize::BITS - (size - 1).leading_zeros();
-        let class_idx = bits.saturating_sub(3) as usize;
+        let class_idx = bits.saturating_sub(MIN_SLAB_SIZE_LOG2) as usize;
         Some(class_idx)
     }
 }
