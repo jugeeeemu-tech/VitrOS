@@ -7,6 +7,7 @@ use crate::info;
 use crate::io::without_interrupts;
 
 // サイズクラス（8バイト～4096バイト）
+// 4096Bはスラブの最大サイズ。スラブが枯渇した場合はバディにフォールバック
 pub const SIZE_CLASSES: &[usize] = &[8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096];
 const NUM_SIZE_CLASSES: usize = SIZE_CLASSES.len();
 
@@ -18,12 +19,15 @@ const MIN_SLAB_SIZE_LOG2: u32 = 3;
 // =============================================================================
 
 /// 最小ブロックサイズ（4KB = ページサイズ）
+/// スラブの最大サイズと一致。4KB以下はスラブ優先、4KB超はバディのみ
 const MIN_BLOCK_SIZE: usize = 4096;
 
 /// MIN_BLOCK_SIZEのlog2（4096 = 2^12）
 const MIN_BLOCK_SIZE_LOG2: u32 = 12;
 
 /// 最大オーダー数（0〜12の13段階、最大16MB）
+/// NOTE: この値を変更した場合、BuddyAllocator::new()のfree_lists初期化子も更新が必要
+/// （要素数が一致しなければコンパイルエラーになる）
 const MAX_ORDER: usize = 13;
 
 /// フリーブロックノード（双方向リンクリスト）
@@ -100,9 +104,7 @@ impl BuddyAllocator {
 
     /// バディアドレスを計算（XOR演算）
     ///
-    /// # Safety
-    /// - `addr`は`region_start`以上であること
-    /// - `addr`はバディ領域内の有効なアドレスであること
+    /// 内部専用関数。`addr`は`region_start`以上かつバディ領域内であること。
     #[inline]
     fn buddy_address(&self, addr: usize, order: usize) -> usize {
         let region_start = unsafe { *self.region_start.get() };
