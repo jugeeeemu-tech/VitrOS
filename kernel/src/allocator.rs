@@ -17,6 +17,9 @@ const NUM_SIZE_CLASSES: usize = SIZE_CLASSES.len();
 /// 最小ブロックサイズ（4KB = ページサイズ）
 const MIN_BLOCK_SIZE: usize = 4096;
 
+/// MIN_BLOCK_SIZEのlog2（4096 = 2^12）
+const MIN_BLOCK_SIZE_LOG2: u32 = 12;
+
 /// 最大オーダー数（0〜12の13段階、最大16MB）
 const MAX_ORDER: usize = 13;
 
@@ -76,8 +79,8 @@ impl BuddyAllocator {
         }
         // 2のべき乗に切り上げ
         let bits = usize::BITS - (size - 1).leading_zeros();
-        // MIN_BLOCK_SIZE = 4096 = 2^12 なので12を引く
-        bits.saturating_sub(12) as usize
+        // MIN_BLOCK_SIZE = 4096 = 2^12 なのでMIN_BLOCK_SIZE_LOG2を引く
+        bits.saturating_sub(MIN_BLOCK_SIZE_LOG2) as usize
     }
 
     /// サイズに収まる最大オーダーを計算（初期化用）
@@ -88,8 +91,8 @@ impl BuddyAllocator {
         }
         // 2のべき乗に切り下げ
         let bits = usize::BITS - 1 - size.leading_zeros();
-        // MIN_BLOCK_SIZE = 4096 = 2^12 なので12を引く
-        bits.saturating_sub(12) as usize
+        // MIN_BLOCK_SIZE = 4096 = 2^12 なのでMIN_BLOCK_SIZE_LOG2を引く
+        bits.saturating_sub(MIN_BLOCK_SIZE_LOG2) as usize
     }
 
     /// バディアドレスを計算（XOR演算）
@@ -219,7 +222,7 @@ impl BuddyAllocator {
             let max_order_by_align = if relative == 0 {
                 MAX_ORDER - 1
             } else {
-                (relative.trailing_zeros() as usize).saturating_sub(12)
+                (relative.trailing_zeros()).saturating_sub(MIN_BLOCK_SIZE_LOG2) as usize
             };
 
             let order = max_order_by_size.min(max_order_by_align);
