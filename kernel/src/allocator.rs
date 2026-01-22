@@ -96,9 +96,14 @@ impl BuddyAllocator {
     }
 
     /// バディアドレスを計算（XOR演算）
+    ///
+    /// # Safety
+    /// - `addr`は`region_start`以上であること
+    /// - `addr`はバディ領域内の有効なアドレスであること
     #[inline]
     fn buddy_address(&self, addr: usize, order: usize) -> usize {
         let region_start = unsafe { *self.region_start.get() };
+        debug_assert!(addr >= region_start, "addr must be >= region_start");
         let relative = addr - region_start;
         let buddy_relative = relative ^ Self::order_to_size(order);
         region_start + buddy_relative
