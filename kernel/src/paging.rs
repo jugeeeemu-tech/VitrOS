@@ -40,6 +40,18 @@ const PAGE_TABLE_ENTRY_COUNT: usize = 512;
 /// ページサイズ（4KB）
 pub const PAGE_SIZE: usize = 4096;
 
+/// 2MBヒュージページサイズ
+pub const HUGE_PAGE_SIZE_2MB: usize = 2 * 1024 * 1024;
+
+/// 1GBヒュージページサイズ
+pub const HUGE_PAGE_SIZE_1GB: usize = 1024 * 1024 * 1024;
+
+/// 2MBヒュージページのオフセットマスク（下位21ビット）
+const HUGE_PAGE_2MB_OFFSET_MASK: u64 = 0x1F_FFFF;
+
+/// 1GBヒュージページのオフセットマスク（下位30ビット）
+const HUGE_PAGE_1GB_OFFSET_MASK: u64 = 0x3FFF_FFFF;
+
 /// 1つのPage Tableがカバーする領域サイズ（2MB = 512 * 4KB）
 const PAGE_TABLE_COVERAGE: u64 = (PAGE_TABLE_ENTRY_COUNT * PAGE_SIZE) as u64;
 
@@ -53,6 +65,18 @@ const PHYSICAL_ADDRESS_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 /// カーネル空間のPML4エントリインデックス (0xFFFF_8000_0000_0000に対応)
 /// x86_64では仮想アドレスのビット47:39がPML4インデックスとなる
 const PML4_KERNEL_INDEX: usize = 256;
+
+/// アドレスが2MB境界にアライメントされているかチェック
+#[inline]
+pub fn is_2mb_aligned(addr: u64) -> bool {
+    addr & HUGE_PAGE_2MB_OFFSET_MASK == 0
+}
+
+/// アドレスが1GB境界にアライメントされているかチェック
+#[inline]
+pub fn is_1gb_aligned(addr: u64) -> bool {
+    addr & HUGE_PAGE_1GB_OFFSET_MASK == 0
+}
 
 /// 物理アドレスを仮想アドレスに変換
 ///
@@ -653,4 +677,256 @@ pub fn map_mmio(phys_addr: u64, size: u64) -> Result<u64, PagingError> {
     );
 
     Ok(virt_addr)
+}
+
+// =============================================================================
+// 2MB ヒュージページ マッピング関連
+// =============================================================================
+
+/// 2MBヒュージページをマッピングする
+///
+/// PDレベルでHugePageフラグを設定し、2MBの連続した物理メモリを
+/// 単一のページテーブルエントリでマッピングする。
+///
+/// # Safety Preconditions
+/// * この関数はシングルコア環境または割り込み無効状態で呼び出すこと
+/// * 同じ仮想アドレス範囲に4KBページが既にマッピングされている場合、
+///   そのPTエントリは無効化されないため、先にunmapする必要がある
+///
+/// # TODO: マルチコア対応
+/// マルチコア環境ではspinlockまたはmutexによる排他制御が必要。
+///
+/// # Arguments
+/// * `phys_addr` - マッピングする物理アドレス（2MB境界にアライメントされている必要がある）
+///
+/// # Returns
+/// マッピングされた仮想アドレス、またはエラー
+///
+/// # Errors
+/// * `PagingError::InvalidAddress` - アドレスが2MB境界にアライメントされていない場合
+/// * `PagingError::PageTableInitFailed` - ページテーブルのインデックスが範囲外の場合
+#[allow(dead_code)]
+pub fn map_huge_2mb(phys_addr: u64) -> Result<u64, PagingError> {
+    use crate::info;
+
+    // 割り込みが無効であることを確認
+    assert_interrupts_disabled("map_huge_2mb");
+
+    // 2MB境界アライメントチェック
+    if !is_2mb_aligned(phys_addr) {
+        return Err(PagingError::InvalidAddress);
+    }
+
+    // PDインデックスを計算（2MB単位）
+    let pd_global_idx = (phys_addr / HUGE_PAGE_SIZE_2MB as u64) as usize;
+    let pd_array_idx = pd_global_idx / PAGE_TABLE_ENTRY_COUNT; // KERNEL_PD_HIGH配列のインデックス
+    let pd_entry_idx = pd_global_idx % PAGE_TABLE_ENTRY_COUNT; // PD内のエントリインデックス
+
+    // インデックスの範囲検証
+    if pd_array_idx >= MAX_SUPPORTED_MEMORY_GB {
+        return Err(PagingError::PageTableInitFailed);
+    }
+
+    // HugePageフラグ: Present | Writable | HugePage
+    let huge_flags = PageTableFlags::Present as u64
+        | PageTableFlags::Writable as u64
+        | PageTableFlags::HugePage as u64;
+
+    unsafe {
+        let pd_high = addr_of_mut!(KERNEL_PD_HIGH);
+
+        // PDエントリにHugePageフラグ付きで物理アドレスを設定
+        (*pd_high)[pd_array_idx]
+            .entry(pd_entry_idx)
+            .set(phys_addr, huge_flags);
+
+        // TLBフラッシュ
+        reload_cr3();
+    }
+
+    // 仮想アドレスを計算して返す
+    let virt_addr = phys_to_virt(phys_addr)?;
+
+    info!(
+        "Huge 2MB page mapped: phys=0x{:X} -> virt=0x{:X}",
+        phys_addr, virt_addr
+    );
+
+    Ok(virt_addr)
+}
+
+/// 2MBヒュージページのマッピングを解除する
+///
+/// PDレベルのエントリをクリアし、マッピングを解除する。
+///
+/// # Safety Preconditions
+/// * この関数はシングルコア環境または割り込み無効状態で呼び出すこと
+///
+/// # TODO: マルチコア対応
+/// マルチコア環境ではspinlockまたはmutexによる排他制御が必要。
+///
+/// # Arguments
+/// * `phys_addr` - マッピング解除する物理アドレス（2MB境界にアライメントされている必要がある）
+///
+/// # Errors
+/// * `PagingError::InvalidAddress` - アドレスが2MB境界にアライメントされていない場合
+/// * `PagingError::PageTableInitFailed` - ページテーブルのインデックスが範囲外の場合
+#[allow(dead_code)]
+pub fn unmap_huge_2mb(phys_addr: u64) -> Result<(), PagingError> {
+    use crate::info;
+
+    // 割り込みが無効であることを確認
+    assert_interrupts_disabled("unmap_huge_2mb");
+
+    // 2MB境界アライメントチェック
+    if !is_2mb_aligned(phys_addr) {
+        return Err(PagingError::InvalidAddress);
+    }
+
+    // PDインデックスを計算（2MB単位）
+    let pd_global_idx = (phys_addr / HUGE_PAGE_SIZE_2MB as u64) as usize;
+    let pd_array_idx = pd_global_idx / PAGE_TABLE_ENTRY_COUNT;
+    let pd_entry_idx = pd_global_idx % PAGE_TABLE_ENTRY_COUNT;
+
+    // インデックスの範囲検証
+    if pd_array_idx >= MAX_SUPPORTED_MEMORY_GB {
+        return Err(PagingError::PageTableInitFailed);
+    }
+
+    unsafe {
+        let pd_high = addr_of_mut!(KERNEL_PD_HIGH);
+
+        // PDエントリをクリア（Present=0）
+        (*pd_high)[pd_array_idx].entry(pd_entry_idx).set(0, 0);
+
+        // TLBフラッシュ
+        reload_cr3();
+    }
+
+    info!("Huge 2MB page unmapped: phys=0x{:X}", phys_addr);
+
+    Ok(())
+}
+
+// =============================================================================
+// 1GB ヒュージページ マッピング関連
+// =============================================================================
+
+/// 1GBヒュージページをマッピングする
+///
+/// PDPレベルでHugePageフラグを設定し、1GBの連続した物理メモリを
+/// 単一のページテーブルエントリでマッピングする。
+///
+/// # Safety Preconditions
+/// * この関数はシングルコア環境または割り込み無効状態で呼び出すこと
+/// * 同じ仮想アドレス範囲に2MB/4KBページが既にマッピングされている場合、
+///   そのPD/PTエントリは無効化されないため、先にunmapする必要がある
+///
+/// # TODO: マルチコア対応
+/// マルチコア環境ではspinlockまたはmutexによる排他制御が必要。
+///
+/// # Arguments
+/// * `phys_addr` - マッピングする物理アドレス（1GB境界にアライメントされている必要がある）
+///
+/// # Returns
+/// マッピングされた仮想アドレス、またはエラー
+///
+/// # Errors
+/// * `PagingError::InvalidAddress` - アドレスが1GB境界にアライメントされていない場合
+/// * `PagingError::PageTableInitFailed` - ページテーブルのインデックスが範囲外の場合
+#[allow(dead_code)]
+pub fn map_huge_1gb(phys_addr: u64) -> Result<u64, PagingError> {
+    use crate::info;
+
+    // 割り込みが無効であることを確認
+    assert_interrupts_disabled("map_huge_1gb");
+
+    // 1GB境界アライメントチェック
+    if !is_1gb_aligned(phys_addr) {
+        return Err(PagingError::InvalidAddress);
+    }
+
+    // PDPインデックスを計算（1GB単位）
+    let pdp_entry_idx = (phys_addr / HUGE_PAGE_SIZE_1GB as u64) as usize;
+
+    // インデックスの範囲検証（MAX_SUPPORTED_MEMORY_GB個のエントリまで）
+    if pdp_entry_idx >= MAX_SUPPORTED_MEMORY_GB {
+        return Err(PagingError::PageTableInitFailed);
+    }
+
+    // HugePageフラグ: Present | Writable | HugePage
+    let huge_flags = PageTableFlags::Present as u64
+        | PageTableFlags::Writable as u64
+        | PageTableFlags::HugePage as u64;
+
+    unsafe {
+        let pdp_high = addr_of_mut!(KERNEL_PDP_HIGH);
+
+        // PDPエントリにHugePageフラグ付きで物理アドレスを設定
+        (*pdp_high).entry(pdp_entry_idx).set(phys_addr, huge_flags);
+
+        // TLBフラッシュ
+        reload_cr3();
+    }
+
+    // 仮想アドレスを計算して返す
+    let virt_addr = phys_to_virt(phys_addr)?;
+
+    info!(
+        "Huge 1GB page mapped: phys=0x{:X} -> virt=0x{:X}",
+        phys_addr, virt_addr
+    );
+
+    Ok(virt_addr)
+}
+
+/// 1GBヒュージページのマッピングを解除する
+///
+/// PDPレベルのエントリをクリアし、マッピングを解除する。
+///
+/// # Safety Preconditions
+/// * この関数はシングルコア環境または割り込み無効状態で呼び出すこと
+///
+/// # TODO: マルチコア対応
+/// マルチコア環境ではspinlockまたはmutexによる排他制御が必要。
+///
+/// # Arguments
+/// * `phys_addr` - マッピング解除する物理アドレス（1GB境界にアライメントされている必要がある）
+///
+/// # Errors
+/// * `PagingError::InvalidAddress` - アドレスが1GB境界にアライメントされていない場合
+/// * `PagingError::PageTableInitFailed` - ページテーブルのインデックスが範囲外の場合
+#[allow(dead_code)]
+pub fn unmap_huge_1gb(phys_addr: u64) -> Result<(), PagingError> {
+    use crate::info;
+
+    // 割り込みが無効であることを確認
+    assert_interrupts_disabled("unmap_huge_1gb");
+
+    // 1GB境界アライメントチェック
+    if !is_1gb_aligned(phys_addr) {
+        return Err(PagingError::InvalidAddress);
+    }
+
+    // PDPインデックスを計算（1GB単位）
+    let pdp_entry_idx = (phys_addr / HUGE_PAGE_SIZE_1GB as u64) as usize;
+
+    // インデックスの範囲検証
+    if pdp_entry_idx >= MAX_SUPPORTED_MEMORY_GB {
+        return Err(PagingError::PageTableInitFailed);
+    }
+
+    unsafe {
+        let pdp_high = addr_of_mut!(KERNEL_PDP_HIGH);
+
+        // PDPエントリをクリア（Present=0）
+        (*pdp_high).entry(pdp_entry_idx).set(0, 0);
+
+        // TLBフラッシュ
+        reload_cr3();
+    }
+
+    info!("Huge 1GB page unmapped: phys=0x{:X}", phys_addr);
+
+    Ok(())
 }
