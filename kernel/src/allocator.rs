@@ -68,6 +68,15 @@ impl BuddyAllocator {
         }
     }
 
+    /// バディ領域の開始アドレスを取得
+    ///
+    /// # Safety
+    /// 内部でUnsafeCellを読み取る。シングルコアシステムでの使用を前提とする。
+    pub fn region_start(&self) -> usize {
+        // SAFETY: シングルコアシステムのため、データ競合は発生しない
+        unsafe { *self.region_start.get() }
+    }
+
     // =========================================================================
     // ヘルパー関数
     // =========================================================================
@@ -568,7 +577,7 @@ unsafe impl GlobalAlloc for KernelAllocator {
         }
 
         let ptr_addr = ptr as usize;
-        let buddy_start = unsafe { *self.buddy.region_start.get() };
+        let buddy_start = self.buddy.region_start();
 
         // アドレス範囲で解放先を判断
         // スラブが空でバディにフォールバックした場合も正しく解放できる
