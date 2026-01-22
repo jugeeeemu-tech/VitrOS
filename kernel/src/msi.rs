@@ -80,6 +80,30 @@ const PCI_COMMAND: u16 = 0x04;
 /// PCI Command Register: Interrupt Disable ビット
 const PCI_COMMAND_INTX_DISABLE: u16 = 1 << 10;
 
+/// INTx（レガシーPCI割り込み）を無効化
+fn disable_intx(device: &PciDevice) {
+    let command = PCI_CONFIG.read_u16(device.bus, device.device, device.function, PCI_COMMAND);
+    PCI_CONFIG.write_u16(
+        device.bus,
+        device.device,
+        device.function,
+        PCI_COMMAND,
+        command | PCI_COMMAND_INTX_DISABLE,
+    );
+}
+
+/// INTx（レガシーPCI割り込み）を再有効化
+fn enable_intx(device: &PciDevice) {
+    let command = PCI_CONFIG.read_u16(device.bus, device.device, device.function, PCI_COMMAND);
+    PCI_CONFIG.write_u16(
+        device.bus,
+        device.device,
+        device.function,
+        PCI_COMMAND,
+        command & !PCI_COMMAND_INTX_DISABLE,
+    );
+}
+
 /// MSI/MSI-X設定時のエラー
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MsiError {
@@ -201,14 +225,7 @@ pub fn configure_msi(device: &PciDevice, vector: u8) -> Result<MsiConfig, MsiErr
     );
 
     // INTx割り込みを無効化（MSI使用時は不要）
-    let command = PCI_CONFIG.read_u16(bus, dev, func, PCI_COMMAND);
-    PCI_CONFIG.write_u16(
-        bus,
-        dev,
-        func,
-        PCI_COMMAND,
-        command | PCI_COMMAND_INTX_DISABLE,
-    );
+    disable_intx(device);
 
     Ok(MsiConfig { vector, cap_offset })
 }
@@ -240,14 +257,7 @@ pub fn disable_msi(device: &PciDevice) -> Result<(), MsiError> {
     );
 
     // INTx割り込みを再有効化
-    let command = PCI_CONFIG.read_u16(bus, dev, func, PCI_COMMAND);
-    PCI_CONFIG.write_u16(
-        bus,
-        dev,
-        func,
-        PCI_COMMAND,
-        command & !PCI_COMMAND_INTX_DISABLE,
-    );
+    enable_intx(device);
 
     Ok(())
 }
@@ -539,14 +549,7 @@ pub fn configure_msix(device: &PciDevice, vectors: &[u8]) -> Result<MsixConfig, 
     );
 
     // INTx割り込みを無効化（MSI-X使用時は不要）
-    let command = PCI_CONFIG.read_u16(bus, dev, func, PCI_COMMAND);
-    PCI_CONFIG.write_u16(
-        bus,
-        dev,
-        func,
-        PCI_COMMAND,
-        command | PCI_COMMAND_INTX_DISABLE,
-    );
+    disable_intx(device);
 
     Ok(config)
 }
@@ -578,14 +581,7 @@ pub fn disable_msix(device: &PciDevice) -> Result<(), MsiError> {
     );
 
     // INTx割り込みを再有効化
-    let command = PCI_CONFIG.read_u16(bus, dev, func, PCI_COMMAND);
-    PCI_CONFIG.write_u16(
-        bus,
-        dev,
-        func,
-        PCI_COMMAND,
-        command & !PCI_COMMAND_INTX_DISABLE,
-    );
+    enable_intx(device);
 
     Ok(())
 }
