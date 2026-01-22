@@ -309,7 +309,8 @@ pub fn detect_msix(device: &PciDevice) -> Option<MsixCapability> {
 /// MSI-X設定情報
 ///
 /// MSI-Xテーブルへのアクセスを提供します。
-#[derive(Debug, Clone, Copy)]
+/// MMIOアクセス用構造体のため、意図しない複製を防ぐためClone/Copyは実装しません。
+#[derive(Debug)]
 pub struct MsixConfig {
     /// MSI-X Capability情報
     pub capability: MsixCapability,
