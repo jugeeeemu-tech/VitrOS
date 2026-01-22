@@ -167,6 +167,12 @@ impl BuddyAllocator {
     }
 
     /// 指定したアドレスがフリーリストに存在するかチェック
+    ///
+    /// # Performance
+    /// この関数はO(n)の線形探索を行う。deallocate時のバディ結合で呼び出されるため、
+    /// 大量のフリーブロックがある場合は割り込みレイテンシが増大する可能性がある。
+    ///
+    /// TODO: ビットマップベースの実装でO(1)判定を可能にする (Issue #41)
     unsafe fn is_in_free_list(&self, addr: usize, order: usize) -> bool {
         let free_list = *self.free_lists[order].get();
         let mut current = free_list;
