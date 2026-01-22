@@ -443,7 +443,9 @@ impl MsixConfig {
     /// 全エントリをマスク
     pub fn mask_all(&self) {
         for i in 0..self.capability.table_size {
-            let _ = self.mask_entry(i);
+            // インデックスは必ずtable_size未満なのでエラーは発生しない
+            let result = self.mask_entry(i);
+            debug_assert!(result.is_ok(), "mask_entry failed unexpectedly: {:?}", result);
         }
     }
 }
