@@ -25,12 +25,7 @@ SECTIONS
         __rodata_end = .;
     }
 
-    .eh_frame_hdr ALIGN(4K) : AT(ALIGN(LOADADDR(.rodata) + SIZEOF(.rodata), 4K))
-    {
-        *(.eh_frame_hdr)
-    }
-
-    .data ALIGN(4K) : AT(ALIGN(LOADADDR(.eh_frame_hdr) + SIZEOF(.eh_frame_hdr), 4K))
+    .data ALIGN(4K) : AT(ALIGN(LOADADDR(.rodata) + SIZEOF(.rodata), 4K))
     {
         __data_start = .;
         *(.got)
@@ -48,5 +43,5 @@ SECTIONS
         __bss_end = .;
     }
 
-    /DISCARD/ : { *(.eh_frame) *(.note .note.*) }
+    /DISCARD/ : { *(.eh_frame) *(.eh_frame_hdr) *(.note .note.*) }
 }
