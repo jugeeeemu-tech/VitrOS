@@ -214,6 +214,7 @@ extern "C" fn kernel_main_inner(boot_info_phys_addr: u64) -> ! {
     info!("Running in higher-half (set up by bootloader)");
 
     // カーネル用のページテーブルを作成（UEFIメモリマップに基づいて動的にマッピング）
+    // カーネル領域は2MBヒュージページでマッピングされる
     info!("Creating kernel page tables...");
     paging::init(boot_info).expect("Failed to initialize paging system");
     info!("Kernel page tables created and loaded");
@@ -258,7 +259,7 @@ extern "C" fn kernel_main_inner(boot_info_phys_addr: u64) -> ! {
     mtrr::dump();
 
     // ローカルフレームバッファを初期化
-    // 物理アドレスを高位仮想アドレスに変換
+    // 可能であれば2MBヒュージページでマッピング
     //
     // TODO: フレームバッファにWrite-Combining (WC)を設定してパフォーマンス向上
     // 現状: 0x80000000〜がMTRR=UC → 描画が遅い
@@ -268,8 +269,9 @@ extern "C" fn kernel_main_inner(boot_info_phys_addr: u64) -> ! {
     //   - PAT[1]=WCに書き換え、フレームバッファのPTEでPWT=1,PCD=0設定
     //   - 結果: フレームバッファ=WC、他MMIO=UC
     // See: https://github.com/jugeeeemu-tech/VitrOS/issues/7
-    let fb_virt_base = paging::phys_to_virt(boot_info.framebuffer.base)
-        .expect("Failed to convert framebuffer address");
+    let fb_size = (boot_info.framebuffer.width * boot_info.framebuffer.height * 4) as u64;
+    let fb_virt_base = paging::map_framebuffer_huge(boot_info.framebuffer.base, fb_size)
+        .expect("Failed to map framebuffer");
     let mut fb_writer = FramebufferWriter::new(
         fb_virt_base,
         boot_info.framebuffer.width,
