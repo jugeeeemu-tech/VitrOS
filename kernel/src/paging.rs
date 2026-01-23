@@ -3,11 +3,23 @@
 //! ハイヤーハーフカーネル（高位アドレス空間へのマッピング）をサポート
 
 use core::arch::asm;
-use core::ptr::addr_of_mut;
+use core::ptr::{addr_of, addr_of_mut};
 
 /// ハイヤーハーフカーネルのベースアドレス（上位カノニカルアドレス空間）
 /// x86_64のカノニカルアドレス空間の上位半分の開始位置
 pub const KERNEL_VIRTUAL_BASE: u64 = 0xFFFF_8000_0000_0000;
+
+// リンカスクリプトで定義されたセクション境界シンボル
+unsafe extern "C" {
+    static __text_start: u8;
+    static __text_end: u8;
+    static __rodata_start: u8;
+    static __rodata_end: u8;
+    static __data_start: u8;
+    static __data_end: u8;
+    static __bss_start: u8;
+    static __bss_end: u8;
+}
 
 /// ページング操作のエラー型
 #[allow(dead_code)]
@@ -56,17 +68,6 @@ pub const HUGE_PAGE_SIZE_2MB: usize = 2 * 1024 * 1024;
 
 /// 1GBヒュージページサイズ
 pub const HUGE_PAGE_SIZE_1GB: usize = 1024 * 1024 * 1024;
-
-/// カーネル物理アドレス開始位置（2MB境界）
-///
-/// **重要**: この値は`kernel/linker.ld`の`KERNEL_LMA`と一致させること。
-/// カーネルが2MB境界に配置されることで、単一のヒュージページでマッピング可能。
-const KERNEL_HUGE_PAGE_START: u64 = 0x200000;
-
-/// カーネルヒュージページ領域の終了アドレス
-///
-/// カーネルサイズが2MBを超える場合は、この値を拡張する必要がある。
-const KERNEL_HUGE_PAGE_END: u64 = KERNEL_HUGE_PAGE_START + HUGE_PAGE_SIZE_2MB as u64;
 
 /// 2MBヒュージページのオフセットマスク（下位21ビット）
 const HUGE_PAGE_2MB_OFFSET_MASK: u64 = 0x1F_FFFF;
@@ -503,9 +504,14 @@ pub fn init(boot_info: &vitros_common::boot_info::BootInfo) -> Result<(), Paging
         // === 必要なページのみマッピング（高位のみ）===
         // MMIO領域とカーネル領域はスキップ
         // - MMIO領域: 後でmap_mmio()でUC属性でマッピング
-        // - カーネル領域: 後でsetup_kernel_huge_pages()で2MBヒュージページとしてマッピング
+        // - カーネル領域: この後セクション毎に適切なフラグでマッピング
         let mut skipped_mmio_pages = 0usize;
         let mut skipped_kernel_pages = 0usize;
+
+        // カーネルセクション境界を取得（仮想アドレス→物理アドレス変換）
+        let kernel_text_start = virt_to_phys(addr_of!(__text_start) as u64)?;
+        let kernel_bss_end = virt_to_phys(addr_of!(__bss_end) as u64)?;
+
         // メモリマップからMMIO領域を抽出し、ソート済み配列を作成（ループ前に1回だけ）
         let memory_region_count = boot_info.memory_map_count.min(boot_info.memory_map.len());
         let memory_regions = &boot_info.memory_map[..memory_region_count];
@@ -515,10 +521,8 @@ pub fn init(boot_info: &vitros_common::boot_info::BootInfo) -> Result<(), Paging
                 let physical_addr =
                     ((pt_idx * PAGE_TABLE_ENTRY_COUNT + page_idx) * PAGE_SIZE) as u64;
                 if physical_addr < actual_max {
-                    // カーネル領域はヒュージページ用に予約（4KBマッピングをスキップ）
-                    if physical_addr >= KERNEL_HUGE_PAGE_START
-                        && physical_addr < KERNEL_HUGE_PAGE_END
-                    {
+                    // カーネル領域はセクション毎のマッピング用に予約（4KBマッピングをスキップ）
+                    if physical_addr >= kernel_text_start && physical_addr < kernel_bss_end {
                         skipped_kernel_pages += 1;
                         continue;
                     }
@@ -533,7 +537,7 @@ pub fn init(boot_info: &vitros_common::boot_info::BootInfo) -> Result<(), Paging
         }
         if skipped_kernel_pages > 0 {
             info!(
-                "Skipped {} pages for kernel huge page region",
+                "Skipped {} pages for kernel section mapping",
                 skipped_kernel_pages
             );
         }
@@ -592,25 +596,50 @@ pub fn init(boot_info: &vitros_common::boot_info::BootInfo) -> Result<(), Paging
             );
         }
 
-        // === カーネル領域を2MBヒュージページでマッピング ===
+        // === カーネル領域を4KBページでセクション毎にマッピング ===
+        // W^X原則: 実行可能なページは書き込み不可、書き込み可能なページは実行不可
         // write_cr3()前に行わないと、カーネルコード自体がアンマップされてしまう
         {
-            let huge_flags = PageTableFlags::Present as u64
+            // セクション境界を取得
+            let text_start = virt_to_phys(addr_of!(__text_start) as u64)?;
+            let text_end = virt_to_phys(addr_of!(__text_end) as u64)?;
+            let rodata_start = virt_to_phys(addr_of!(__rodata_start) as u64)?;
+            let rodata_end = virt_to_phys(addr_of!(__rodata_end) as u64)?;
+            let data_start = virt_to_phys(addr_of!(__data_start) as u64)?;
+            let bss_end = virt_to_phys(addr_of!(__bss_end) as u64)?;
+
+            // .text: RO+X (実行可能、書き込み不可)
+            let text_flags = PageTableFlags::Present as u64;
+            for phys in (text_start..text_end).step_by(PAGE_SIZE) {
+                let page_num = (phys >> 12) as usize;
+                let pt_idx = page_num / PAGE_TABLE_ENTRY_COUNT;
+                let entry_idx = page_num % PAGE_TABLE_ENTRY_COUNT;
+                (*pt_high)[pt_idx].entry(entry_idx).set(phys, text_flags);
+            }
+
+            // .rodata: RO+NX (読み取り専用、実行不可)
+            let rodata_flags = PageTableFlags::Present as u64 | PageTableFlags::NoExecute as u64;
+            for phys in (rodata_start..rodata_end).step_by(PAGE_SIZE) {
+                let page_num = (phys >> 12) as usize;
+                let pt_idx = page_num / PAGE_TABLE_ENTRY_COUNT;
+                let entry_idx = page_num % PAGE_TABLE_ENTRY_COUNT;
+                (*pt_high)[pt_idx].entry(entry_idx).set(phys, rodata_flags);
+            }
+
+            // .data + .bss: RW+NX (書き込み可能、実行不可)
+            let data_flags = PageTableFlags::Present as u64
                 | PageTableFlags::Writable as u64
-                | PageTableFlags::HugePage as u64;
-
-            // 0x200000を2MBヒュージページでマッピング
-            let pd_global_idx = (KERNEL_HUGE_PAGE_START / HUGE_PAGE_SIZE_2MB as u64) as usize;
-            let pd_array_idx = pd_global_idx / PAGE_TABLE_ENTRY_COUNT;
-            let pd_entry_idx = pd_global_idx % PAGE_TABLE_ENTRY_COUNT;
-
-            (*pd_high)[pd_array_idx]
-                .entry(pd_entry_idx)
-                .set(KERNEL_HUGE_PAGE_START, huge_flags);
+                | PageTableFlags::NoExecute as u64;
+            for phys in (data_start..bss_end).step_by(PAGE_SIZE) {
+                let page_num = (phys >> 12) as usize;
+                let pt_idx = page_num / PAGE_TABLE_ENTRY_COUNT;
+                let entry_idx = page_num % PAGE_TABLE_ENTRY_COUNT;
+                (*pt_high)[pt_idx].entry(entry_idx).set(phys, data_flags);
+            }
 
             info!(
-                "Kernel huge page pre-mapped at 0x{:X} before CR3 switch",
-                KERNEL_HUGE_PAGE_START
+                "Kernel sections mapped with W^X: .text=0x{:X}-0x{:X}, .rodata=0x{:X}-0x{:X}, .data/.bss=0x{:X}-0x{:X}",
+                text_start, text_end, rodata_start, rodata_end, data_start, bss_end
             );
         }
 
@@ -820,7 +849,12 @@ fn clear_4kb_mappings_for_huge_page(phys_addr: u64) -> Result<(), PagingError> {
 ///
 /// # Arguments
 /// * `phys_addr` - マッピングする物理アドレス（2MB境界にアライメントされている必要がある）
-/// * `additional_flags` - 追加のページテーブルフラグ（例: CacheDisable）
+/// * `additional_flags` - 追加のページフラグ。以下のフラグが有効:
+///   - `PageTableFlags::CacheDisable` - MMIO領域用のキャッシュ無効化
+///   - `PageTableFlags::WriteThrough` - ライトスルーキャッシュ
+///   - `PageTableFlags::NoExecute` - 実行禁止
+///
+///   注: Present, Writable, HugePageは内部で自動設定されるため指定不要
 ///
 /// # Returns
 /// マッピングされた仮想アドレス、またはエラー
@@ -978,6 +1012,12 @@ fn supports_1gb_pages() -> bool {
 ///
 /// # Arguments
 /// * `phys_addr` - マッピングする物理アドレス（1GB境界にアライメントされている必要がある）
+/// * `additional_flags` - 追加のページフラグ。以下のフラグが有効:
+///   - `PageTableFlags::CacheDisable` - MMIO領域用のキャッシュ無効化
+///   - `PageTableFlags::WriteThrough` - ライトスルーキャッシュ
+///   - `PageTableFlags::NoExecute` - 実行禁止
+///
+///   注: Present, Writable, HugePageは内部で自動設定されるため指定不要
 ///
 /// # Returns
 /// マッピングされた仮想アドレス、またはエラー
@@ -988,7 +1028,7 @@ fn supports_1gb_pages() -> bool {
 /// * `PagingError::FeatureNotSupported` - CPUが1GBヒュージページをサポートしていない場合
 /// * `PagingError::ExistingMappingConflict` - 既存のPD参照が存在する場合
 #[allow(dead_code)]
-pub fn map_huge_1gb(phys_addr: u64) -> Result<u64, PagingError> {
+pub fn map_huge_1gb(phys_addr: u64, additional_flags: u64) -> Result<u64, PagingError> {
     use crate::info;
 
     // 割り込みが無効であることを確認
@@ -1012,10 +1052,11 @@ pub fn map_huge_1gb(phys_addr: u64) -> Result<u64, PagingError> {
         return Err(PagingError::AddressOutOfRange);
     }
 
-    // HugePageフラグ: Present | Writable | HugePage
+    // HugePageフラグ: Present | Writable | HugePage + 追加フラグ
     let huge_flags = PageTableFlags::Present as u64
         | PageTableFlags::Writable as u64
-        | PageTableFlags::HugePage as u64;
+        | PageTableFlags::HugePage as u64
+        | additional_flags;
 
     unsafe {
         let pdp_high = addr_of_mut!(KERNEL_PDP_HIGH);
