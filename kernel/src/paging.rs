@@ -982,10 +982,30 @@ pub fn unmap_huge_2mb(phys_addr: u64) -> Result<(), PagingError> {
 // 1GB ヒュージページ マッピング関連
 // =============================================================================
 
+/// 1GBページサポートのキャッシュ (0xFF=未チェック, 0=非対応, 1=対応)
+static SUPPORTS_1GB_PAGES_CACHE: core::sync::atomic::AtomicU8 =
+    core::sync::atomic::AtomicU8::new(0xFF);
+
 /// 1GBヒュージページがサポートされているか確認
 ///
 /// CPUID.80000001H:EDX\[bit 26\] (Page1GB) で確認
+/// 結果はキャッシュされ、2回目以降はキャッシュから返す
 fn supports_1gb_pages() -> bool {
+    use core::sync::atomic::Ordering;
+
+    match SUPPORTS_1GB_PAGES_CACHE.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let result = check_1gb_pages_support_cpuid();
+            SUPPORTS_1GB_PAGES_CACHE.store(result as u8, Ordering::Relaxed);
+            result
+        }
+    }
+}
+
+/// CPUIDで1GBページサポートを確認（内部実装）
+fn check_1gb_pages_support_cpuid() -> bool {
     // まず拡張CPUID機能の最大値を確認
     let max_extended: u32;
     unsafe {
