@@ -811,6 +811,11 @@ fn clear_4kb_mappings_for_huge_page(phys_addr: u64) -> Result<(), PagingError> {
     let pd_array_idx = pd_global_idx / PAGE_TABLE_ENTRY_COUNT;
     let pd_entry_idx = pd_global_idx % PAGE_TABLE_ENTRY_COUNT;
 
+    // pd_array_idxの範囲検証
+    if pd_array_idx >= MAX_SUPPORTED_MEMORY_GB {
+        return Err(PagingError::AddressOutOfRange);
+    }
+
     // SAFETY:
     // - KERNEL_PT_HIGH, KERNEL_PD_HIGHは静的に確保された配列で、カーネル存続期間中有効
     // - pt_array_idx, pd_array_idx, pd_entry_idxは上記で範囲チェック済み
