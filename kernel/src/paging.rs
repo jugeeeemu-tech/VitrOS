@@ -1215,7 +1215,10 @@ pub fn map_framebuffer_huge(fb_base: u64, fb_size: u64) -> Result<u64, PagingErr
         let page_addr = fb_base + (i as u64 * HUGE_PAGE_SIZE_2MB as u64);
         // 既存の4KBマッピングをクリアしてからヒュージページをマッピング
         clear_4kb_mappings_for_huge_page(page_addr)?;
-        map_huge_2mb(page_addr, PageTableFlags::CacheDisable as u64)?;
+        map_huge_2mb(
+            page_addr,
+            PageTableFlags::CacheDisable as u64 | PageTableFlags::NoExecute as u64,
+        )?;
     }
 
     info!("Framebuffer huge page mapping complete");
