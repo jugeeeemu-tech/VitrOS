@@ -25,6 +25,8 @@ pub enum PagingError {
     AddressOutOfRange,
     /// CPU機能がサポートされていない
     FeatureNotSupported,
+    /// 既存のマッピングと競合（PT/PD参照が既に存在）
+    ExistingMappingConflict,
 }
 
 impl core::fmt::Display for PagingError {
@@ -36,6 +38,9 @@ impl core::fmt::Display for PagingError {
             PagingError::PageTableInitFailed => write!(f, "Page table initialization failed"),
             PagingError::AddressOutOfRange => write!(f, "Address out of supported range"),
             PagingError::FeatureNotSupported => write!(f, "CPU feature not supported"),
+            PagingError::ExistingMappingConflict => {
+                write!(f, "Existing page table mapping conflict")
+            }
         }
     }
 }
@@ -198,6 +203,11 @@ impl PageTableEntry {
     /// エントリの生の値を取得（デバッグ用）
     pub fn get_raw(&self) -> u64 {
         self.entry
+    }
+
+    /// エントリがHugePageフラグを持っているかどうか
+    pub fn is_huge_page(&self) -> bool {
+        (self.entry & PageTableFlags::HugePage as u64) != 0
     }
 }
 
@@ -738,6 +748,63 @@ pub fn map_mmio(phys_addr: u64, size: u64) -> Result<u64, PagingError> {
 // 2MB ヒュージページ マッピング関連
 // =============================================================================
 
+/// 2MB範囲の既存4KBマッピングをクリアする
+///
+/// ヒュージページをマッピングする前に、対象範囲の4KBページエントリを
+/// クリア（Present=0）にする。これにより、PDエントリをヒュージページに
+/// 変更しても、元のPTエントリが不整合な状態にならない。
+///
+/// # Arguments
+/// * `phys_addr` - クリアする2MB範囲の開始物理アドレス（2MB境界）
+///
+/// # Errors
+/// * `PagingError::InvalidAddress` - アドレスが2MB境界にアライメントされていない場合
+/// * `PagingError::AddressOutOfRange` - アドレスがサポート範囲外の場合
+fn clear_4kb_mappings_for_huge_page(phys_addr: u64) -> Result<(), PagingError> {
+    use crate::info;
+
+    // 2MB境界アライメントチェック
+    if !is_2mb_aligned(phys_addr) {
+        return Err(PagingError::InvalidAddress);
+    }
+
+    // PT配列内のインデックスを計算
+    // 1 PT = 512 * 4KB = 2MB なので、2MB境界のアドレスはPT境界に対応
+    let pt_array_idx = (phys_addr / PAGE_TABLE_COVERAGE) as usize;
+
+    // インデックスの範囲検証
+    if pt_array_idx >= PT_COUNT {
+        return Err(PagingError::AddressOutOfRange);
+    }
+
+    // PDインデックスを計算（2MB単位）
+    let pd_global_idx = (phys_addr / HUGE_PAGE_SIZE_2MB as u64) as usize;
+    let pd_array_idx = pd_global_idx / PAGE_TABLE_ENTRY_COUNT;
+    let pd_entry_idx = pd_global_idx % PAGE_TABLE_ENTRY_COUNT;
+
+    // SAFETY:
+    // - KERNEL_PT_HIGH, KERNEL_PD_HIGHは静的に確保された配列で、カーネル存続期間中有効
+    // - pt_array_idx, pd_array_idx, pd_entry_idxは上記で範囲チェック済み
+    // - この関数は割り込み無効状態で呼び出される（呼び出し元で保証）
+    unsafe {
+        let pt_high = addr_of_mut!(KERNEL_PT_HIGH);
+        let pd_high = addr_of_mut!(KERNEL_PD_HIGH);
+
+        // PT内の全512エントリをクリア
+        (*pt_high)[pt_array_idx].clear();
+
+        // PDエントリもクリア（PTへの参照を解除）
+        (*pd_high)[pd_array_idx].entry(pd_entry_idx).set(0, 0);
+    }
+
+    info!(
+        "Cleared 4KB mappings for huge page at 0x{:X} (PT index {}, PD[{}][{}])",
+        phys_addr, pt_array_idx, pd_array_idx, pd_entry_idx
+    );
+
+    Ok(())
+}
+
 /// 2MBヒュージページをマッピングする
 ///
 /// PDレベルでHugePageフラグを設定し、2MBの連続した物理メモリを
@@ -761,6 +828,7 @@ pub fn map_mmio(phys_addr: u64, size: u64) -> Result<u64, PagingError> {
 /// # Errors
 /// * `PagingError::InvalidAddress` - アドレスが2MB境界にアライメントされていない場合
 /// * `PagingError::AddressOutOfRange` - ページテーブルのインデックスが範囲外の場合
+/// * `PagingError::ExistingMappingConflict` - 既存のPT参照が存在する場合
 pub fn map_huge_2mb(phys_addr: u64, additional_flags: u64) -> Result<u64, PagingError> {
     use crate::info;
 
@@ -790,6 +858,13 @@ pub fn map_huge_2mb(phys_addr: u64, additional_flags: u64) -> Result<u64, Paging
 
     unsafe {
         let pd_high = addr_of_mut!(KERNEL_PD_HIGH);
+
+        // 既存のマッピング競合チェック
+        // エントリがPresent=1かつHugePage=0の場合、PT参照が設定されている
+        let existing_entry = (*pd_high)[pd_array_idx].entry(pd_entry_idx);
+        if existing_entry.is_present() && !existing_entry.is_huge_page() {
+            return Err(PagingError::ExistingMappingConflict);
+        }
 
         // PDエントリにHugePageフラグ付きで物理アドレスを設定
         (*pd_high)[pd_array_idx]
@@ -911,6 +986,7 @@ fn supports_1gb_pages() -> bool {
 /// * `PagingError::InvalidAddress` - アドレスが1GB境界にアライメントされていない場合
 /// * `PagingError::AddressOutOfRange` - ページテーブルのインデックスが範囲外の場合
 /// * `PagingError::FeatureNotSupported` - CPUが1GBヒュージページをサポートしていない場合
+/// * `PagingError::ExistingMappingConflict` - 既存のPD参照が存在する場合
 #[allow(dead_code)]
 pub fn map_huge_1gb(phys_addr: u64) -> Result<u64, PagingError> {
     use crate::info;
@@ -943,6 +1019,13 @@ pub fn map_huge_1gb(phys_addr: u64) -> Result<u64, PagingError> {
 
     unsafe {
         let pdp_high = addr_of_mut!(KERNEL_PDP_HIGH);
+
+        // 既存のマッピング競合チェック
+        // エントリがPresent=1かつHugePage=0の場合、PD参照が設定されている
+        let existing_entry = (*pdp_high).entry(pdp_entry_idx);
+        if existing_entry.is_present() && !existing_entry.is_huge_page() {
+            return Err(PagingError::ExistingMappingConflict);
+        }
 
         // PDPエントリにHugePageフラグ付きで物理アドレスを設定
         (*pdp_high).entry(pdp_entry_idx).set(phys_addr, huge_flags);
@@ -1062,8 +1145,11 @@ pub fn map_framebuffer_huge(fb_base: u64, fb_size: u64) -> Result<u64, PagingErr
     );
 
     // 各2MBページをマッピング（MMIO領域のためCacheDisableフラグを設定）
+    // 既存の4KBマッピングがある場合は先にクリアする
     for i in 0..huge_page_count {
         let page_addr = fb_base + (i as u64 * HUGE_PAGE_SIZE_2MB as u64);
+        // 既存の4KBマッピングをクリアしてからヒュージページをマッピング
+        clear_4kb_mappings_for_huge_page(page_addr)?;
         map_huge_2mb(page_addr, PageTableFlags::CacheDisable as u64)?;
     }
 
