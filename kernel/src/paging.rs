@@ -981,9 +981,28 @@ pub fn unmap_huge_2mb(phys_addr: u64) -> Result<(), PagingError> {
 ///
 /// CPUID.80000001H:EDX\[bit 26\] (Page1GB) で確認
 fn supports_1gb_pages() -> bool {
+    // まず拡張CPUID機能の最大値を確認
+    let max_extended: u32;
+    unsafe {
+        core::arch::asm!(
+            "push rbx",
+            "cpuid",
+            "pop rbx",
+            inout("eax") 0x80000000u32 => max_extended,
+            out("ecx") _,
+            lateout("edx") _,
+            options(nomem, nostack),
+        );
+    }
+
+    // 拡張CPUID 0x80000001 がサポートされていない場合は1GBページ非対応
+    if max_extended < 0x80000001 {
+        return false;
+    }
+
+    // 拡張CPUID 0x80000001 でPage1GBフラグを確認
     let edx: u32;
     unsafe {
-        // rbxはLLVMが使用するため、push/popで保存・復元する
         core::arch::asm!(
             "push rbx",
             "cpuid",
