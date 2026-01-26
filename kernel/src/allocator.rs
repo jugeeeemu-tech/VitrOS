@@ -31,9 +31,9 @@ const MIN_BLOCK_SIZE_LOG2: u32 = 12;
 const MAX_ORDER: usize = 13;
 
 /// ビットマップの最大ワード数
-/// 1GB / 4KB / 64 = 4096ワード
-/// 実際のヒープサイズ（約1GB）に対応
-const MAX_BITMAP_WORDS: usize = 4096;
+/// 64MB / 4KB / 64 = 256ワード
+/// 実際のヒープサイズ（最大64MB）に対応
+const MAX_BITMAP_WORDS: usize = 256;
 
 /// フリーブロックノード（双方向リンクリスト）
 #[repr(C)]
