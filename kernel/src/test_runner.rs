@@ -19,6 +19,13 @@ pub enum QemuExitCode {
 /// QEMUを指定した終了コードで終了する
 ///
 /// ポート0xf4に書き込むことでQEMUを終了させる。
+///
+/// # Requirements
+///
+/// QEMUに`isa-debug-exit`デバイスが設定されている必要がある:
+/// ```text
+/// -device isa-debug-exit,iobase=0xf4,iosize=0x04
+/// ```
 pub fn exit_qemu(code: QemuExitCode) -> ! {
     // SAFETY: isa-debug-exitデバイスに書き込んでQEMUを終了する。
     // このデバイスはQEMU起動時に設定されている。
