@@ -219,4 +219,42 @@ mod tests {
         assert_eq!(align_down(0x1FFF, 0x1000), 0x1000);
         assert_eq!(align_down(0, 0x1000), 0);
     }
+
+    #[test_case]
+    fn test_is_aligned_edge_cases() {
+        // 最小アラインメント(1)は常に成功
+        assert!(is_aligned(0, 1));
+        assert!(is_aligned(1, 1));
+        assert!(is_aligned(0xFFFF_FFFF_FFFF_FFFF, 1));
+
+        // 大きな値でのテスト
+        assert!(is_aligned(0x1_0000_0000, 0x1000)); // 4GB
+        assert!(!is_aligned(0x1_0000_0001, 0x1000));
+    }
+
+    #[test_case]
+    fn test_align_up_edge_cases() {
+        // 最小アラインメント(1)
+        assert_eq!(align_up(42, 1), 42);
+
+        // 2MBアラインメント
+        const ALIGN_2MB: u64 = 0x20_0000;
+        assert_eq!(align_up(0, ALIGN_2MB), 0);
+        assert_eq!(align_up(1, ALIGN_2MB), ALIGN_2MB);
+        assert_eq!(align_up(ALIGN_2MB, ALIGN_2MB), ALIGN_2MB);
+        assert_eq!(align_up(ALIGN_2MB + 1, ALIGN_2MB), ALIGN_2MB * 2);
+    }
+
+    #[test_case]
+    fn test_align_down_edge_cases() {
+        // 大きな値のテスト
+        assert_eq!(align_down(0x1_0000_1234, 0x1000), 0x1_0000_1000);
+
+        // 2MBアラインメント
+        const ALIGN_2MB: u64 = 0x20_0000;
+        assert_eq!(align_down(0, ALIGN_2MB), 0);
+        assert_eq!(align_down(ALIGN_2MB - 1, ALIGN_2MB), 0);
+        assert_eq!(align_down(ALIGN_2MB, ALIGN_2MB), ALIGN_2MB);
+        assert_eq!(align_down(ALIGN_2MB + 1, ALIGN_2MB), ALIGN_2MB);
+    }
 }
