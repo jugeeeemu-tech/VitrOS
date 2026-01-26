@@ -415,3 +415,35 @@ impl Task {
         &mut self.context
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test_case]
+    fn test_nice_to_weight_default() {
+        // nice 0（デフォルト）は重み1024
+        assert_eq!(nice_to_weight(0), 1024);
+    }
+
+    #[test_case]
+    fn test_nice_to_weight_min() {
+        // nice -20（最高優先度）は重み88761
+        assert_eq!(nice_to_weight(-20), 88761);
+    }
+
+    #[test_case]
+    fn test_nice_to_weight_max() {
+        // nice +19（最低優先度）は重み15
+        assert_eq!(nice_to_weight(19), 15);
+    }
+
+    #[test_case]
+    fn test_nice_to_weight_clamping() {
+        // 範囲外のnice値はクランプされる
+        // nice -30 -> クランプされて -20 -> 重み88761
+        assert_eq!(nice_to_weight(-30), nice_to_weight(-20));
+        // nice +30 -> クランプされて +19 -> 重み15
+        assert_eq!(nice_to_weight(30), nice_to_weight(19));
+    }
+}
