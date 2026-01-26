@@ -3,6 +3,7 @@ target = "x86_64-unknown-uefi"
 
 [target.x86_64-unknown-none]
 linker = "rust-lld"
+runner = "scripts/qemu_test_runner.sh"
 rustflags = [
     "-C", "link-arg=-Tkernel/linker.ld",
     "-C", "link-arg=-znorelro",
@@ -17,3 +18,4 @@ runner = "scripts/launch_qemu.sh"
 [unstable]
 build-std = ["core", "alloc", "compiler_builtins"]
 build-std-features = ["compiler-builtins-mem"]
+panic-abort-tests = true

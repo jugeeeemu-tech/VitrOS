@@ -362,14 +362,12 @@ fn is_mmio_region_binary(phys_addr: u64, mmio_ranges: &[MmioRange; 64], count: u
 }
 
 /// カーネル専用スタック（64KB）
-/// クレート内でのみ公開（kernel_mainから参照するため）
 #[allow(dead_code)]
 #[repr(align(16))]
-pub(crate) struct KernelStack([u8; 65536]);
+pub struct KernelStack(pub [u8; 65536]);
 
 /// カーネルスタックの実体
-/// クレート内でのみ公開（kernel_mainのインラインアセンブリから参照するため）
-pub(crate) static mut KERNEL_STACK: KernelStack = KernelStack([0; 65536]);
+pub static mut KERNEL_STACK: KernelStack = KernelStack([0; 65536]);
 
 /// カーネルスタックに切り替える
 /// この関数を呼ぶと、UEFIから継承した低位アドレスのスタックから

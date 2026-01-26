@@ -6,36 +6,31 @@ extern crate alloc;
 // OS カーネル処理
 // アロケータ初期化、可視化テスト、メインループ
 
-mod acpi;
-mod addr;
-mod allocator;
-mod apic;
-mod debug_overlay;
-mod gdt;
-mod graphics;
-mod hpet;
-mod idt;
-mod io;
-mod msi;
-mod msr;
-mod mtrr;
-mod paging;
-mod pci;
-mod pit;
-mod sched;
-mod serial;
-mod sync;
-mod timer;
-mod timer_device;
+// ライブラリクレートからモジュールをインポート
+use vitros_kernel::acpi;
+use vitros_kernel::allocator;
+use vitros_kernel::apic;
+use vitros_kernel::debug_overlay;
+use vitros_kernel::gdt;
+use vitros_kernel::graphics;
+use vitros_kernel::idt;
+use vitros_kernel::mtrr;
+use vitros_kernel::paging;
+use vitros_kernel::pci;
+use vitros_kernel::sched;
+use vitros_kernel::timer;
+
+// マクロをインポート
+use vitros_kernel::{error, info, print, println, warn};
 
 // 後方互換性のためのエイリアス
 use sched as task;
 
 #[cfg(feature = "visualize-allocator")]
-mod allocator_visualization;
+use vitros_kernel::allocator_visualization;
 
 #[cfg(feature = "visualize-pipeline")]
-mod pipeline_visualization;
+use vitros_kernel::pipeline_visualization;
 
 use crate::graphics::FramebufferWriter;
 use alloc::boxed::Box;

@@ -47,6 +47,10 @@ cargo run
 3. EFI パーティション構造を作成
 4. QEMU で起動
 
+## テスト
+
+cargo +nightly test --target x86_64-unknown-none 
+
 ## オプション
 
 ### メモリアロケータ可視化

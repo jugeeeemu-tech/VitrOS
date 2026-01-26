@@ -5,7 +5,8 @@ members = [
     "kernel",
     "common",
 ]
-default-members = ["bootloader"]
+# cargo run はブートローダー、cargo test はカーネル
+default-members = ["bootloader", "kernel"]
 
 [workspace.package]
 version = "0.1.0"

@@ -3,6 +3,16 @@ name = "vitros-kernel"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+name = "vitros_kernel"
+crate-type = ["rlib"]
+test = true
+doctest = false
+
+[[bin]]
+name = "vitros-kernel"
+test = false
+
 [features]
 visualize-allocator = ["vitros-common/visualize-allocator"]
 visualize-pipeline = ["vitros-common/visualize-pipeline"]

@@ -3,6 +3,12 @@ name = "vitros-bootloader"
 version.workspace = true
 edition.workspace = true
 
+# ブートローダーはテスト対象外（no_std環境で別のテストフレームワークが必要）
+[[bin]]
+name = "vitros-bootloader"
+path = "src/main.rs"
+test = false
+
 [features]
 visualize-allocator = []
 

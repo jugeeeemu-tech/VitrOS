@@ -3,6 +3,10 @@ name = "vitros-common"
 version.workspace = true
 edition.workspace = true
 
+# no_std環境のためテスト対象外
+[lib]
+test = false
+
 [features]
 visualize-allocator = []
 visualize-pipeline = []
