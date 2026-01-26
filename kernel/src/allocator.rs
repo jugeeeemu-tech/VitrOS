@@ -134,19 +134,21 @@ impl BuddyAllocator {
     /// - `addr`は他のフリーリストに含まれていないこと
     /// - `order`は0..MAX_ORDERの範囲内であること
     unsafe fn add_to_free_list(&self, addr: usize, order: usize) {
-        let node = addr as *mut BuddyFreeNode;
-        let free_list = &mut *self.free_lists[order].get();
+        unsafe {
+            let node = addr as *mut BuddyFreeNode;
+            let free_list = &mut *self.free_lists[order].get();
 
-        // 双方向リストの先頭に追加
-        (*node).prev = None;
-        (*node).next = *free_list;
+            // 双方向リストの先頭に追加
+            (*node).prev = None;
+            (*node).next = *free_list;
 
-        // 既存の先頭ノードのprevを更新
-        if let Some(head) = *free_list {
-            (*head.as_ptr()).prev = NonNull::new(node);
+            // 既存の先頭ノードのprevを更新
+            if let Some(head) = *free_list {
+                (*head.as_ptr()).prev = NonNull::new(node);
+            }
+
+            *free_list = NonNull::new(node);
         }
-
-        *free_list = NonNull::new(node);
     }
 
     /// フリーリストの先頭からブロックを取り出し
@@ -155,20 +157,22 @@ impl BuddyAllocator {
     /// - `order`は0..MAX_ORDERの範囲内であること
     /// - フリーリスト内のノードは全て有効なポインタであること
     unsafe fn remove_from_free_list(&self, order: usize) -> Option<NonNull<BuddyFreeNode>> {
-        let free_list = &mut *self.free_lists[order].get();
+        unsafe {
+            let free_list = &mut *self.free_lists[order].get();
 
-        if let Some(head) = *free_list {
-            let next = (*head.as_ptr()).next;
+            if let Some(head) = *free_list {
+                let next = (*head.as_ptr()).next;
 
-            // 次のノードのprevをNoneに
-            if let Some(next_node) = next {
-                (*next_node.as_ptr()).prev = None;
+                // 次のノードのprevをNoneに
+                if let Some(next_node) = next {
+                    (*next_node.as_ptr()).prev = None;
+                }
+
+                *free_list = next;
+                Some(head)
+            } else {
+                None
             }
-
-            *free_list = next;
-            Some(head)
-        } else {
-            None
         }
     }
 
@@ -178,23 +182,25 @@ impl BuddyAllocator {
     /// - `addr`はこのorder用フリーリストに含まれていること
     /// - `order`は0..MAX_ORDERの範囲内であること
     unsafe fn remove_node_from_free_list(&self, addr: usize, order: usize) {
-        let node = addr as *mut BuddyFreeNode;
-        let free_list = &mut *self.free_lists[order].get();
+        unsafe {
+            let node = addr as *mut BuddyFreeNode;
+            let free_list = &mut *self.free_lists[order].get();
 
-        let prev = (*node).prev;
-        let next = (*node).next;
+            let prev = (*node).prev;
+            let next = (*node).next;
 
-        // 前のノードのnextを更新
-        if let Some(prev_node) = prev {
-            (*prev_node.as_ptr()).next = next;
-        } else {
-            // このノードが先頭だった
-            *free_list = next;
-        }
+            // 前のノードのnextを更新
+            if let Some(prev_node) = prev {
+                (*prev_node.as_ptr()).next = next;
+            } else {
+                // このノードが先頭だった
+                *free_list = next;
+            }
 
-        // 次のノードのprevを更新
-        if let Some(next_node) = next {
-            (*next_node.as_ptr()).prev = prev;
+            // 次のノードのprevを更新
+            if let Some(next_node) = next {
+                (*next_node.as_ptr()).prev = prev;
+            }
         }
     }
 
@@ -210,16 +216,18 @@ impl BuddyAllocator {
     ///
     /// TODO: ビットマップベースの実装でO(1)判定を可能にする (Issue #41)
     unsafe fn is_in_free_list(&self, addr: usize, order: usize) -> bool {
-        let free_list = *self.free_lists[order].get();
-        let mut current = free_list;
+        unsafe {
+            let free_list = *self.free_lists[order].get();
+            let mut current = free_list;
 
-        while let Some(node) = current {
-            if node.as_ptr() as usize == addr {
-                return true;
+            while let Some(node) = current {
+                if node.as_ptr() as usize == addr {
+                    return true;
+                }
+                current = (*node.as_ptr()).next;
             }
-            current = (*node.as_ptr()).next;
+            false
         }
-        false
     }
 
     // =========================================================================
@@ -298,15 +306,17 @@ impl BuddyAllocator {
     /// - `order`は0..MAX_ORDERの範囲内であること
     /// - フリーリスト内のノードは全て有効なポインタであること
     unsafe fn count_free_blocks(&self, order: usize) -> usize {
-        let mut count = 0;
-        let free_list = *self.free_lists[order].get();
-        let mut current = free_list;
+        unsafe {
+            let mut count = 0;
+            let free_list = *self.free_lists[order].get();
+            let mut current = free_list;
 
-        while let Some(node) = current {
-            count += 1;
-            current = (*node.as_ptr()).next;
+            while let Some(node) = current {
+                count += 1;
+                current = (*node.as_ptr()).next;
+            }
+            count
         }
-        count
     }
 
     // =========================================================================
@@ -350,7 +360,7 @@ impl BuddyAllocator {
                 }
             }
 
-            Some(NonNull::new_unchecked(block_addr as *mut u8))
+            Some(unsafe { NonNull::new_unchecked(block_addr as *mut u8) })
         })
     }
 
