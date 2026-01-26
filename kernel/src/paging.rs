@@ -1209,3 +1209,61 @@ pub fn map_framebuffer_huge(fb_base: u64, fb_size: u64) -> Result<u64, PagingErr
     info!("Framebuffer huge page mapping complete");
     phys_to_virt(fb_base)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test_case]
+    fn test_is_2mb_aligned() {
+        // 2MB = 0x20_0000
+        assert!(is_2mb_aligned(0));
+        assert!(is_2mb_aligned(0x20_0000));
+        assert!(is_2mb_aligned(0x40_0000));
+        assert!(!is_2mb_aligned(0x1));
+        assert!(!is_2mb_aligned(0x1000)); // 4KB
+        assert!(!is_2mb_aligned(0x20_0001));
+    }
+
+    #[test_case]
+    fn test_is_1gb_aligned() {
+        // 1GB = 0x4000_0000
+        assert!(is_1gb_aligned(0));
+        assert!(is_1gb_aligned(0x4000_0000));
+        assert!(is_1gb_aligned(0x8000_0000));
+        assert!(!is_1gb_aligned(0x1));
+        assert!(!is_1gb_aligned(0x20_0000)); // 2MB
+        assert!(!is_1gb_aligned(0x4000_0001));
+    }
+
+    #[test_case]
+    fn test_phys_to_virt_valid() {
+        // 有効な物理アドレス
+        let result = phys_to_virt(0x1000);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), KERNEL_VIRTUAL_BASE + 0x1000);
+    }
+
+    #[test_case]
+    fn test_phys_to_virt_null() {
+        // nullアドレスはエラー
+        let result = phys_to_virt(0);
+        assert_eq!(result, Err(PagingError::InvalidAddress));
+    }
+
+    #[test_case]
+    fn test_virt_to_phys_valid() {
+        // 有効な仮想アドレス（KERNEL_VIRTUAL_BASE以上）
+        let virt_addr = KERNEL_VIRTUAL_BASE + 0x1000;
+        let result = virt_to_phys(virt_addr);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 0x1000);
+    }
+
+    #[test_case]
+    fn test_virt_to_phys_invalid() {
+        // KERNEL_VIRTUAL_BASE未満はエラー
+        let result = virt_to_phys(0x1000);
+        assert_eq!(result, Err(PagingError::InvalidAddress));
+    }
+}

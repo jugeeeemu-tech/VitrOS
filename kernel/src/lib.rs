@@ -50,6 +50,7 @@ pub mod pipeline_visualization;
 pub extern "efiapi" fn kernel_main(_boot_info: u64) -> ! {
     // テストではBootInfoは使用しない
     serial::init();
+    allocator::init_test_heap();
     test_main();
     loop {
         // SAFETY: hlt命令はCPUを低消費電力状態にする特権命令。

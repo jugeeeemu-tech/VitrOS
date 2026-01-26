@@ -119,3 +119,56 @@ impl WriterBuffer {
 /// Arc<BlockingMutex<WriterBuffer>>の型エイリアス。
 /// TaskWriterとCompositorの間でバッファを共有するために使用します。
 pub type SharedBuffer = Arc<BlockingMutex<WriterBuffer>>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test_case]
+    fn test_writer_buffer_new() {
+        let region = Region::new(0, 0, 100, 50);
+        let buffer = WriterBuffer::new(region);
+        // 初期状態ではdirty=false
+        assert!(!buffer.is_dirty());
+        assert!(buffer.commands().is_empty());
+    }
+
+    #[test_case]
+    fn test_writer_buffer_push_command() {
+        let region = Region::new(0, 0, 100, 50);
+        let mut buffer = WriterBuffer::new(region);
+
+        buffer.push_command(DrawCommand::Clear { color: 0xFFFFFF });
+
+        // コマンド追加でdirty=true
+        assert!(buffer.is_dirty());
+        assert_eq!(buffer.commands().len(), 1);
+    }
+
+    #[test_case]
+    fn test_writer_buffer_clear_commands() {
+        let region = Region::new(0, 0, 100, 50);
+        let mut buffer = WriterBuffer::new(region);
+
+        buffer.push_command(DrawCommand::Clear { color: 0xFFFFFF });
+        assert!(buffer.is_dirty());
+
+        buffer.clear_commands();
+
+        // クリアでdirty=false
+        assert!(!buffer.is_dirty());
+        assert!(buffer.commands().is_empty());
+    }
+
+    #[test_case]
+    fn test_writer_buffer_region() {
+        let region = Region::new(10, 20, 100, 50);
+        let buffer = WriterBuffer::new(region);
+
+        let stored_region = buffer.region();
+        assert_eq!(stored_region.x, 10);
+        assert_eq!(stored_region.y, 20);
+        assert_eq!(stored_region.width, 100);
+        assert_eq!(stored_region.height, 50);
+    }
+}

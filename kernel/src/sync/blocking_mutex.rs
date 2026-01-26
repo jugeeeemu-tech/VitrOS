@@ -115,3 +115,60 @@ impl<'a, T: ?Sized> Drop for MutexGuard<'a, T> {
         self.mutex.wait_queue.wake_one();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test_case]
+    fn test_mutex_new() {
+        let mutex = BlockingMutex::new(42);
+        // 初期状態でロック可能
+        assert!(mutex.try_lock().is_some());
+    }
+
+    #[test_case]
+    fn test_mutex_try_lock_success() {
+        let mutex = BlockingMutex::new(42);
+        let guard = mutex.try_lock().expect("Lock should succeed");
+        assert_eq!(*guard, 42);
+    }
+
+    #[test_case]
+    fn test_mutex_try_lock_fail_when_locked() {
+        let mutex = BlockingMutex::new(42);
+        let _guard = mutex.try_lock().unwrap();
+        // 既にロック済みなのでNoneが返る
+        assert!(mutex.try_lock().is_none());
+    }
+
+    #[test_case]
+    fn test_mutex_guard_deref() {
+        let mutex = BlockingMutex::new(42);
+        let guard = mutex.try_lock().unwrap();
+        // Deref で不変参照を取得
+        let value: &i32 = &*guard;
+        assert_eq!(*value, 42);
+    }
+
+    #[test_case]
+    fn test_mutex_guard_deref_mut() {
+        let mutex = BlockingMutex::new(42);
+        let mut guard = mutex.try_lock().unwrap();
+        // DerefMut で可変参照を取得し、値を変更
+        *guard = 100;
+        assert_eq!(*guard, 100);
+    }
+
+    #[test_case]
+    fn test_mutex_unlock_on_drop() {
+        let mutex = BlockingMutex::new(42);
+        {
+            let _guard = mutex.try_lock().unwrap();
+            // ここではロック中
+            assert!(mutex.try_lock().is_none());
+        }
+        // guardがdropされたのでロック解除
+        assert!(mutex.try_lock().is_some());
+    }
+}

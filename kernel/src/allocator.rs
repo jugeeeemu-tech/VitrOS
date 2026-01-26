@@ -686,3 +686,30 @@ pub(crate) fn notify_deallocate(class_idx: usize, ptr: *mut u8) {
 #[cfg(not(feature = "visualize-allocator"))]
 #[inline(always)]
 pub(crate) fn notify_deallocate(_class_idx: usize, _ptr: *mut u8) {}
+
+// =============================================================================
+// テスト用ヒープ初期化
+// =============================================================================
+
+/// テスト用ヒープ（4KB境界アラインメント必須）
+#[cfg(test)]
+#[repr(C, align(4096))]
+struct TestHeap([u8; 64 * 1024]);
+
+#[cfg(test)]
+static mut TEST_HEAP: TestHeap = TestHeap([0; 64 * 1024]);
+
+/// テスト用にヒープを初期化
+///
+/// # Safety
+/// この関数はテスト環境でのみ使用すること。
+/// 複数回呼び出すと未定義動作を引き起こす可能性がある。
+#[cfg(test)]
+pub fn init_test_heap() {
+    use core::ptr::addr_of;
+    unsafe {
+        let heap_start = addr_of!(TEST_HEAP) as usize;
+        let heap_size = core::mem::size_of::<TestHeap>();
+        ALLOCATOR.init(heap_start, heap_size);
+    }
+}
