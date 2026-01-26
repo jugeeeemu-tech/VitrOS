@@ -49,7 +49,9 @@ cargo run
 
 ## テスト
 
-cargo +nightly test --target x86_64-unknown-none 
+```bash
+cargo +nightly test -p vitros-kernel --target x86_64-unknown-none
+```
 
 ## オプション
 
