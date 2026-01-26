@@ -19,7 +19,7 @@ TIMEOUT_SECONDS=60
 cd "${PROJECT_ROOT}"
 
 # ブートローダーをビルド
-cargo +nightly build -p vitros-bootloader --target x86_64-unknown-uefi 2>/dev/null
+cargo +nightly build -p vitros-bootloader --target x86_64-unknown-uefi
 
 # EFIパーティション構造を準備
 rm -rf mnt
