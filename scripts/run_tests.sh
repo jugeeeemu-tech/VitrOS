@@ -46,7 +46,7 @@ fi
 
 # カーゴ出力からテストバイナリのパスを抽出
 # 形式: "Executable unittests src/lib.rs (target/...)"
-TEST_BINARY=$(echo "$BUILD_OUTPUT" | grep -oP 'Executable unittests src/lib\.rs \(\K[^)]+')
+TEST_BINARY=$(echo "$BUILD_OUTPUT" | sed -n 's/.*Executable unittests src\/lib\.rs (\([^)]*\)).*/\1/p')
 
 if [ -z "$TEST_BINARY" ]; then
     echo -e "${RED}Test binary not found in cargo output!${NC}"
