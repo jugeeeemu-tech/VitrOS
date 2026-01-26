@@ -383,16 +383,10 @@ extern "C" fn double_fault_handler_inner(error_code: u64) {
         asm!("mov {}, cr2", out(reg) fault_addr, options(nomem, nostack));
     }
 
-    // Guard Pageアクセスの検知（スタックオーバーフロー）
-    let guard_page_addr = {
-        let stack_addr = core::ptr::addr_of!(crate::paging::KERNEL_STACK) as u64;
-        stack_addr - crate::paging::PAGE_SIZE as u64
-    };
-
     // CR2がGuard Page範囲内であれば、スタックオーバーフローと判定
-    if fault_addr >= guard_page_addr
-        && fault_addr < guard_page_addr + crate::paging::PAGE_SIZE as u64
-    {
+    if crate::stack::is_guard_page_fault(fault_addr) {
+        // ガードページアドレスを表示用に取得
+        let guard_page_addr = crate::stack::guard_page_address().unwrap_or(0);
         println!("\n\n");
         println!("========================================");
         println!("FATAL: STACK OVERFLOW DETECTED");

@@ -29,6 +29,7 @@ pub mod pci;
 pub mod pit;
 pub mod sched;
 pub mod serial;
+pub mod stack;
 pub mod sync;
 pub mod timer;
 pub mod timer_device;

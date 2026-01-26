@@ -156,6 +156,11 @@ extern "C" fn task3() -> ! {
     }
 }
 
+// リンカスクリプトで定義されたスタックトップシンボル
+unsafe extern "C" {
+    static __stack_top: u8;
+}
+
 /// カーネルエントリポイント（トランポリン）
 /// UEFIブートローダから呼ばれる - MS x64 ABI (RCX) から System V ABI (RDI) に変換
 #[unsafe(no_mangle)]
@@ -168,8 +173,8 @@ extern "efiapi" fn kernel_main() -> ! {
         "mov rdi, rcx",
 
         // カーネルスタックに切り替え（Rust関数を呼ぶ前に実行）
-        "lea rsp, [rip + {kernel_stack}]",
-        "add rsp, {stack_size}",
+        // __stack_topが直接スタックトップを指すのでシンプルに
+        "lea rsp, [rip + {stack_top}]",
 
         // 実際のカーネルメイン関数を呼び出し
         // この時点で既に新しいカーネルスタック上で動作している
@@ -178,8 +183,7 @@ extern "efiapi" fn kernel_main() -> ! {
         // kernel_main_inner は戻ってこないが、念のため無限ループ
         "2: jmp 2b",
 
-        kernel_stack = sym paging::KERNEL_STACK,
-        stack_size = const core::mem::size_of::<paging::KernelStack>(),
+        stack_top = sym __stack_top,
         kernel_main_inner = sym kernel_main_inner,
     )
 }

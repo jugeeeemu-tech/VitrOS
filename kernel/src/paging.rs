@@ -361,39 +361,6 @@ fn is_mmio_region_binary(phys_addr: u64, mmio_ranges: &[MmioRange; 64], count: u
     phys_addr < candidate.end
 }
 
-/// カーネル専用スタック（64KB）
-#[allow(dead_code)]
-#[repr(align(16))]
-pub struct KernelStack([u8; 65536]);
-
-/// カーネルスタックの実体
-pub static mut KERNEL_STACK: KernelStack = KernelStack([0; 65536]);
-
-/// カーネルスタックに切り替える
-/// この関数を呼ぶと、UEFIから継承した低位アドレスのスタックから
-/// カーネル専用の高位アドレスのスタックに切り替わる
-#[allow(dead_code)]
-#[unsafe(naked)]
-pub unsafe extern "C" fn switch_to_kernel_stack() {
-    core::arch::naked_asm!(
-        // 古いスタックからリターンアドレスをポップ（raxに保存）
-        "pop rax",
-
-        // 新しいスタックのアドレスをロード
-        "lea rsp, [rip + {kernel_stack}]",
-        "add rsp, {stack_size}",
-
-        // リターンアドレスを新しいスタックにプッシュ
-        "push rax",
-
-        // リターン（新しいスタックから）
-        "ret",
-
-        kernel_stack = sym KERNEL_STACK,
-        stack_size = const core::mem::size_of::<KernelStack>(),
-    )
-}
-
 // グローバルページテーブルを静的に確保
 // 物理メモリの直接マッピング（Direct Mapping）を実装
 
@@ -544,54 +511,54 @@ pub fn init(boot_info: &vitros_common::boot_info::BootInfo) -> Result<(), Paging
         }
 
         // === Guard Page の設定 ===
-        // スタック領域の直前のページをGuard Page（Present=0）に設定
-        let stack_virt_addr = addr_of_mut!(KERNEL_STACK) as u64;
-        let guard_page_virt_addr = stack_virt_addr
-            .checked_sub(PAGE_SIZE as u64)
-            .ok_or(PagingError::GuardPageSetupFailed)?;
+        // スタック領域のガードページをPresent=0に設定
+        // リンカスクリプトで__stack_guardが直接ガードページアドレスを指す
+        // テスト環境ではリンカスクリプトが使われないためスキップ
+        #[cfg(not(test))]
+        if let Some(guard_page_virt_addr) = crate::stack::guard_page_address() {
+            // 仮想アドレスを物理アドレスに変換
+            let guard_page_phys_addr = virt_to_phys(guard_page_virt_addr)?;
+            let physical_offset = guard_page_phys_addr;
 
-        // 仮想アドレスを物理アドレスに変換
-        let guard_page_phys_addr = virt_to_phys(guard_page_virt_addr)?;
-        let physical_offset = guard_page_phys_addr;
+            // ページ番号を計算
+            let page_num = (physical_offset >> 12) as usize;
 
-        // ページ番号を計算
-        let page_num = (physical_offset >> 12) as usize;
+            // PT配列内のインデックスとPT内のエントリ番号を計算
+            let pt_array_idx = page_num / PAGE_TABLE_ENTRY_COUNT;
+            let page_idx_in_pt = page_num % PAGE_TABLE_ENTRY_COUNT;
 
-        // PT配列内のインデックスとPT内のエントリ番号を計算
-        let pt_array_idx = page_num / PAGE_TABLE_ENTRY_COUNT;
-        let page_idx_in_pt = page_num % PAGE_TABLE_ENTRY_COUNT;
+            // インデックスの範囲検証
+            if pt_array_idx >= PT_COUNT {
+                return Err(PagingError::GuardPageSetupFailed);
+            }
+            if page_idx_in_pt >= PAGE_TABLE_ENTRY_COUNT {
+                return Err(PagingError::GuardPageSetupFailed);
+            }
 
-        // インデックスの範囲検証
-        if pt_array_idx >= PT_COUNT {
-            return Err(PagingError::GuardPageSetupFailed);
-        }
-        if page_idx_in_pt >= PAGE_TABLE_ENTRY_COUNT {
-            return Err(PagingError::GuardPageSetupFailed);
-        }
+            // Guard PageのPTエントリをPresent=0に設定（アクセス時にPage Faultが発生）
+            // 高位アドレスのみ設定（低位はアンマップ済み）
+            (*pt_high)[pt_array_idx]
+                .entry(page_idx_in_pt)
+                .set(guard_page_phys_addr, 0);
 
-        // Guard PageのPTエントリをPresent=0に設定（アクセス時にPage Faultが発生）
-        // 高位アドレスのみ設定（低位はアンマップ済み）
-        (*pt_high)[pt_array_idx]
-            .entry(page_idx_in_pt)
-            .set(guard_page_phys_addr, 0);
-
-        // デバッグ: Guard Page設定を確認（リリースビルドでは省略）
-        #[cfg(debug_assertions)]
-        {
-            info!("Guard Page setup:");
-            info!("  Virtual address: 0x{:016X}", guard_page_virt_addr);
-            info!("  Physical offset: 0x{:X}", physical_offset);
-            info!("  Page number: {}", page_num);
-            info!("  PT array index: {}", pt_array_idx);
-            info!("  Entry in PT: {}", page_idx_in_pt);
-            info!(
-                "  Entry value: 0x{:016X}",
-                (*pt_high)[pt_array_idx].entry(page_idx_in_pt).get_raw()
-            );
-            info!(
-                "  Entry is Present: {}",
-                (*pt_high)[pt_array_idx].entry(page_idx_in_pt).get_raw() & 1 != 0
-            );
+            // デバッグ: Guard Page設定を確認（リリースビルドでは省略）
+            #[cfg(debug_assertions)]
+            {
+                info!("Guard Page setup:");
+                info!("  Virtual address: 0x{:016X}", guard_page_virt_addr);
+                info!("  Physical offset: 0x{:X}", physical_offset);
+                info!("  Page number: {}", page_num);
+                info!("  PT array index: {}", pt_array_idx);
+                info!("  Entry in PT: {}", page_idx_in_pt);
+                info!(
+                    "  Entry value: 0x{:016X}",
+                    (*pt_high)[pt_array_idx].entry(page_idx_in_pt).get_raw()
+                );
+                info!(
+                    "  Entry is Present: {}",
+                    (*pt_high)[pt_array_idx].entry(page_idx_in_pt).get_raw() & 1 != 0
+                );
+            }
         }
 
         // === カーネル領域を4KBページでセクション毎にマッピング ===
