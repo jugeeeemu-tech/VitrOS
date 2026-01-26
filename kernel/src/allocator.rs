@@ -157,27 +157,45 @@ impl BuddyAllocator {
     }
 
     /// ビットマップにフリーマークを設定
+    ///
+    /// # Safety
+    /// - `addr`は`region_start`以上かつバディ領域内であること
+    /// - `order`は0..MAX_ORDERの範囲内であること
     #[inline]
     unsafe fn mark_free(&self, addr: usize, order: usize) {
         let index = self.addr_to_bit_index(addr, order);
+        let word_index = index / 64;
+        debug_assert!(word_index < MAX_BITMAP_WORDS, "bitmap index out of bounds");
         let bitmap = unsafe { &mut *self.free_bitmaps[order].get() };
-        bitmap[index / 64] |= 1u64 << (index % 64);
+        bitmap[word_index] |= 1u64 << (index % 64);
     }
 
     /// ビットマップからフリーマークを削除
+    ///
+    /// # Safety
+    /// - `addr`は`region_start`以上かつバディ領域内であること
+    /// - `order`は0..MAX_ORDERの範囲内であること
     #[inline]
     unsafe fn unmark_free(&self, addr: usize, order: usize) {
         let index = self.addr_to_bit_index(addr, order);
+        let word_index = index / 64;
+        debug_assert!(word_index < MAX_BITMAP_WORDS, "bitmap index out of bounds");
         let bitmap = unsafe { &mut *self.free_bitmaps[order].get() };
-        bitmap[index / 64] &= !(1u64 << (index % 64));
+        bitmap[word_index] &= !(1u64 << (index % 64));
     }
 
     /// アドレスがフリーかO(1)で判定
+    ///
+    /// # Safety
+    /// - `addr`は`region_start`以上かつバディ領域内であること
+    /// - `order`は0..MAX_ORDERの範囲内であること
     #[inline]
     unsafe fn is_free(&self, addr: usize, order: usize) -> bool {
         let index = self.addr_to_bit_index(addr, order);
+        let word_index = index / 64;
+        debug_assert!(word_index < MAX_BITMAP_WORDS, "bitmap index out of bounds");
         let bitmap = unsafe { &*self.free_bitmaps[order].get() };
-        (bitmap[index / 64] >> (index % 64)) & 1 != 0
+        (bitmap[word_index] >> (index % 64)) & 1 != 0
     }
 
     // =========================================================================
@@ -852,6 +870,10 @@ mod bitmap_tests {
             ALLOCATOR.buddy.deallocate(ptr.as_ptr(), layout);
             // 解放後はフリーリストに存在する（結合されている可能性があるため
             // 特定のオーダーでの存在は保証できないが、ビットマップは正しく更新される）
+
+            // 解放後、再割り当てが成功することを確認（ビットマップが正しく更新されていれば成功する）
+            let ptr2 = ALLOCATOR.buddy.allocate(layout);
+            assert!(ptr2.is_some(), "再割り当てが成功すべき");
         }
     }
 }
