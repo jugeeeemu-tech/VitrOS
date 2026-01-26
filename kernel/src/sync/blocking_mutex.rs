@@ -130,9 +130,8 @@ mod tests {
     #[test_case]
     fn test_mutex_try_lock_success() {
         let mutex = BlockingMutex::new(42);
-        let guard = mutex.try_lock();
-        assert!(guard.is_some());
-        assert_eq!(*guard.unwrap(), 42);
+        let guard = mutex.try_lock().expect("Lock should succeed");
+        assert_eq!(*guard, 42);
     }
 
     #[test_case]
