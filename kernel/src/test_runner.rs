@@ -10,7 +10,7 @@ use crate::io::port_write_u8;
 /// - Success (0x10) → (0x10 << 1) | 1 = 0x21 = 33
 /// - Failed (0x11) → (0x11 << 1) | 1 = 0x23 = 35
 #[derive(Debug, Clone, Copy)]
-#[repr(u32)]
+#[repr(u8)]
 pub enum QemuExitCode {
     Success = 0x10, // QEMU exit code: 33
     Failed = 0x11,  // QEMU exit code: 35
@@ -62,12 +62,15 @@ pub fn runner(tests: &[&dyn Testable]) {
 // サンプルテスト
 // ============================================================================
 
-#[test_case]
-fn trivial_assertion() {
-    assert_eq!(1, 1);
-}
+#[cfg(test)]
+mod tests {
+    #[test_case]
+    fn trivial_assertion() {
+        assert_eq!(1, 1);
+    }
 
-#[test_case]
-fn test_serial_print() {
-    crate::serial_print!("test output ");
+    #[test_case]
+    fn test_serial_print() {
+        crate::serial_print!("test output ");
+    }
 }

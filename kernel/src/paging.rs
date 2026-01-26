@@ -364,7 +364,7 @@ fn is_mmio_region_binary(phys_addr: u64, mmio_ranges: &[MmioRange; 64], count: u
 /// カーネル専用スタック（64KB）
 #[allow(dead_code)]
 #[repr(align(16))]
-pub struct KernelStack(pub [u8; 65536]);
+pub struct KernelStack([u8; 65536]);
 
 /// カーネルスタックの実体
 pub static mut KERNEL_STACK: KernelStack = KernelStack([0; 65536]);
