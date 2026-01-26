@@ -30,6 +30,11 @@ const MIN_BLOCK_SIZE_LOG2: u32 = 12;
 /// （要素数が一致しなければコンパイルエラーになる）
 const MAX_ORDER: usize = 13;
 
+/// ビットマップの最大ワード数
+/// 1GB / 4KB / 64 = 4096ワード
+/// 実際のヒープサイズ（約1GB）に対応
+const MAX_BITMAP_WORDS: usize = 4096;
+
 /// フリーブロックノード（双方向リンクリスト）
 #[repr(C)]
 struct BuddyFreeNode {
@@ -42,6 +47,8 @@ struct BuddyAllocator {
     free_lists: [UnsafeCell<Option<NonNull<BuddyFreeNode>>>; MAX_ORDER],
     region_start: UnsafeCell<usize>,
     region_size: UnsafeCell<usize>,
+    /// 各オーダーのフリーブロックビットマップ（O(1)判定用）
+    free_bitmaps: [UnsafeCell<[u64; MAX_BITMAP_WORDS]>; MAX_ORDER],
 }
 
 impl BuddyAllocator {
@@ -65,6 +72,21 @@ impl BuddyAllocator {
             ],
             region_start: UnsafeCell::new(0),
             region_size: UnsafeCell::new(0),
+            free_bitmaps: [
+                UnsafeCell::new([0u64; MAX_BITMAP_WORDS]),
+                UnsafeCell::new([0u64; MAX_BITMAP_WORDS]),
+                UnsafeCell::new([0u64; MAX_BITMAP_WORDS]),
+                UnsafeCell::new([0u64; MAX_BITMAP_WORDS]),
+                UnsafeCell::new([0u64; MAX_BITMAP_WORDS]),
+                UnsafeCell::new([0u64; MAX_BITMAP_WORDS]),
+                UnsafeCell::new([0u64; MAX_BITMAP_WORDS]),
+                UnsafeCell::new([0u64; MAX_BITMAP_WORDS]),
+                UnsafeCell::new([0u64; MAX_BITMAP_WORDS]),
+                UnsafeCell::new([0u64; MAX_BITMAP_WORDS]),
+                UnsafeCell::new([0u64; MAX_BITMAP_WORDS]),
+                UnsafeCell::new([0u64; MAX_BITMAP_WORDS]),
+                UnsafeCell::new([0u64; MAX_BITMAP_WORDS]),
+            ],
         }
     }
 
@@ -123,6 +145,42 @@ impl BuddyAllocator {
     }
 
     // =========================================================================
+    // ビットマップ操作（O(1)フリー判定用）
+    // =========================================================================
+
+    /// アドレスからビットインデックスを計算
+    #[inline]
+    fn addr_to_bit_index(&self, addr: usize, order: usize) -> usize {
+        let region_start = unsafe { *self.region_start.get() };
+        debug_assert!(addr >= region_start, "addr must be >= region_start");
+        (addr - region_start) >> (MIN_BLOCK_SIZE_LOG2 as usize + order)
+    }
+
+    /// ビットマップにフリーマークを設定
+    #[inline]
+    unsafe fn mark_free(&self, addr: usize, order: usize) {
+        let index = self.addr_to_bit_index(addr, order);
+        let bitmap = unsafe { &mut *self.free_bitmaps[order].get() };
+        bitmap[index / 64] |= 1u64 << (index % 64);
+    }
+
+    /// ビットマップからフリーマークを削除
+    #[inline]
+    unsafe fn unmark_free(&self, addr: usize, order: usize) {
+        let index = self.addr_to_bit_index(addr, order);
+        let bitmap = unsafe { &mut *self.free_bitmaps[order].get() };
+        bitmap[index / 64] &= !(1u64 << (index % 64));
+    }
+
+    /// アドレスがフリーかO(1)で判定
+    #[inline]
+    unsafe fn is_free(&self, addr: usize, order: usize) -> bool {
+        let index = self.addr_to_bit_index(addr, order);
+        let bitmap = unsafe { &*self.free_bitmaps[order].get() };
+        (bitmap[index / 64] >> (index % 64)) & 1 != 0
+    }
+
+    // =========================================================================
     // フリーリスト操作
     // =========================================================================
 
@@ -148,6 +206,9 @@ impl BuddyAllocator {
             }
 
             *free_list = NonNull::new(node);
+
+            // ビットマップにフリーマークを設定
+            self.mark_free(addr, order);
         }
     }
 
@@ -169,6 +230,10 @@ impl BuddyAllocator {
                 }
 
                 *free_list = next;
+
+                // ビットマップからフリーマークを削除
+                self.unmark_free(head.as_ptr() as usize, order);
+
                 Some(head)
             } else {
                 None
@@ -201,32 +266,9 @@ impl BuddyAllocator {
             if let Some(next_node) = next {
                 (*next_node.as_ptr()).prev = prev;
             }
-        }
-    }
 
-    /// 指定したアドレスがフリーリストに存在するかチェック
-    ///
-    /// # Safety
-    /// - `order`は0..MAX_ORDERの範囲内であること
-    /// - フリーリスト内のノードは全て有効なポインタであること
-    ///
-    /// # Performance
-    /// この関数はO(n)の線形探索を行う。deallocate時のバディ結合で呼び出されるため、
-    /// 大量のフリーブロックがある場合は割り込みレイテンシが増大する可能性がある。
-    ///
-    /// TODO: ビットマップベースの実装でO(1)判定を可能にする (Issue #41)
-    unsafe fn is_in_free_list(&self, addr: usize, order: usize) -> bool {
-        unsafe {
-            let free_list = *self.free_lists[order].get();
-            let mut current = free_list;
-
-            while let Some(node) = current {
-                if node.as_ptr() as usize == addr {
-                    return true;
-                }
-                current = (*node.as_ptr()).next;
-            }
-            false
+            // ビットマップからフリーマークを削除
+            self.unmark_free(addr, order);
         }
     }
 
@@ -392,8 +434,8 @@ impl BuddyAllocator {
                     break;
                 }
 
-                // バディがフリーリストにあるかチェック
-                if !unsafe { self.is_in_free_list(buddy_addr, order) } {
+                // バディがフリーかチェック（O(1)ビットマップ判定）
+                if !unsafe { self.is_free(buddy_addr, order) } {
                     break;
                 }
 
@@ -699,17 +741,117 @@ struct TestHeap([u8; 64 * 1024]);
 #[cfg(test)]
 static mut TEST_HEAP: TestHeap = TestHeap([0; 64 * 1024]);
 
+#[cfg(test)]
+static TEST_HEAP_INITIALIZED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// テスト用にヒープを初期化
 ///
-/// # Safety
-/// この関数はテスト環境でのみ使用すること。
-/// 複数回呼び出すと未定義動作を引き起こす可能性がある。
+/// この関数は複数回呼び出しても安全。2回目以降は何もしない。
 #[cfg(test)]
 pub fn init_test_heap() {
+    use core::sync::atomic::Ordering;
+
+    // 既に初期化済みなら何もしない
+    if TEST_HEAP_INITIALIZED.load(Ordering::Acquire) {
+        return;
+    }
+
+    // 初期化を試みる（CASで競合を防ぐ）
+    if TEST_HEAP_INITIALIZED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return; // 他のスレッドが先に初期化した
+    }
+
     use core::ptr::addr_of;
     unsafe {
         let heap_start = addr_of!(TEST_HEAP) as usize;
         let heap_size = core::mem::size_of::<TestHeap>();
         ALLOCATOR.init(heap_start, heap_size);
+    }
+}
+
+// =============================================================================
+// ビットマップ関連テスト
+// =============================================================================
+
+#[cfg(test)]
+mod bitmap_tests {
+    use super::*;
+
+    #[test_case]
+    fn test_addr_to_bit_index_order0() {
+        // オーダー0: 4KB単位でインデックス化
+        init_test_heap();
+        let start = ALLOCATOR.buddy.region_start();
+
+        assert_eq!(ALLOCATOR.buddy.addr_to_bit_index(start, 0), 0);
+        assert_eq!(ALLOCATOR.buddy.addr_to_bit_index(start + 4096, 0), 1);
+        assert_eq!(ALLOCATOR.buddy.addr_to_bit_index(start + 8192, 0), 2);
+    }
+
+    #[test_case]
+    fn test_addr_to_bit_index_order1() {
+        // オーダー1: 8KB単位でインデックス化
+        init_test_heap();
+        let start = ALLOCATOR.buddy.region_start();
+
+        assert_eq!(ALLOCATOR.buddy.addr_to_bit_index(start, 1), 0);
+        assert_eq!(ALLOCATOR.buddy.addr_to_bit_index(start + 8192, 1), 1);
+        assert_eq!(ALLOCATOR.buddy.addr_to_bit_index(start + 16384, 1), 2);
+    }
+
+    #[test_case]
+    fn test_bitmap_mark_and_check() {
+        // mark_free -> is_free がtrueを返す
+        init_test_heap();
+        let start = ALLOCATOR.buddy.region_start();
+
+        unsafe {
+            // mark_freeしてis_freeがtrueになることを確認
+            ALLOCATOR.buddy.mark_free(start + 4096 * 5, 0);
+            assert!(ALLOCATOR.buddy.is_free(start + 4096 * 5, 0));
+        }
+    }
+
+    #[test_case]
+    fn test_bitmap_unmark() {
+        // mark_free -> unmark_free -> is_free がfalseを返す
+        init_test_heap();
+        let start = ALLOCATOR.buddy.region_start();
+
+        unsafe {
+            ALLOCATOR.buddy.mark_free(start + 4096 * 6, 0);
+            assert!(ALLOCATOR.buddy.is_free(start + 4096 * 6, 0));
+
+            ALLOCATOR.buddy.unmark_free(start + 4096 * 6, 0);
+            assert!(!ALLOCATOR.buddy.is_free(start + 4096 * 6, 0));
+        }
+    }
+
+    #[test_case]
+    fn test_is_free_consistency() {
+        // フリーリスト操作とビットマップの一貫性を確認
+        init_test_heap();
+
+        // バディからブロックを割り当て・解放して一貫性を確認
+        use core::alloc::Layout;
+        let layout = Layout::from_size_align(4096, 4096).unwrap();
+
+        unsafe {
+            let ptr = ALLOCATOR.buddy.allocate(layout);
+            assert!(ptr.is_some());
+
+            let ptr = ptr.unwrap();
+            // 割り当て後はフリーリストに存在しない
+            assert!(!ALLOCATOR.buddy.is_free(ptr.as_ptr() as usize, 0));
+
+            // 解放
+            ALLOCATOR.buddy.deallocate(ptr.as_ptr(), layout);
+            // 解放後はフリーリストに存在する（結合されている可能性があるため
+            // 特定のオーダーでの存在は保証できないが、ビットマップは正しく更新される）
+        }
     }
 }
