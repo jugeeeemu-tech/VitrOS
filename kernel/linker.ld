@@ -43,5 +43,15 @@ SECTIONS
         __bss_end = .;
     }
 
+    /* カーネルスタック（ガードページ付き） */
+    .stack ALIGN(4K) : AT(ALIGN(LOADADDR(.bss) + SIZEOF(.bss), 4K))
+    {
+        __stack_guard = .;    /* ガードページ（4KB） */
+        . += 4K;
+        __stack_bottom = .;   /* スタック底 */
+        . += 64K;             /* スタック領域（64KB） */
+        __stack_top = .;      /* スタックトップ */
+    }
+
     /DISCARD/ : { *(.eh_frame) *(.eh_frame_hdr) *(.note .note.*) }
 }

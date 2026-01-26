@@ -196,7 +196,7 @@ pub unsafe fn virt_to_mut<T>(virt_addr: u64) -> Result<&'static mut T, AddressEr
 mod tests {
     use super::*;
 
-    #[test]
+    #[test_case]
     fn test_is_aligned() {
         assert!(is_aligned(0x1000, 0x1000));
         assert!(is_aligned(0x2000, 0x1000));
@@ -204,7 +204,7 @@ mod tests {
         assert!(is_aligned(0, 0x1000));
     }
 
-    #[test]
+    #[test_case]
     fn test_align_up() {
         assert_eq!(align_up(0x1000, 0x1000), 0x1000);
         assert_eq!(align_up(0x1001, 0x1000), 0x2000);
@@ -212,7 +212,7 @@ mod tests {
         assert_eq!(align_up(0, 0x1000), 0);
     }
 
-    #[test]
+    #[test_case]
     fn test_align_down() {
         assert_eq!(align_down(0x1000, 0x1000), 0x1000);
         assert_eq!(align_down(0x1001, 0x1000), 0x1000);

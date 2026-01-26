@@ -79,7 +79,7 @@ impl CompositorObserver for NoOpObserver {}
 mod tests {
     use super::*;
 
-    #[test]
+    #[test_case]
     fn noop_observer_is_zst() {
         assert_eq!(core::mem::size_of::<NoOpObserver>(), 0);
     }

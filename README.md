@@ -47,6 +47,12 @@ cargo run
 3. EFI パーティション構造を作成
 4. QEMU で起動
 
+## テスト
+
+```bash
+cargo +nightly test -p vitros-kernel --target x86_64-unknown-none
+```
+
 ## オプション
 
 ### メモリアロケータ可視化

@@ -123,3 +123,21 @@ macro_rules! error {
         let _ = writeln!(serial, "\x1b[31m[ERROR]\x1b[0m {}", format_args!($($arg)*));
     }};
 }
+
+// テスト用シリアル出力マクロ
+// serial_print!: 改行なしでシリアル出力
+#[macro_export]
+macro_rules! serial_print {
+    ($($arg:tt)*) => {{
+        $crate::serial::_print(format_args!($($arg)*));
+    }};
+}
+
+// serial_println!: 改行ありでシリアル出力
+#[macro_export]
+macro_rules! serial_println {
+    () => ($crate::serial_print!("\n"));
+    ($($arg:tt)*) => {{
+        $crate::serial::_print(format_args!("{}\n", format_args!($($arg)*)));
+    }};
+}
