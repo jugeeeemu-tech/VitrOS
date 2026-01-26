@@ -9,7 +9,6 @@ use crate::paging::PAGE_SIZE;
 #[cfg(not(test))]
 unsafe extern "C" {
     static __stack_top: u8;
-    static __stack_bottom: u8;
     static __stack_guard: u8;
 }
 
