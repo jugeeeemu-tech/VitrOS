@@ -299,8 +299,8 @@ extern "C" fn timer_handler_inner() {
 // 例外ハンドラ実装
 // =============================================================================
 
-/// Divide Error (#DE, ベクタ0) ハンドラ
-/// ゼロ除算または除算結果がオーバーフローした場合に発生
+// Divide Error (#DE, ベクタ0) ハンドラ
+// ゼロ除算または除算結果がオーバーフローした場合に発生
 exception_handler!(divide_error_handler, divide_error_handler_inner);
 
 extern "C" fn divide_error_handler_inner() {
@@ -317,8 +317,8 @@ extern "C" fn divide_error_handler_inner() {
     }
 }
 
-/// Debug Exception (#DB, ベクタ1) ハンドラ
-/// デバッグレジスタによるブレークポイントやシングルステップで発生
+// Debug Exception (#DB, ベクタ1) ハンドラ
+// デバッグレジスタによるブレークポイントやシングルステップで発生
 exception_handler!(debug_exception_handler, debug_exception_handler_inner);
 
 extern "C" fn debug_exception_handler_inner() {
@@ -334,8 +334,8 @@ extern "C" fn debug_exception_handler_inner() {
     }
 }
 
-/// Breakpoint (#BP, ベクタ3) ハンドラ
-/// INT3命令（0xCC）によって発生
+// Breakpoint (#BP, ベクタ3) ハンドラ
+// INT3命令（0xCC）によって発生
 exception_handler!(breakpoint_handler, breakpoint_handler_inner);
 
 extern "C" fn breakpoint_handler_inner() {
@@ -350,8 +350,8 @@ extern "C" fn breakpoint_handler_inner() {
     println!("Control will transfer to debugger if attached.");
 }
 
-/// Invalid Opcode (#UD, ベクタ6) ハンドラ
-/// 無効な命令やサポートされていない命令を実行しようとした場合に発生
+// Invalid Opcode (#UD, ベクタ6) ハンドラ
+// 無効な命令やサポートされていない命令を実行しようとした場合に発生
 exception_handler!(invalid_opcode_handler, invalid_opcode_handler_inner);
 
 extern "C" fn invalid_opcode_handler_inner() {
@@ -371,8 +371,8 @@ extern "C" fn invalid_opcode_handler_inner() {
 // エラーコード付き例外ハンドラ実装
 // =============================================================================
 
-/// Double Fault (#DF, ベクタ8) ハンドラ
-/// 例外ハンドラ内で別の例外が発生した場合に発生（重大なエラー）
+// Double Fault (#DF, ベクタ8) ハンドラ
+// 例外ハンドラ内で別の例外が発生した場合に発生（重大なエラー）
 exception_handler_with_error_code!(double_fault_handler, double_fault_handler_inner);
 
 extern "C" fn double_fault_handler_inner(error_code: u64) {
@@ -426,8 +426,8 @@ extern "C" fn double_fault_handler_inner(error_code: u64) {
     }
 }
 
-/// General Protection Fault (#GP, ベクタ13) ハンドラ
-/// セグメント違反、特権レベル違反、無効なメモリアクセスなどで発生
+// General Protection Fault (#GP, ベクタ13) ハンドラ
+// セグメント違反、特権レベル違反、無効なメモリアクセスなどで発生
 exception_handler_with_error_code!(
     general_protection_fault_handler,
     general_protection_fault_handler_inner
@@ -469,8 +469,8 @@ extern "C" fn general_protection_fault_handler_inner(error_code: u64) {
     }
 }
 
-/// Page Fault (#PF, ベクタ14) ハンドラ
-/// 無効なページアクセス、権限違反、ページ未マップなどで発生
+// Page Fault (#PF, ベクタ14) ハンドラ
+// 無効なページアクセス、権限違反、ページ未マップなどで発生
 exception_handler_with_error_code!(page_fault_handler, page_fault_handler_inner);
 
 extern "C" fn page_fault_handler_inner(error_code: u64) {
