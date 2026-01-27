@@ -19,6 +19,7 @@ use vitros_kernel::paging;
 use vitros_kernel::pci;
 use vitros_kernel::sched;
 use vitros_kernel::timer;
+use vitros_kernel::usb;
 
 // マクロをインポート
 use vitros_kernel::{error, info, print, println, warn};
@@ -241,6 +242,9 @@ extern "C" fn kernel_main_inner(boot_info_phys_addr: u64) -> ! {
 
     // PCIバスをスキャン
     pci::scan_pci_bus();
+
+    // USBサブシステムを初期化
+    usb::init();
 
     // Local APICを初期化
     // APICは必須なので失敗時はpanic

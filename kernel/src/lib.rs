@@ -33,6 +33,7 @@ pub mod stack;
 pub mod sync;
 pub mod timer;
 pub mod timer_device;
+pub mod usb;
 
 // テストフレームワーク
 pub mod test_runner;
