@@ -11,6 +11,7 @@ use vitros_kernel::acpi;
 use vitros_kernel::allocator;
 use vitros_kernel::apic;
 use vitros_kernel::debug_overlay;
+use vitros_kernel::frame_allocator;
 use vitros_kernel::gdt;
 use vitros_kernel::graphics;
 use vitros_kernel::idt;
@@ -19,6 +20,7 @@ use vitros_kernel::paging;
 use vitros_kernel::pci;
 use vitros_kernel::sched;
 use vitros_kernel::timer;
+use vitros_kernel::usb;
 
 // マクロをインポート
 use vitros_kernel::{error, info, print, println, warn};
@@ -204,6 +206,23 @@ extern "C" fn kernel_main_inner(boot_info_phys_addr: u64) -> ! {
     // カーネル実行中は不変であることが保証されている。
     let boot_info = unsafe { &*(boot_info_virt_addr as *const BootInfo) };
 
+    // ヒープ候補となる最大のConventional Memory領域を先に決定
+    let safe_count = boot_info.memory_map_count.min(boot_info.memory_map.len());
+    let mut largest_start_phys: u64 = 0;
+    let mut largest_size: usize = 0;
+    for i in 0..safe_count {
+        let region = &boot_info.memory_map[i];
+        if region.region_type == uefi::EFI_CONVENTIONAL_MEMORY && region.size > largest_size as u64
+        {
+            largest_start_phys = region.start;
+            largest_size = region.size as usize;
+        }
+    }
+    #[cfg(feature = "visualize-allocator")]
+    let heap_size = largest_size.min(256 * 1024); // 可視化のため256KBに制限
+    #[cfg(not(feature = "visualize-allocator"))]
+    let heap_size = largest_size; // 本番環境では全て使用
+
     // GDTを初期化
     info!("Initializing GDT...");
     gdt::init().expect("Failed to initialize GDT");
@@ -217,6 +236,19 @@ extern "C" fn kernel_main_inner(boot_info_phys_addr: u64) -> ! {
     info!("Creating kernel page tables...");
     paging::init(boot_info).expect("Failed to initialize paging system");
     info!("Kernel page tables created and loaded");
+
+    // 物理メモリアロケータを初期化
+    info!("Initializing frame allocator...");
+    frame_allocator::init(boot_info).expect("Failed to initialize frame allocator");
+    if heap_size > 0 {
+        frame_allocator::reserve_range(largest_start_phys, heap_size as u64)
+            .expect("Failed to reserve heap range in frame allocator");
+        info!(
+            "Reserved heap range in frame allocator: phys=0x{:X}, size={} KB",
+            largest_start_phys,
+            heap_size / 1024
+        );
+    }
 
     // GDTを高位アドレスで再ロード（念のため）
     info!("Reloading GDT...");
@@ -241,6 +273,9 @@ extern "C" fn kernel_main_inner(boot_info_phys_addr: u64) -> ! {
 
     // PCIバスをスキャン
     pci::scan_pci_bus();
+
+    // USBサブシステムを初期化
+    usb::init();
 
     // Local APICを初期化
     // APICは必須なので失敗時はpanic
@@ -283,34 +318,10 @@ extern "C" fn kernel_main_inner(boot_info_phys_addr: u64) -> ! {
 
     info!("Memory map count: {}", boot_info.memory_map_count);
     info!("Memory map array len: {}", boot_info.memory_map.len());
-
-    // 利用可能なメモリを探してアロケータを初期化
-    let mut largest_start_phys: u64 = 0;
-    let mut largest_size = 0;
-
-    // 配列の範囲内に制限
-    let safe_count = boot_info.memory_map_count.min(boot_info.memory_map.len());
     info!("Using safe count: {}", safe_count);
-
-    for i in 0..safe_count {
-        let region = &boot_info.memory_map[i];
-        // region_type == 7 は EFI_CONVENTIONAL_MEMORY
-        if region.region_type == uefi::EFI_CONVENTIONAL_MEMORY && region.size > largest_size as u64
-        {
-            largest_start_phys = region.start;
-            largest_size = region.size as usize;
-        }
-    }
 
     if largest_size > 0 {
         info!("Found usable memory");
-
-        // ヒープサイズを決定
-        #[cfg(feature = "visualize-allocator")]
-        let heap_size = largest_size.min(256 * 1024); // 可視化のため256KBに制限
-
-        #[cfg(not(feature = "visualize-allocator"))]
-        let heap_size = largest_size; // 本番環境では全て使用
 
         // 物理アドレスを高位仮想アドレスに変換
         let largest_start_virt =

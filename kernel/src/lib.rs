@@ -16,6 +16,7 @@ pub mod addr;
 pub mod allocator;
 pub mod apic;
 pub mod debug_overlay;
+pub mod frame_allocator;
 pub mod gdt;
 pub mod graphics;
 pub mod hpet;
@@ -33,6 +34,7 @@ pub mod stack;
 pub mod sync;
 pub mod timer;
 pub mod timer_device;
+pub mod usb;
 
 // テストフレームワーク
 pub mod test_runner;

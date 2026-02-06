@@ -422,6 +422,32 @@ pub fn scan_pci_bus() {
     info!("PCI scan complete. Found {} device(s)", device_count);
 }
 
+/// 条件に一致するPCIデバイスを検索
+pub fn find_device<F>(predicate: F) -> Option<PciDevice>
+where
+    F: Fn(&PciDevice) -> bool,
+{
+    for bus in 0..=255u8 {
+        for device in 0..32u8 {
+            if let Some(pci_dev) = PciDevice::read(bus, device, 0) {
+                if predicate(&pci_dev) {
+                    return Some(pci_dev);
+                }
+                if (pci_dev.header_type & 0x80) != 0 {
+                    for function in 1..8u8 {
+                        if let Some(func_dev) = PciDevice::read(bus, device, function) {
+                            if predicate(&func_dev) {
+                                return Some(func_dev);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// PCIデバイス情報を表示
 fn print_device(dev: &PciDevice) {
     info!(
