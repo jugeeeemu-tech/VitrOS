@@ -16,6 +16,7 @@ pub mod addr;
 pub mod allocator;
 pub mod apic;
 pub mod debug_overlay;
+pub mod frame_allocator;
 pub mod gdt;
 pub mod graphics;
 pub mod hpet;

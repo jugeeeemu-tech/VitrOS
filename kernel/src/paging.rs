@@ -39,6 +39,8 @@ pub enum PagingError {
     FeatureNotSupported,
     /// 既存のマッピングと競合（PT/PD参照が既に存在）
     ExistingMappingConflict,
+    /// ページテーブル用フレームの確保に失敗
+    FrameAllocationFailed,
 }
 
 impl core::fmt::Display for PagingError {
@@ -53,6 +55,7 @@ impl core::fmt::Display for PagingError {
             PagingError::ExistingMappingConflict => {
                 write!(f, "Existing page table mapping conflict")
             }
+            PagingError::FrameAllocationFailed => write!(f, "Page-table frame allocation failed"),
         }
     }
 }
@@ -386,6 +389,9 @@ static mut KERNEL_PD_HIGH: [PageTable; MAX_SUPPORTED_MEMORY_GB] =
 // 低位アドレスはアンマップ（ハイヤーハーフカーネル）
 static mut KERNEL_PT_HIGH: [PageTable; PT_COUNT] = [PageTable::new(); PT_COUNT];
 
+// map_mmio() がページテーブル拡張に使えるフレームの上限（初期直写済み範囲）
+static mut INITIAL_MAPPED_MAX_PHYS: u64 = 0;
+
 /// ページングシステムを初期化してCR3に設定
 /// 物理メモリの直接マッピング（Direct Mapping）を実装
 /// - 低位アドレス（0x0〜）: アンマップ（ハイヤーハーフカーネル）
@@ -404,6 +410,10 @@ pub fn init(boot_info: &vitros_common::boot_info::BootInfo) -> Result<(), Paging
     // サポートする最大アドレスを計算
     let max_supported = (MAX_SUPPORTED_MEMORY_GB as u64) << 30; // 8GB
     let actual_max = boot_info.max_physical_address.min(max_supported);
+
+    unsafe {
+        INITIAL_MAPPED_MAX_PHYS = actual_max;
+    }
 
     // 必要なPD数とPT数を計算
     // 1 PT = 512 * 4KB = 2MB
@@ -641,6 +651,46 @@ fn assert_interrupts_disabled(context: &str) {
     );
 }
 
+#[inline]
+fn direct_map_table_indices(phys_addr: u64) -> Result<(usize, usize, usize, usize), PagingError> {
+    let virt_addr = phys_to_virt(phys_addr)?;
+    let pml4_idx = ((virt_addr >> 39) & 0x1FF) as usize;
+    let pdp_idx = ((virt_addr >> 30) & 0x1FF) as usize;
+    let pd_idx = ((virt_addr >> 21) & 0x1FF) as usize;
+    let pt_idx = ((virt_addr >> 12) & 0x1FF) as usize;
+    Ok((pml4_idx, pdp_idx, pd_idx, pt_idx))
+}
+
+unsafe fn table_from_entry(entry: &PageTableEntry) -> Result<*mut PageTable, PagingError> {
+    if !entry.is_present() {
+        return Err(PagingError::PageTableInitFailed);
+    }
+    if entry.is_huge_page() {
+        return Err(PagingError::ExistingMappingConflict);
+    }
+    let table_phys = entry.get_address();
+    let table_virt = phys_to_virt(table_phys)?;
+    Ok(table_virt as *mut PageTable)
+}
+
+unsafe fn alloc_page_table_frame() -> Result<*mut PageTable, PagingError> {
+    let limit = unsafe { INITIAL_MAPPED_MAX_PHYS };
+    if limit < PAGE_SIZE as u64 {
+        return Err(PagingError::FrameAllocationFailed);
+    }
+
+    let frame_phys = crate::frame_allocator::alloc_frame_below(limit)
+        .map_err(|_| PagingError::FrameAllocationFailed)?;
+    let frame_virt = phys_to_virt(frame_phys)?;
+    let frame_ptr = frame_virt as *mut PageTable;
+
+    unsafe {
+        (*frame_ptr).clear();
+    }
+
+    Ok(frame_ptr)
+}
+
 /// MMIO領域をUC（Uncacheable）属性でマッピングする
 ///
 /// init()でスキップされたMMIO領域を、デバイス使用前に動的にマッピングする。
@@ -665,7 +715,9 @@ fn assert_interrupts_disabled(context: &str) {
 ///
 /// # Errors
 /// * `PagingError::InvalidAddress` - アドレスが4KB境界にアライメントされていない場合
-/// * `PagingError::PageTableInitFailed` - ページテーブルのインデックスが範囲外の場合
+/// * `PagingError::AddressOutOfRange` - 直接マップ可能範囲外の物理アドレスの場合
+/// * `PagingError::ExistingMappingConflict` - 既存HugePageマッピングと衝突した場合
+/// * `PagingError::FrameAllocationFailed` - ページテーブル用フレーム確保に失敗した場合
 pub fn map_mmio(phys_addr: u64, size: u64) -> Result<u64, PagingError> {
     use crate::info;
 
@@ -684,32 +736,67 @@ pub fn map_mmio(phys_addr: u64, size: u64) -> Result<u64, PagingError> {
     let uc_flags = PageTableFlags::Present as u64
         | PageTableFlags::Writable as u64
         | PageTableFlags::CacheDisable as u64;
+    let table_flags = PageTableFlags::Present as u64 | PageTableFlags::Writable as u64;
 
     unsafe {
-        let pt_high = addr_of_mut!(KERNEL_PT_HIGH);
+        let pml4 = addr_of_mut!(KERNEL_PML4);
 
         for i in 0..page_count {
             let addr = phys_addr + (i * PAGE_SIZE) as u64;
+            let (pml4_idx, pdp_idx, pd_idx, pt_idx) = direct_map_table_indices(addr)?;
+            if pml4_idx != PML4_KERNEL_INDEX {
+                return Err(PagingError::AddressOutOfRange);
+            }
 
-            // ページ番号を計算
-            let page_num = (addr >> 12) as usize;
-
-            // PT配列内のインデックスとPT内のエントリ番号を計算
-            let pt_array_idx = page_num / PAGE_TABLE_ENTRY_COUNT;
-            let page_idx_in_pt = page_num % PAGE_TABLE_ENTRY_COUNT;
-
-            // インデックスの範囲検証
-            if pt_array_idx >= PT_COUNT {
+            // PML4 -> PDP は init() で固定設定済み
+            let pdp_entry = (*pml4).entry(pml4_idx);
+            if !pdp_entry.is_present() {
                 return Err(PagingError::PageTableInitFailed);
             }
+            let pdp = table_from_entry(pdp_entry)?;
+
+            // PDP[pdp_idx] -> PD を必要時に動的確保
+            let pdp_entry = (*pdp).entry(pdp_idx);
+            let pd = if pdp_entry.is_present() {
+                if pdp_entry.is_huge_page() {
+                    return Err(PagingError::ExistingMappingConflict);
+                }
+                table_from_entry(pdp_entry)?
+            } else {
+                let new_pd = alloc_page_table_frame()?;
+                let new_pd_phys = virt_to_phys(new_pd as u64)?;
+                pdp_entry.set(new_pd_phys, table_flags);
+                #[cfg(debug_assertions)]
+                info!(
+                    "map_mmio: allocated PD table phys=0x{:X} for PDP index {}",
+                    new_pd_phys, pdp_idx
+                );
+                new_pd
+            };
+
+            // PD[pd_idx] -> PT を必要時に動的確保
+            let pd_entry = (*pd).entry(pd_idx);
+            let pt = if pd_entry.is_present() {
+                if pd_entry.is_huge_page() {
+                    return Err(PagingError::ExistingMappingConflict);
+                }
+                table_from_entry(pd_entry)?
+            } else {
+                let new_pt = alloc_page_table_frame()?;
+                let new_pt_phys = virt_to_phys(new_pt as u64)?;
+                pd_entry.set(new_pt_phys, table_flags);
+                #[cfg(debug_assertions)]
+                info!(
+                    "map_mmio: allocated PT table phys=0x{:X} for PD index {}",
+                    new_pt_phys, pd_idx
+                );
+                new_pt
+            };
 
             // デバッグビルド時のみ重複マッピングを警告
             #[cfg(debug_assertions)]
             {
-                if (*pt_high)[pt_array_idx]
-                    .get_entry(page_idx_in_pt)
-                    .is_present()
-                {
+                if (*pt).get_entry(pt_idx).is_present() {
                     info!(
                         "Warning: map_mmio overwriting existing mapping at 0x{:X}",
                         addr
@@ -718,9 +805,7 @@ pub fn map_mmio(phys_addr: u64, size: u64) -> Result<u64, PagingError> {
             }
 
             // UC属性でページテーブルエントリを設定
-            (*pt_high)[pt_array_idx]
-                .entry(page_idx_in_pt)
-                .set(addr, uc_flags);
+            (*pt).entry(pt_idx).set(addr, uc_flags);
         }
 
         // TLBフラッシュ
