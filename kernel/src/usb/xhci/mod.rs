@@ -1,5 +1,7 @@
 //! xHCI (USB 3.x) コントローラドライバ
 
+pub mod registers;
+
 use crate::info;
 use crate::paging;
 use crate::pci::{self, PciDevice};
