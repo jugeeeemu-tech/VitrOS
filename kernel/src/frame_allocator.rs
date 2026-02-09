@@ -13,6 +13,13 @@ const PAGE_SIZE: u64 = 4096;
 const MAX_FREE_RANGES: usize = MAX_MEMORY_REGIONS * 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ContiguousConstraints {
+    pub alignment: u64,
+    pub boundary: u64,
+    pub max_address: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameAllocError {
     NotInitialized,
     AlreadyInitialized,
@@ -208,6 +215,99 @@ impl FrameAllocator {
         Err(FrameAllocError::OutOfMemoryBelowLimit)
     }
 
+    fn alloc_contiguous(
+        &mut self,
+        size: usize,
+        constraints: ContiguousConstraints,
+    ) -> Result<(u64, usize), FrameAllocError> {
+        if !self.initialized {
+            return Err(FrameAllocError::NotInitialized);
+        }
+        if size == 0 {
+            return Err(FrameAllocError::InvalidRange);
+        }
+        if constraints.alignment == 0 || !constraints.alignment.is_power_of_two() {
+            return Err(FrameAllocError::InvalidRange);
+        }
+        if constraints.boundary != 0 && !constraints.boundary.is_power_of_two() {
+            return Err(FrameAllocError::InvalidRange);
+        }
+
+        let size_u64 = u64::try_from(size).map_err(|_| FrameAllocError::InvalidRange)?;
+        let alloc_size = align_up(size_u64, PAGE_SIZE).ok_or(FrameAllocError::InvalidRange)?;
+        if alloc_size == 0 {
+            return Err(FrameAllocError::InvalidRange);
+        }
+
+        let max_exclusive = if constraints.max_address == u64::MAX {
+            u64::MAX
+        } else {
+            constraints.max_address + 1
+        };
+        if max_exclusive < alloc_size {
+            return Err(FrameAllocError::OutOfMemory);
+        }
+
+        let effective_alignment = constraints.alignment.max(PAGE_SIZE);
+        let alloc_pages = (alloc_size / PAGE_SIZE) as usize;
+
+        for i in 0..self.free_count {
+            let range = self.free_ranges[i];
+            if range.start >= max_exclusive {
+                break;
+            }
+
+            let range_end = range.end.min(max_exclusive);
+            if range_end <= range.start {
+                continue;
+            }
+
+            let mut candidate_start = match align_up(range.start, effective_alignment) {
+                Some(v) => v,
+                None => continue,
+            };
+
+            while candidate_start < range_end {
+                let candidate_end = match candidate_start.checked_add(alloc_size) {
+                    Some(v) => v,
+                    None => break,
+                };
+                if candidate_end > range_end {
+                    break;
+                }
+
+                if crosses_boundary(candidate_start, candidate_end, constraints.boundary) {
+                    let boundary_start = align_down(candidate_start, constraints.boundary);
+                    let next_boundary = match boundary_start.checked_add(constraints.boundary) {
+                        Some(v) => v,
+                        None => break,
+                    };
+                    candidate_start = match align_up(next_boundary, effective_alignment) {
+                        Some(v) => v,
+                        None => break,
+                    };
+                    continue;
+                }
+
+                match self.commit_contiguous_alloc(i, candidate_start, candidate_end) {
+                    Ok(()) => {
+                        self.free_pages = self.free_pages.saturating_sub(alloc_pages);
+                        return Ok((candidate_start, alloc_size as usize));
+                    }
+                    Err(FrameAllocError::TooManyRanges) => {
+                        candidate_start = match candidate_start.checked_add(effective_alignment) {
+                            Some(v) => v,
+                            None => break,
+                        };
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+
+        Err(FrameAllocError::OutOfMemory)
+    }
+
     fn free_frame(&mut self, frame_phys: u64) -> Result<(), FrameAllocError> {
         if !self.initialized {
             return Err(FrameAllocError::NotInitialized);
@@ -256,6 +356,64 @@ impl FrameAllocator {
         self.free_pages += 1;
         self.merge_neighbors(insert_idx);
 
+        Ok(())
+    }
+
+    fn free_contiguous(&mut self, start: u64, size: usize) -> Result<(), FrameAllocError> {
+        if !self.initialized {
+            return Err(FrameAllocError::NotInitialized);
+        }
+        if size == 0 {
+            return Ok(());
+        }
+        if start & (PAGE_SIZE - 1) != 0 {
+            return Err(FrameAllocError::InvalidAddress);
+        }
+
+        let size_u64 = u64::try_from(size).map_err(|_| FrameAllocError::InvalidRange)?;
+        if size_u64 & (PAGE_SIZE - 1) != 0 {
+            return Err(FrameAllocError::InvalidRange);
+        }
+
+        let end = start
+            .checked_add(size_u64)
+            .ok_or(FrameAllocError::InvalidRange)?;
+        if !self.is_managed_range(start, end) {
+            return Err(FrameAllocError::AddressNotManaged);
+        }
+
+        for i in 0..self.free_count {
+            let range = self.free_ranges[i];
+            if end <= range.start {
+                break;
+            }
+            if start < range.end && end > range.start {
+                return Err(FrameAllocError::DoubleFree);
+            }
+        }
+
+        if self.free_count >= self.free_ranges.len() {
+            return Err(FrameAllocError::TooManyRanges);
+        }
+
+        let mut insert_idx = self.free_count;
+        for i in 0..self.free_count {
+            if start < self.free_ranges[i].start {
+                insert_idx = i;
+                break;
+            }
+        }
+
+        insert_range(
+            &mut self.free_ranges,
+            &mut self.free_count,
+            insert_idx,
+            PhysRange { start, end },
+        )?;
+
+        let pages = (size_u64 / PAGE_SIZE) as usize;
+        self.free_pages = self.free_pages.saturating_add(pages);
+        self.merge_neighbors(insert_idx);
         Ok(())
     }
 
@@ -325,17 +483,69 @@ impl FrameAllocator {
     }
 
     fn is_managed_frame(&self, frame_phys: u64) -> bool {
-        let frame_end = frame_phys + PAGE_SIZE;
+        let frame_end = match frame_phys.checked_add(PAGE_SIZE) {
+            Some(v) => v,
+            None => return false,
+        };
+        self.is_managed_range(frame_phys, frame_end)
+    }
+
+    fn is_managed_range(&self, start: u64, end: u64) -> bool {
+        if start >= end {
+            return false;
+        }
+
         for i in 0..self.managed_count {
             let range = self.managed_ranges[i];
-            if frame_phys >= range.start && frame_end <= range.end {
+            if start >= range.start && end <= range.end {
                 return true;
             }
-            if frame_phys < range.start {
+            if end <= range.start {
                 break;
             }
         }
         false
+    }
+
+    fn commit_contiguous_alloc(
+        &mut self,
+        range_idx: usize,
+        alloc_start: u64,
+        alloc_end: u64,
+    ) -> Result<(), FrameAllocError> {
+        let range = self.free_ranges[range_idx];
+        if alloc_start < range.start || alloc_end > range.end || alloc_start >= alloc_end {
+            return Err(FrameAllocError::InvalidRange);
+        }
+
+        if alloc_start == range.start && alloc_end == range.end {
+            remove_range(&mut self.free_ranges, &mut self.free_count, range_idx);
+            return Ok(());
+        }
+        if alloc_start == range.start {
+            self.free_ranges[range_idx].start = alloc_end;
+            return Ok(());
+        }
+        if alloc_end == range.end {
+            self.free_ranges[range_idx].end = alloc_start;
+            return Ok(());
+        }
+
+        if self.free_count >= self.free_ranges.len() {
+            return Err(FrameAllocError::TooManyRanges);
+        }
+
+        self.free_ranges[range_idx].end = alloc_start;
+        insert_range(
+            &mut self.free_ranges,
+            &mut self.free_count,
+            range_idx + 1,
+            PhysRange {
+                start: alloc_end,
+                end: range.end,
+            },
+        )?;
+        Ok(())
     }
 
     fn merge_neighbors(&mut self, mut idx: usize) {
@@ -391,6 +601,23 @@ pub fn reserve_range(start: u64, size: u64) -> Result<(), FrameAllocError> {
     without_interrupts(|| unsafe {
         let allocator = core::ptr::addr_of_mut!(FRAME_ALLOCATOR);
         (*allocator).reserve_range(start, size)
+    })
+}
+
+pub(crate) fn alloc_contiguous(
+    size: usize,
+    constraints: ContiguousConstraints,
+) -> Result<(u64, usize), FrameAllocError> {
+    without_interrupts(|| unsafe {
+        let allocator = core::ptr::addr_of_mut!(FRAME_ALLOCATOR);
+        (*allocator).alloc_contiguous(size, constraints)
+    })
+}
+
+pub(crate) fn free_contiguous(start: u64, size: usize) -> Result<(), FrameAllocError> {
+    without_interrupts(|| unsafe {
+        let allocator = core::ptr::addr_of_mut!(FRAME_ALLOCATOR);
+        (*allocator).free_contiguous(start, size)
     })
 }
 
@@ -521,6 +748,19 @@ fn align_up(value: u64, align: u64) -> Option<u64> {
     value.checked_add(addend).map(|v| v & !addend)
 }
 
+#[inline]
+fn crosses_boundary(start: u64, end_exclusive: u64, boundary: u64) -> bool {
+    if boundary == 0 {
+        return false;
+    }
+
+    let window_start = align_down(start, boundary);
+    match window_start.checked_add(boundary) {
+        Some(window_end) => end_exclusive > window_end,
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -635,6 +875,106 @@ mod tests {
             free_frame(0x900000),
             Err(FrameAllocError::AddressNotManaged)
         );
+    }
+
+    #[test_case]
+    fn test_alloc_contiguous_alignment_and_boundary() {
+        reset_for_test();
+        let boot_info = boot_info_with_regions(&[MemoryRegion {
+            start: 0xF000,
+            size: 0x50000,
+            region_type: EFI_CONVENTIONAL_MEMORY,
+        }]);
+        init(&boot_info).expect("init failed");
+
+        let constraints = ContiguousConstraints {
+            alignment: 0x10000,
+            boundary: 0x10000,
+            max_address: 0x5EFFF,
+        };
+        let (phys, allocated_len) =
+            alloc_contiguous(0x3000, constraints).expect("alloc_contiguous failed");
+
+        assert_eq!(phys, 0x10000);
+        assert_eq!(allocated_len, 0x3000);
+        assert_eq!(phys & 0xFFFF, 0);
+        assert!(!crosses_boundary(
+            phys,
+            phys + allocated_len as u64,
+            constraints.boundary
+        ));
+    }
+
+    #[test_case]
+    fn test_alloc_contiguous_with_max_address() {
+        reset_for_test();
+        let boot_info = boot_info_with_regions(&[MemoryRegion {
+            start: 0x10000,
+            size: 0x8000,
+            region_type: EFI_CONVENTIONAL_MEMORY,
+        }]);
+        init(&boot_info).expect("init failed");
+
+        let constraints = ContiguousConstraints {
+            alignment: PAGE_SIZE,
+            boundary: 0,
+            max_address: 0x12FFF,
+        };
+
+        let (phys, allocated_len) =
+            alloc_contiguous(0x3000, constraints).expect("alloc_contiguous failed");
+        assert_eq!(phys, 0x10000);
+        assert_eq!(allocated_len, 0x3000);
+        assert!(phys + allocated_len as u64 - 1 <= constraints.max_address);
+    }
+
+    #[test_case]
+    fn test_alloc_contiguous_failure_keeps_state() {
+        reset_for_test();
+        let boot_info = boot_info_with_regions(&[MemoryRegion {
+            start: 0x300000,
+            size: 0x8000,
+            region_type: EFI_CONVENTIONAL_MEMORY,
+        }]);
+        init(&boot_info).expect("init failed");
+
+        let before_pages = debug_free_pages();
+        let before_count = debug_free_count();
+
+        let constraints = ContiguousConstraints {
+            alignment: PAGE_SIZE,
+            boundary: 0,
+            max_address: 0x1FFF,
+        };
+        assert_eq!(
+            alloc_contiguous(0x2000, constraints),
+            Err(FrameAllocError::OutOfMemory)
+        );
+        assert_eq!(debug_free_pages(), before_pages);
+        assert_eq!(debug_free_count(), before_count);
+    }
+
+    #[test_case]
+    fn test_free_contiguous_round_trip() {
+        reset_for_test();
+        let boot_info = boot_info_with_regions(&[MemoryRegion {
+            start: 0x400000,
+            size: 0x10000,
+            region_type: EFI_CONVENTIONAL_MEMORY,
+        }]);
+        init(&boot_info).expect("init failed");
+
+        let constraints = ContiguousConstraints {
+            alignment: PAGE_SIZE,
+            boundary: 0,
+            max_address: u64::MAX,
+        };
+
+        let (a, size_a) = alloc_contiguous(0x3000, constraints).expect("alloc a failed");
+        free_contiguous(a, size_a).expect("free_contiguous failed");
+        let (b, size_b) = alloc_contiguous(0x3000, constraints).expect("alloc b failed");
+        assert_eq!(a, b);
+        assert_eq!(size_a, size_b);
     }
 
     #[test_case]
