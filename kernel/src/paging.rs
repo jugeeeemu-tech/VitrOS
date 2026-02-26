@@ -460,9 +460,6 @@ const DIRECT_MAP_PROGRESS_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
 
 static mut KERNEL_PML4: PageTable = PageTable::new();
 
-// map_mmio() がページテーブル拡張に使えるフレームの上限（初期直写済み範囲）
-static mut INITIAL_MAPPED_MAX_PHYS: u64 = 0;
-
 /// ページングシステムを初期化してCR3に設定
 /// 物理メモリの直接マッピング（Direct Mapping）を実装
 /// - 低位アドレス（0x0〜）: アンマップ（ハイヤーハーフカーネル）
@@ -515,11 +512,10 @@ pub fn init(boot_info: &vitros_common::boot_info::BootInfo) -> Result<(), Paging
 
         let memory_region_count = boot_info.memory_map_count.min(boot_info.memory_map.len());
         let memory_regions = &boot_info.memory_map[..memory_region_count];
-        let (direct_map_ranges, direct_map_range_count, total_pages, max_mapped_end) =
+        let (direct_map_ranges, direct_map_range_count, total_pages, _) =
             extract_direct_map_ranges(memory_regions)?;
 
         let use_1gb_pages = supports_1gb_pages();
-        INITIAL_MAPPED_MAX_PHYS = max_mapped_end;
 
         let total_bytes = total_pages
             .checked_mul(PAGE_SIZE as u64)
@@ -813,14 +809,15 @@ unsafe fn walk_table_if_present(
 }
 
 unsafe fn alloc_page_table_frame() -> Result<*mut PageTable, PagingError> {
-    let limit = unsafe { INITIAL_MAPPED_MAX_PHYS };
-    if limit < PAGE_SIZE as u64 {
-        return Err(PagingError::FrameAllocationFailed);
-    }
-
-    let frame_phys = crate::frame_allocator::alloc_frame_below(limit)
+    let frame_phys = crate::frame_allocator::alloc_frame()
         .map_err(|_| PagingError::FrameAllocationFailed)?;
-    let frame_virt = phys_to_virt(frame_phys)?;
+    let frame_virt = match phys_to_virt(frame_phys) {
+        Ok(addr) => addr,
+        Err(_) => {
+            let _ = crate::frame_allocator::free_frame(frame_phys);
+            return Err(PagingError::AddressConversionFailed);
+        }
+    };
     let frame_ptr = frame_virt as *mut PageTable;
 
     unsafe {
@@ -1508,7 +1505,6 @@ mod tests {
         EFI_RUNTIME_SERVICES_DATA,
     };
 
-    const TEST_TABLE_ALLOC_LIMIT: u64 = 0x20_0000; // 2 MiB
     const TEST_TABLE_ALLOC_REGION_SIZE: u64 = 0x80_0000; // 8 MiB
 
     fn setup_table_allocator_for_test() {
@@ -1521,12 +1517,11 @@ mod tests {
             region_type: EFI_CONVENTIONAL_MEMORY,
         };
         boot_info.memory_map_count = 1;
-        boot_info.max_physical_address = TEST_TABLE_ALLOC_LIMIT;
+        boot_info.max_physical_address = TEST_TABLE_ALLOC_REGION_SIZE;
 
         crate::frame_allocator::init(&boot_info).expect("frame allocator init failed");
 
         unsafe {
-            INITIAL_MAPPED_MAX_PHYS = TEST_TABLE_ALLOC_LIMIT;
             let pml4 = addr_of_mut!(KERNEL_PML4);
             (*pml4).clear();
         }
@@ -1825,6 +1820,37 @@ mod tests {
             let pt_entry = (*pt).entry(pt_idx);
             assert!(pt_entry.is_present());
             assert!(!pt_entry.is_huge_page());
+        }
+    }
+
+    #[test_case]
+    fn test_map_mmio_high_bar_crosses_512gb_boundary() {
+        setup_table_allocator_for_test();
+
+        let phys_addr = (512u64 * HUGE_PAGE_SIZE_1GB as u64) + 0x20_0000; // PML4[257] 側
+
+        crate::io::without_interrupts(|| {
+            let virt_addr = map_mmio(phys_addr, PAGE_SIZE as u64).expect("map_mmio failed");
+            assert_eq!(virt_addr, KERNEL_VIRTUAL_BASE + phys_addr);
+        });
+
+        unsafe {
+            let pml4 = addr_of_mut!(KERNEL_PML4);
+            let (pml4_idx, pdp_idx, pd_idx, pt_idx) =
+                direct_map_table_indices(phys_addr).expect("indices failed");
+            assert!(pml4_idx >= 257);
+
+            let pdp = walk_table(pml4, pml4_idx).expect("walk pdp failed");
+            let pd = walk_table(pdp, pdp_idx).expect("walk pd failed");
+            let pt = walk_table(pd, pd_idx).expect("walk pt failed");
+
+            let entry = (*pt).entry(pt_idx);
+            let uc_flags = PageTableFlags::Present as u64
+                | PageTableFlags::Writable as u64
+                | PageTableFlags::CacheDisable as u64;
+            assert!(entry.is_present());
+            assert_eq!(entry.get_address(), phys_addr);
+            assert_eq!(entry.get_raw() & uc_flags, uc_flags);
         }
     }
 

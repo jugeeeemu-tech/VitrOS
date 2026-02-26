@@ -29,7 +29,6 @@ pub enum FrameAllocError {
     InvalidAddress,
     InvalidRange,
     OutOfMemory,
-    OutOfMemoryBelowLimit,
     AddressNotManaged,
     DoubleFree,
     TooManyRanges,
@@ -46,9 +45,6 @@ impl fmt::Display for FrameAllocError {
             FrameAllocError::InvalidAddress => write!(f, "Invalid physical address"),
             FrameAllocError::InvalidRange => write!(f, "Invalid range"),
             FrameAllocError::OutOfMemory => write!(f, "Out of physical memory"),
-            FrameAllocError::OutOfMemoryBelowLimit => {
-                write!(f, "Out of physical memory below limit")
-            }
             FrameAllocError::AddressNotManaged => write!(f, "Address is outside managed ranges"),
             FrameAllocError::DoubleFree => write!(f, "Double free detected"),
             FrameAllocError::TooManyRanges => write!(f, "Too many free ranges"),
@@ -219,41 +215,6 @@ impl FrameAllocator {
         }
 
         Err(FrameAllocError::OutOfMemory)
-    }
-
-    fn alloc_frame_below(&mut self, limit_exclusive: u64) -> Result<u64, FrameAllocError> {
-        if !self.initialized {
-            return Err(FrameAllocError::NotInitialized);
-        }
-
-        let limit = align_down(limit_exclusive, PAGE_SIZE);
-        if limit < PAGE_SIZE {
-            return Err(FrameAllocError::OutOfMemoryBelowLimit);
-        }
-
-        for i in 0..self.free_count {
-            let range = self.free_ranges[i];
-            if range.start >= limit {
-                break;
-            }
-
-            let alloc_start = range.start;
-            let alloc_end = alloc_start + PAGE_SIZE;
-
-            if alloc_end > range.end || alloc_end > limit {
-                continue;
-            }
-
-            self.free_ranges[i].start = alloc_end;
-            if self.free_ranges[i].start == self.free_ranges[i].end {
-                remove_range(&mut self.free_ranges, &mut self.free_count, i);
-            }
-
-            self.free_pages = self.free_pages.saturating_sub(1);
-            return Ok(alloc_start);
-        }
-
-        Err(FrameAllocError::OutOfMemoryBelowLimit)
     }
 
     fn alloc_contiguous(
@@ -624,13 +585,6 @@ pub fn init(boot_info: &BootInfo) -> Result<(), FrameAllocError> {
     })
 }
 
-pub fn alloc_frame_below(limit_exclusive: u64) -> Result<u64, FrameAllocError> {
-    without_interrupts(|| unsafe {
-        let allocator = core::ptr::addr_of_mut!(FRAME_ALLOCATOR);
-        (*allocator).alloc_frame_below(limit_exclusive)
-    })
-}
-
 pub fn alloc_frame() -> Result<u64, FrameAllocError> {
     without_interrupts(|| unsafe {
         let allocator = core::ptr::addr_of_mut!(FRAME_ALLOCATOR);
@@ -869,13 +823,13 @@ mod tests {
         }]);
         init(&boot_info).expect("init failed");
 
-        let a = alloc_frame_below(0x800000).expect("alloc a failed");
-        let b = alloc_frame_below(0x800000).expect("alloc b failed");
+        let a = alloc_frame().expect("alloc a failed");
+        let b = alloc_frame().expect("alloc b failed");
         assert_eq!(a, 0x400000);
         assert_eq!(b, 0x401000);
 
         free_frame(a).expect("free failed");
-        let c = alloc_frame_below(0x800000).expect("alloc c failed");
+        let c = alloc_frame().expect("alloc c failed");
         assert_eq!(c, a);
     }
 
@@ -939,7 +893,7 @@ mod tests {
     }
 
     #[test_case]
-    fn test_alloc_frame_below_limit() {
+    fn test_alloc_contiguous_max_address_limit() {
         reset_for_test();
         let boot_info = boot_info_with_regions(&[
             MemoryRegion {
@@ -955,11 +909,24 @@ mod tests {
         ]);
         init(&boot_info).expect("init failed");
 
-        let f = alloc_frame_below(0x180000).expect("alloc below failed");
-        assert!(f < 0x180000);
+        let constraints = ContiguousConstraints {
+            alignment: PAGE_SIZE,
+            boundary: 0,
+            max_address: 0x17_FFFF,
+        };
 
-        let e = alloc_frame_below(0x100000);
-        assert_eq!(e, Err(FrameAllocError::OutOfMemoryBelowLimit));
+        let (f, allocated_len) =
+            alloc_contiguous(PAGE_SIZE as usize, constraints).expect("alloc_contiguous below failed");
+        assert!(f <= constraints.max_address);
+        assert!(f + allocated_len as u64 - 1 <= constraints.max_address);
+
+        let low_only_constraints = ContiguousConstraints {
+            alignment: PAGE_SIZE,
+            boundary: 0,
+            max_address: 0x0F_FFFF,
+        };
+        let e = alloc_contiguous(PAGE_SIZE as usize, low_only_constraints);
+        assert_eq!(e, Err(FrameAllocError::OutOfMemory));
     }
 
     #[test_case]
@@ -974,7 +941,7 @@ mod tests {
 
         assert_eq!(free_frame(0x1234), Err(FrameAllocError::InvalidAddress));
 
-        let frame = alloc_frame_below(0x400000).expect("alloc failed");
+        let frame = alloc_frame().expect("alloc failed");
         free_frame(frame).expect("free once failed");
         assert_eq!(free_frame(frame), Err(FrameAllocError::DoubleFree));
 

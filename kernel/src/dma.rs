@@ -161,9 +161,7 @@ fn map_alloc_error(err: FrameAllocError) -> DmaError {
         FrameAllocError::InvalidAddress | FrameAllocError::InvalidRange => {
             DmaError::InvalidConstraint
         }
-        FrameAllocError::OutOfMemory
-        | FrameAllocError::OutOfMemoryBelowLimit
-        | FrameAllocError::TooManyRanges => DmaError::OutOfMemory,
+        FrameAllocError::OutOfMemory | FrameAllocError::TooManyRanges => DmaError::OutOfMemory,
         _ => DmaError::ConstraintViolation,
     }
 }
