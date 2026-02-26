@@ -39,7 +39,7 @@ use alloc::boxed::Box;
 use core::arch::asm;
 use core::fmt::Write;
 use core::panic::PanicInfo;
-use vitros_common::boot_info::BootInfo;
+use vitros_common::boot_info::{BOOT_INFO_ABI_VERSION, BootInfo};
 use vitros_common::uefi;
 
 // カーネル仮想アドレスベース（ブートローダと同じ値）
@@ -202,9 +202,13 @@ extern "C" fn kernel_main_inner(boot_info_phys_addr: u64) -> ! {
     // SAFETY: boot_info_phys_addrはブートローダーから渡された有効なBootInfo構造体の
     // 物理アドレス。KERNEL_VMAを加算することで高位仮想アドレスに変換し、
     // ブートローダーが設定したページテーブルによりアクセス可能な領域を参照する。
-    // BootInfoはブートローダーによって正しく初期化されており、
-    // カーネル実行中は不変であることが保証されている。
     let boot_info = unsafe { &*(boot_info_virt_addr as *const BootInfo) };
+    assert!(
+        boot_info.abi_version == BOOT_INFO_ABI_VERSION,
+        "BootInfo ABI mismatch: kernel={}, bootloader={}",
+        BOOT_INFO_ABI_VERSION,
+        boot_info.abi_version
+    );
 
     // ヒープ候補となる最大のConventional Memory領域を先に決定
     let safe_count = boot_info.memory_map_count.min(boot_info.memory_map.len());
@@ -231,15 +235,12 @@ extern "C" fn kernel_main_inner(boot_info_phys_addr: u64) -> ! {
     // ブートローダーが既にページングを設定し、高位アドレスで起動している
     info!("Running in higher-half (set up by bootloader)");
 
-    // カーネル用のページテーブルを作成（UEFIメモリマップに基づいて動的にマッピング）
-    // カーネル領域は2MBヒュージページでマッピングされる
-    info!("Creating kernel page tables...");
-    paging::init(boot_info).expect("Failed to initialize paging system");
-    info!("Kernel page tables created and loaded");
-
     // 物理メモリアロケータを初期化
     info!("Initializing frame allocator...");
     frame_allocator::init(boot_info).expect("Failed to initialize frame allocator");
+    frame_allocator::reserve_range(0, 0x10_0000)
+        .expect("Failed to reserve low 1MiB range in frame allocator");
+    info!("Reserved low 1MiB range in frame allocator");
     if heap_size > 0 {
         frame_allocator::reserve_range(largest_start_phys, heap_size as u64)
             .expect("Failed to reserve heap range in frame allocator");
@@ -249,6 +250,11 @@ extern "C" fn kernel_main_inner(boot_info_phys_addr: u64) -> ! {
             heap_size / 1024
         );
     }
+
+    // カーネル用のページテーブルを作成（UEFIメモリマップに基づいて動的にマッピング）
+    info!("Creating kernel page tables...");
+    paging::init(boot_info).expect("Failed to initialize paging system");
+    info!("Kernel page tables created and loaded");
 
     // GDTを高位アドレスで再ロード（念のため）
     info!("Reloading GDT...");

@@ -4,7 +4,11 @@
 use core::fmt::Write;
 #[cfg(not(test))]
 use core::panic::PanicInfo;
-use vitros_common::boot_info::{BootInfo, BootloaderPageTableRange, FramebufferInfo, MemoryRegion};
+use vitros_common::boot_info::{
+    BOOT_INFO_ABI_VERSION, BootInfo, BootloaderPageTableRange, FramebufferInfo, MemoryRegion,
+    RESERVED_RANGE_KIND_ACPI_TABLE, RESERVED_RANGE_KIND_BOOT_INFO,
+    RESERVED_RANGE_KIND_BOOTLOADER_PT, RESERVED_RANGE_KIND_KERNEL_IMAGE,
+};
 use vitros_common::elf::{Elf64Header, Elf64ProgramHeader, PT_LOAD};
 use vitros_common::uefi::*;
 
@@ -123,9 +127,225 @@ const PAGE_SIZE_1GB: u64 = 1024 * 1024 * 1024;
 const DIRECT_MAP_WINDOW_BYTES: u64 = 1u64 << 47; // 48bit paging前提での高位半分直写窓
 const EXIT_BOOT_SERVICES_RETRY_LIMIT: usize = 8;
 const PAGE_TABLE_ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+const MAX_ACPI_TABLE_LENGTH: u32 = 100 * 1024 * 1024;
 
 // カーネル仮想アドレスベース
 const KERNEL_VMA: u64 = 0xFFFF800000000000;
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct RsdpV1 {
+    signature: [u8; 8],
+    checksum: u8,
+    oem_id: [u8; 6],
+    revision: u8,
+    rsdt_address: u32,
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct RsdpV2 {
+    v1: RsdpV1,
+    length: u32,
+    xsdt_address: u64,
+    extended_checksum: u8,
+    reserved: [u8; 3],
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct AcpiSdtHeader {
+    signature: [u8; 4],
+    length: u32,
+    revision: u8,
+    checksum: u8,
+    oem_id: [u8; 6],
+    oem_table_id: [u8; 8],
+    oem_revision: u32,
+    creator_id: u32,
+    creator_revision: u32,
+}
+
+#[derive(Clone, Copy)]
+struct KernelLoadInfo {
+    entry_phys: u64,
+    image_phys_start: u64,
+    image_size: u64,
+}
+
+#[inline]
+fn align_down_4k(value: u64) -> u64 {
+    value & !(PAGE_SIZE_4KB - 1)
+}
+
+#[inline]
+fn align_up_4k(value: u64) -> Option<u64> {
+    value
+        .checked_add(PAGE_SIZE_4KB - 1)
+        .map(|v| align_down_4k(v))
+}
+
+fn push_reserved_range(boot_info: &mut BootInfo, start: u64, size: u64, kind: u32) -> bool {
+    if size == 0 {
+        return true;
+    }
+
+    let end = match start.checked_add(size) {
+        Some(v) => v,
+        None => return false,
+    };
+    let start_aligned = align_down_4k(start);
+    let end_aligned = match align_up_4k(end) {
+        Some(v) => v,
+        None => return false,
+    };
+    if start_aligned >= end_aligned {
+        return true;
+    }
+
+    let count = boot_info.reserved_range_count;
+    if count >= boot_info.reserved_ranges.len() {
+        return false;
+    }
+    boot_info.reserved_ranges[count].start = start_aligned;
+    boot_info.reserved_ranges[count].size = end_aligned - start_aligned;
+    boot_info.reserved_ranges[count].kind = kind;
+    boot_info.reserved_range_count = count + 1;
+    true
+}
+
+unsafe fn checksum_is_zero(addr: u64, len: usize) -> bool {
+    if len == 0 {
+        return false;
+    }
+    let bytes = unsafe { core::slice::from_raw_parts(addr as *const u8, len) };
+    let sum = bytes.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
+    sum == 0
+}
+
+fn parse_sdt_header(addr: u64) -> Option<AcpiSdtHeader> {
+    if addr == 0 {
+        return None;
+    }
+    Some(unsafe { (addr as *const AcpiSdtHeader).read_unaligned() })
+}
+
+fn validate_and_reserve_sdt(boot_info: &mut BootInfo, table_addr: u64) -> bool {
+    let header = match parse_sdt_header(table_addr) {
+        Some(v) => v,
+        None => return false,
+    };
+    let length = header.length as usize;
+    if length < core::mem::size_of::<AcpiSdtHeader>() || header.length > MAX_ACPI_TABLE_LENGTH {
+        return false;
+    }
+    if !unsafe { checksum_is_zero(table_addr, length) } {
+        return false;
+    }
+    push_reserved_range(
+        boot_info,
+        table_addr,
+        header.length as u64,
+        RESERVED_RANGE_KIND_ACPI_TABLE,
+    )
+}
+
+fn collect_acpi_table_ranges(boot_info: &mut BootInfo) -> bool {
+    let rsdp_addr = boot_info.rsdp_address;
+    if rsdp_addr == 0 {
+        return true;
+    }
+
+    let rsdp_v1 = unsafe { (rsdp_addr as *const RsdpV1).read_unaligned() };
+    if rsdp_v1.signature != *b"RSD PTR " {
+        return false;
+    }
+    if !unsafe { checksum_is_zero(rsdp_addr, core::mem::size_of::<RsdpV1>()) } {
+        return false;
+    }
+
+    let mut root_addr = rsdp_v1.rsdt_address as u64;
+    let mut root_signature = *b"RSDT";
+    let mut root_entry_size = core::mem::size_of::<u32>();
+    let mut rsdp_length = core::mem::size_of::<RsdpV1>() as u64;
+
+    if rsdp_v1.revision >= 2 {
+        let rsdp_v2 = unsafe { (rsdp_addr as *const RsdpV2).read_unaligned() };
+        if rsdp_v2.length < core::mem::size_of::<RsdpV2>() as u32
+            || rsdp_v2.length > MAX_ACPI_TABLE_LENGTH
+        {
+            return false;
+        }
+        if !unsafe { checksum_is_zero(rsdp_addr, rsdp_v2.length as usize) } {
+            return false;
+        }
+        rsdp_length = rsdp_v2.length as u64;
+        if rsdp_v2.xsdt_address != 0 {
+            root_addr = rsdp_v2.xsdt_address;
+            root_signature = *b"XSDT";
+            root_entry_size = core::mem::size_of::<u64>();
+        } else if root_addr == 0 {
+            return false;
+        }
+    } else if root_addr == 0 {
+        return false;
+    }
+
+    if !push_reserved_range(
+        boot_info,
+        rsdp_addr,
+        rsdp_length,
+        RESERVED_RANGE_KIND_ACPI_TABLE,
+    ) {
+        return false;
+    }
+
+    let root_header = match parse_sdt_header(root_addr) {
+        Some(v) => v,
+        None => return false,
+    };
+    if root_header.signature != root_signature {
+        return false;
+    }
+    let root_length = root_header.length as usize;
+    let header_size = core::mem::size_of::<AcpiSdtHeader>();
+    if root_length < header_size || root_header.length > MAX_ACPI_TABLE_LENGTH {
+        return false;
+    }
+    if (root_length - header_size) % root_entry_size != 0 {
+        return false;
+    }
+    if !unsafe { checksum_is_zero(root_addr, root_length) } {
+        return false;
+    }
+    if !push_reserved_range(
+        boot_info,
+        root_addr,
+        root_header.length as u64,
+        RESERVED_RANGE_KIND_ACPI_TABLE,
+    ) {
+        return false;
+    }
+
+    let entry_count = (root_length - header_size) / root_entry_size;
+    let entries_base = root_addr + header_size as u64;
+    for i in 0..entry_count {
+        let entry_addr = entries_base + (i as u64) * (root_entry_size as u64);
+        let table_addr = if root_entry_size == core::mem::size_of::<u64>() {
+            unsafe { (entry_addr as *const u64).read_unaligned() }
+        } else {
+            unsafe { (entry_addr as *const u32).read_unaligned() as u64 }
+        };
+        if table_addr == 0 {
+            continue;
+        }
+        if !validate_and_reserve_sdt(boot_info, table_addr) {
+            return false;
+        }
+    }
+
+    true
+}
 
 // ページテーブル構造体（4KBアラインメント）
 #[repr(C, align(4096))]
@@ -504,6 +724,7 @@ extern "efiapi" fn efi_main(
 
     // BOOT_INFOを静的変数から取得
     let boot_info = unsafe { &mut *core::ptr::addr_of_mut!(BOOT_INFO) };
+    let boot_info_phys_addr = core::ptr::addr_of!(BOOT_INFO) as u64;
 
     // フレームバッファ情報を設定
     boot_info.framebuffer = FramebufferInfo {
@@ -513,7 +734,9 @@ extern "efiapi" fn efi_main(
         height,
         stride: width,
     };
+    boot_info.abi_version = BOOT_INFO_ABI_VERSION;
     boot_info.bootloader_page_table_range_count = 0;
+    boot_info.reserved_range_count = 0;
 
     // RSDP (ACPI Root System Description Pointer) を UEFI Configuration Table から取得
     unsafe {
@@ -544,6 +767,24 @@ extern "efiapi" fn efi_main(
         boot_info.rsdp_address = rsdp_addr;
     }
 
+    if !collect_acpi_table_ranges(boot_info) {
+        println_uefi!("[ERROR] Failed to enumerate ACPI table ranges");
+        loop {
+            unsafe { core::arch::asm!("hlt") }
+        }
+    }
+    if !push_reserved_range(
+        boot_info,
+        boot_info_phys_addr,
+        core::mem::size_of::<BootInfo>() as u64,
+        RESERVED_RANGE_KIND_BOOT_INFO,
+    ) {
+        println_uefi!("[ERROR] Failed to reserve BOOT_INFO range");
+        loop {
+            unsafe { core::arch::asm!("hlt") }
+        }
+    }
+
     let entry_count = map_size / descriptor_size;
     println_uefi!("[INFO] Memory map retrieved: {} entries", entry_count);
 
@@ -555,9 +796,8 @@ extern "efiapi" fn efi_main(
     );
     for i in 0..entry_count.min(max_display) {
         let offset = i * descriptor_size;
-        let desc = unsafe {
-            &*(memory_map_buffer.as_ptr().add(offset) as *const EfiMemoryDescriptor)
-        };
+        let desc =
+            unsafe { &*(memory_map_buffer.as_ptr().add(offset) as *const EfiMemoryDescriptor) };
 
         let type_str = memory_type_str(desc.r#type);
         println_uefi!(
@@ -569,7 +809,12 @@ extern "efiapi" fn efi_main(
     }
     println_uefi!("\nTotal entries: {}", entry_count);
 
-    copy_memory_map_to_boot_info(boot_info, &memory_map_buffer[..map_size], map_size, descriptor_size);
+    copy_memory_map_to_boot_info(
+        boot_info,
+        &memory_map_buffer[..map_size],
+        map_size,
+        descriptor_size,
+    );
     let initial_max_phys = match analyze_bootstrap_map_limit(
         &memory_map_buffer[..map_size],
         entry_count,
@@ -595,8 +840,7 @@ extern "efiapi" fn efi_main(
     }
     boot_info.max_physical_address = initial_max_phys;
 
-    let boot_info_addr = core::ptr::addr_of!(BOOT_INFO) as u64;
-    println_uefi!("[INFO] BOOT_INFO at 0x{:X}", boot_info_addr);
+    println_uefi!("[INFO] BOOT_INFO at 0x{:X}", boot_info_phys_addr);
     println_uefi!(
         "[INFO] BOOT_INFO.memory_map_count = {}",
         boot_info.memory_map_count
@@ -615,14 +859,27 @@ extern "efiapi" fn efi_main(
 
     // カーネルをロード (ブートサービス終了前に実行)
     println_uefi!("[INFO] Loading kernel from ELF...");
-    let kernel_entry = load_kernel_elf(image_handle, boot_services);
-    if kernel_entry == 0 {
-        println_uefi!("[ERROR] Failed to load kernel!");
+    let kernel_load = match load_kernel_elf(image_handle, boot_services) {
+        Some(v) => v,
+        None => {
+            println_uefi!("[ERROR] Failed to load kernel!");
+            loop {
+                unsafe { core::arch::asm!("hlt") }
+            }
+        }
+    };
+    println_uefi!("[INFO] Kernel entry point: 0x{:X}", kernel_load.entry_phys);
+    if !push_reserved_range(
+        boot_info,
+        kernel_load.image_phys_start,
+        kernel_load.image_size,
+        RESERVED_RANGE_KIND_KERNEL_IMAGE,
+    ) {
+        println_uefi!("[ERROR] Failed to reserve kernel image range");
         loop {
             unsafe { core::arch::asm!("hlt") }
         }
     }
-    println_uefi!("[INFO] Kernel entry point: 0x{:X}", kernel_entry);
 
     // カーネルロード後にメモリマップが変更されているので、再取得
     println_uefi!("[INFO] Updating memory map before page-table allocation...");
@@ -712,6 +969,20 @@ extern "efiapi" fn efi_main(
         boot_info.bootloader_page_table_ranges[0].start,
         boot_info.bootloader_page_table_ranges[0].size
     );
+    for i in 0..boot_info.bootloader_page_table_range_count {
+        let range = boot_info.bootloader_page_table_ranges[i];
+        if !push_reserved_range(
+            boot_info,
+            range.start,
+            range.size,
+            RESERVED_RANGE_KIND_BOOTLOADER_PT,
+        ) {
+            println_uefi!("[ERROR] Failed to reserve bootloader page-table ranges");
+            loop {
+                unsafe { core::arch::asm!("hlt") }
+            }
+        }
+    }
 
     let pml4_addr = unsafe {
         match setup_initial_page_tables(max_phys_addr, &mut page_table_pool) {
@@ -752,8 +1023,12 @@ extern "efiapi" fn efi_main(
         }
     };
 
-    let final_entry_count =
-        copy_memory_map_to_boot_info(boot_info, &memory_map_buffer[..map_size], map_size, descriptor_size);
+    let final_entry_count = copy_memory_map_to_boot_info(
+        boot_info,
+        &memory_map_buffer[..map_size],
+        map_size,
+        descriptor_size,
+    );
     let final_max_phys = match analyze_bootstrap_map_limit(
         &memory_map_buffer[..map_size],
         final_entry_count,
@@ -790,6 +1065,10 @@ extern "efiapi" fn efi_main(
     println_uefi!(
         "[INFO] BOOT_INFO.bootloader_page_table_range_count = {}",
         boot_info.bootloader_page_table_range_count
+    );
+    println_uefi!(
+        "[INFO] BOOT_INFO.reserved_range_count = {}",
+        boot_info.reserved_range_count
     );
 
     let mut exit_retry = 0usize;
@@ -871,10 +1150,9 @@ extern "efiapi" fn efi_main(
     }
 
     // ExitBootServices成功 - ここから先はBoot Servicesは使用不可
-    let boot_info_phys_addr = core::ptr::addr_of!(BOOT_INFO) as u64;
     unsafe { load_page_tables(pml4_addr) };
 
-    let kernel_high_addr = match kernel_entry.checked_add(KERNEL_VMA) {
+    let kernel_high_addr = match kernel_load.entry_phys.checked_add(KERNEL_VMA) {
         Some(addr) => addr,
         None => loop {
             unsafe { core::arch::asm!("hlt") }
@@ -888,7 +1166,10 @@ extern "efiapi" fn efi_main(
 }
 
 /// ELFファイルからカーネルをロード
-fn load_kernel_elf(_image_handle: EfiHandle, boot_services: *mut EfiBootServices) -> u64 {
+fn load_kernel_elf(
+    _image_handle: EfiHandle,
+    boot_services: *mut EfiBootServices,
+) -> Option<KernelLoadInfo> {
     // Simple File System Protocolを直接検索
     let mut sfs: *mut EfiSimpleFileSystemProtocol = core::ptr::null_mut();
     let status = unsafe {
@@ -900,7 +1181,7 @@ fn load_kernel_elf(_image_handle: EfiHandle, boot_services: *mut EfiBootServices
     };
     if status != EFI_SUCCESS {
         println_uefi!("[ERROR] Failed to locate Simple File System Protocol");
-        return 0;
+        return None;
     }
 
     // ルートディレクトリを開く
@@ -908,7 +1189,7 @@ fn load_kernel_elf(_image_handle: EfiHandle, boot_services: *mut EfiBootServices
     let status = unsafe { ((*sfs).open_volume)(sfs, &mut root) };
     if status != EFI_SUCCESS {
         println_uefi!("[ERROR] Failed to open root volume");
-        return 0;
+        return None;
     }
 
     // kernel.elfを開く
@@ -925,7 +1206,7 @@ fn load_kernel_elf(_image_handle: EfiHandle, boot_services: *mut EfiBootServices
     };
     if status != EFI_SUCCESS {
         println_uefi!("[ERROR] Failed to open kernel.elf");
-        return 0;
+        return None;
     }
 
     // ファイルを一時バッファに読み込む (最大2MB - staticを使用)
@@ -946,28 +1227,72 @@ fn load_kernel_elf(_image_handle: EfiHandle, boot_services: *mut EfiBootServices
 
     if status != EFI_SUCCESS {
         println_uefi!("[ERROR] Failed to read kernel file");
-        return 0;
+        return None;
     }
 
     println_uefi!("[INFO] Kernel loaded: {} bytes", file_size);
+    if file_size < core::mem::size_of::<Elf64Header>() {
+        println_uefi!("[ERROR] Kernel file too small");
+        return None;
+    }
 
     // ELFヘッダーを検証
     let elf_header = unsafe { &*(file_buffer.as_ptr() as *const Elf64Header) };
     if !elf_header.is_valid() {
         println_uefi!("[ERROR] Invalid ELF header");
-        return 0;
+        return None;
     }
 
     // プログラムヘッダーを処理してLOADセグメントをメモリにコピー
     // 最初のLOADセグメントから仮想/物理アドレスのオフセットを計算
     let mut kernel_virt_offset: Option<u64> = None;
+    let mut image_phys_start = u64::MAX;
+    let mut image_phys_end = 0u64;
+    let mut saw_load_segment = false;
 
     for i in 0..elf_header.e_phnum {
         let ph_offset =
             elf_header.e_phoff as usize + (i as usize * core::mem::size_of::<Elf64ProgramHeader>());
+        let ph_end = ph_offset + core::mem::size_of::<Elf64ProgramHeader>();
+        if ph_end > file_size {
+            println_uefi!("[ERROR] Program header out of file bounds");
+            return None;
+        }
         let ph = unsafe { &*(file_buffer.as_ptr().add(ph_offset) as *const Elf64ProgramHeader) };
 
         if ph.p_type == PT_LOAD {
+            if ph.p_memsz == 0 {
+                continue;
+            }
+            if ph.p_filesz > ph.p_memsz {
+                println_uefi!("[ERROR] Invalid PT_LOAD sizes");
+                return None;
+            }
+
+            let segment_file_end = match (ph.p_offset as usize).checked_add(ph.p_filesz as usize) {
+                Some(v) => v,
+                None => {
+                    println_uefi!("[ERROR] PT_LOAD file range overflow");
+                    return None;
+                }
+            };
+            if segment_file_end > file_size {
+                println_uefi!("[ERROR] PT_LOAD file range exceeds input");
+                return None;
+            }
+
+            let segment_start = ph.p_paddr;
+            let segment_end = match ph.p_paddr.checked_add(ph.p_memsz) {
+                Some(v) => v,
+                None => {
+                    println_uefi!("[ERROR] PT_LOAD physical range overflow");
+                    return None;
+                }
+            };
+            image_phys_start = image_phys_start.min(segment_start);
+            image_phys_end = image_phys_end.max(segment_end);
+            saw_load_segment = true;
+
             // 最初のLOADセグメントから仮想/物理アドレスのオフセットを記録
             if kernel_virt_offset.is_none() && ph.p_vaddr != ph.p_paddr {
                 kernel_virt_offset = Some(ph.p_vaddr - ph.p_paddr);
@@ -975,9 +1300,11 @@ fn load_kernel_elf(_image_handle: EfiHandle, boot_services: *mut EfiBootServices
 
             // ファイルからメモリにコピー
             unsafe {
-                let src = file_buffer.as_ptr().add(ph.p_offset as usize);
                 let dst = ph.p_paddr as *mut u8;
-                core::ptr::copy_nonoverlapping(src, dst, ph.p_filesz as usize);
+                if ph.p_filesz != 0 {
+                    let src = file_buffer.as_ptr().add(ph.p_offset as usize);
+                    core::ptr::copy_nonoverlapping(src, dst, ph.p_filesz as usize);
+                }
 
                 // 残りをゼロクリア (BSS領域)
                 if ph.p_memsz > ph.p_filesz {
@@ -990,14 +1317,30 @@ fn load_kernel_elf(_image_handle: EfiHandle, boot_services: *mut EfiBootServices
             }
         }
     }
+    if !saw_load_segment {
+        println_uefi!("[ERROR] ELF has no PT_LOAD segments");
+        return None;
+    }
 
     // エントリポイントを物理アドレスに変換
     // カーネルが高位アドレスでリンクされている場合、仮想アドレスを物理アドレスに変換
-    if let Some(offset) = kernel_virt_offset {
-        elf_header.e_entry - offset
+    let entry_phys = if let Some(offset) = kernel_virt_offset {
+        match elf_header.e_entry.checked_sub(offset) {
+            Some(v) => v,
+            None => {
+                println_uefi!("[ERROR] Kernel entry conversion overflow");
+                return None;
+            }
+        }
     } else {
         elf_header.e_entry
-    }
+    };
+
+    Some(KernelLoadInfo {
+        entry_phys,
+        image_phys_start,
+        image_size: image_phys_end - image_phys_start,
+    })
 }
 
 /// 文字列をUTF-16に変換

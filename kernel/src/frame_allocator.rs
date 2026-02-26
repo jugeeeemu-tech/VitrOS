@@ -1,13 +1,16 @@
 //! 物理メモリアロケータ（4KBページフレーム管理）
 //!
-//! UEFIメモリマップから `EFI_CONVENTIONAL_MEMORY` 領域を取り込み、
+//! UEFIメモリマップから direct-map 対象の RAM 領域を取り込み、
 //! 4KBフレーム単位で割り当て/解放を行う。
 
 use crate::info;
 use crate::io::without_interrupts;
 use core::fmt;
 use vitros_common::boot_info::{BootInfo, MAX_MEMORY_REGIONS, MemoryRegion};
-use vitros_common::uefi::EFI_CONVENTIONAL_MEMORY;
+use vitros_common::uefi::{
+    EFI_ACPI_RECLAIM_MEMORY, EFI_BOOT_SERVICES_CODE, EFI_BOOT_SERVICES_DATA,
+    EFI_CONVENTIONAL_MEMORY, EFI_LOADER_CODE, EFI_LOADER_DATA,
+};
 
 const PAGE_SIZE: u64 = 4096;
 const MAX_FREE_RANGES: usize = MAX_MEMORY_REGIONS * 4;
@@ -128,7 +131,7 @@ impl FrameAllocator {
         let mut raw_count = 0usize;
 
         for region in &boot_info.memory_map[..count] {
-            if region.region_type != EFI_CONVENTIONAL_MEMORY {
+            if !is_allocator_ram_type(region.region_type) {
                 continue;
             }
 
@@ -163,8 +166,14 @@ impl FrameAllocator {
 
         self.total_pages = count_pages(&self.managed_ranges, self.managed_count);
         self.free_pages = count_pages(&self.free_ranges, self.free_count);
-
         self.initialized = true;
+
+        let reserved_count = boot_info
+            .reserved_range_count
+            .min(boot_info.reserved_ranges.len());
+        for reserved in &boot_info.reserved_ranges[..reserved_count] {
+            self.reserve_range(reserved.start, reserved.size)?;
+        }
 
         info!(
             "Frame allocator initialized: {} ranges, {} total pages ({} MiB)",
@@ -176,8 +185,40 @@ impl FrameAllocator {
             "Frame allocator free: {} ranges, {} pages",
             self.free_count, self.free_pages
         );
+        info!(
+            "Frame allocator reserved ranges applied: {}",
+            reserved_count
+        );
 
         Ok(())
+    }
+
+    fn alloc_frame(&mut self) -> Result<u64, FrameAllocError> {
+        if !self.initialized {
+            return Err(FrameAllocError::NotInitialized);
+        }
+
+        for i in 0..self.free_count {
+            let range = self.free_ranges[i];
+            let alloc_start = range.start;
+            let alloc_end = alloc_start
+                .checked_add(PAGE_SIZE)
+                .ok_or(FrameAllocError::OutOfMemory)?;
+
+            if alloc_end > range.end {
+                continue;
+            }
+
+            self.free_ranges[i].start = alloc_end;
+            if self.free_ranges[i].start == self.free_ranges[i].end {
+                remove_range(&mut self.free_ranges, &mut self.free_count, i);
+            }
+
+            self.free_pages = self.free_pages.saturating_sub(1);
+            return Ok(alloc_start);
+        }
+
+        Err(FrameAllocError::OutOfMemory)
     }
 
     fn alloc_frame_below(&mut self, limit_exclusive: u64) -> Result<u64, FrameAllocError> {
@@ -590,6 +631,13 @@ pub fn alloc_frame_below(limit_exclusive: u64) -> Result<u64, FrameAllocError> {
     })
 }
 
+pub fn alloc_frame() -> Result<u64, FrameAllocError> {
+    without_interrupts(|| unsafe {
+        let allocator = core::ptr::addr_of_mut!(FRAME_ALLOCATOR);
+        (*allocator).alloc_frame()
+    })
+}
+
 pub fn free_frame(frame_phys: u64) -> Result<(), FrameAllocError> {
     without_interrupts(|| unsafe {
         let allocator = core::ptr::addr_of_mut!(FRAME_ALLOCATOR);
@@ -671,6 +719,19 @@ fn align_region_to_pages(region: &MemoryRegion) -> Option<PhysRange> {
         start: start_aligned,
         end: end_aligned,
     })
+}
+
+#[inline]
+fn is_allocator_ram_type(region_type: u32) -> bool {
+    matches!(
+        region_type,
+        EFI_CONVENTIONAL_MEMORY
+            | EFI_LOADER_CODE
+            | EFI_LOADER_DATA
+            | EFI_BOOT_SERVICES_CODE
+            | EFI_BOOT_SERVICES_DATA
+            | EFI_ACPI_RECLAIM_MEMORY
+    )
 }
 
 fn sort_ranges(ranges: &mut [PhysRange], count: usize) {
@@ -764,7 +825,9 @@ fn crosses_boundary(start: u64, end_exclusive: u64, boundary: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vitros_common::boot_info::{BootInfo, MemoryRegion};
+    use vitros_common::boot_info::{
+        BootInfo, MemoryRegion, RESERVED_RANGE_KIND_KERNEL_IMAGE, ReservedMemoryRange,
+    };
 
     fn boot_info_with_regions(regions: &[MemoryRegion]) -> BootInfo {
         let mut boot_info = BootInfo::new();
@@ -776,7 +839,7 @@ mod tests {
     }
 
     #[test_case]
-    fn test_init_conventional_only() {
+    fn test_init_managed_ram_types() {
         reset_for_test();
         let boot_info = boot_info_with_regions(&[
             MemoryRegion {
@@ -792,8 +855,8 @@ mod tests {
         ]);
 
         init(&boot_info).expect("init failed");
-        assert_eq!(debug_free_pages(), 4);
-        assert_eq!(debug_free_count(), 1);
+        assert_eq!(debug_free_pages(), 13);
+        assert_eq!(debug_free_count(), 2);
     }
 
     #[test_case]
@@ -817,6 +880,26 @@ mod tests {
     }
 
     #[test_case]
+    fn test_alloc_frame_and_free_frame() {
+        reset_for_test();
+        let boot_info = boot_info_with_regions(&[MemoryRegion {
+            start: 0x600000,
+            size: 0x3000,
+            region_type: EFI_CONVENTIONAL_MEMORY,
+        }]);
+        init(&boot_info).expect("init failed");
+
+        let a = alloc_frame().expect("alloc_frame a failed");
+        let b = alloc_frame().expect("alloc_frame b failed");
+        assert_eq!(a, 0x600000);
+        assert_eq!(b, 0x601000);
+
+        free_frame(a).expect("free_frame failed");
+        let c = alloc_frame().expect("alloc_frame c failed");
+        assert_eq!(c, a);
+    }
+
+    #[test_case]
     fn test_reserve_range_split() {
         reset_for_test();
         let boot_info = boot_info_with_regions(&[MemoryRegion {
@@ -829,6 +912,30 @@ mod tests {
         reserve_range(0x103000, 0x4000).expect("reserve failed");
         assert_eq!(debug_free_count(), 2);
         assert_eq!(debug_free_pages(), 12);
+    }
+
+    #[test_case]
+    fn test_init_applies_reserved_ranges() {
+        reset_for_test();
+        let mut boot_info = boot_info_with_regions(&[MemoryRegion {
+            start: 0x100000,
+            size: 0x10000,
+            region_type: EFI_CONVENTIONAL_MEMORY,
+        }]);
+        boot_info.reserved_ranges[0] = ReservedMemoryRange {
+            start: 0x104000,
+            size: 0x2000,
+            kind: RESERVED_RANGE_KIND_KERNEL_IMAGE,
+        };
+        boot_info.reserved_range_count = 1;
+
+        init(&boot_info).expect("init failed");
+
+        assert_eq!(alloc_frame().expect("alloc 0"), 0x100000);
+        assert_eq!(alloc_frame().expect("alloc 1"), 0x101000);
+        assert_eq!(alloc_frame().expect("alloc 2"), 0x102000);
+        assert_eq!(alloc_frame().expect("alloc 3"), 0x103000);
+        assert_eq!(alloc_frame().expect("alloc 4"), 0x106000);
     }
 
     #[test_case]
@@ -983,7 +1090,7 @@ mod tests {
         let boot_info = boot_info_with_regions(&[MemoryRegion {
             start: 0x1000,
             size: 0x2000,
-            region_type: vitros_common::uefi::EFI_ACPI_RECLAIM_MEMORY,
+            region_type: vitros_common::uefi::EFI_RUNTIME_SERVICES_DATA,
         }]);
 
         assert_eq!(init(&boot_info), Err(FrameAllocError::NoUsableMemory));
