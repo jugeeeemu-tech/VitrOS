@@ -4,7 +4,6 @@
 //! MMCONFIG (MCFG経由) を優先し、利用できない場合はレガシーI/Oポートを使用します。
 
 use crate::info;
-use crate::paging::KERNEL_VIRTUAL_BASE;
 use core::arch::asm;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -37,6 +36,7 @@ pub mod capability_id {
 static MMCONFIG_BASE: AtomicU64 = AtomicU64::new(0);
 static MMCONFIG_START_BUS: AtomicU64 = AtomicU64::new(0);
 static MMCONFIG_END_BUS: AtomicU64 = AtomicU64::new(0);
+static MMCONFIG_VIRT_BASE: AtomicU64 = AtomicU64::new(0);
 
 /// PCIデバイス情報
 #[allow(dead_code)]
@@ -305,20 +305,49 @@ pub fn set_mmconfig(base_address: u64, segment: u16, start_bus: u8, end_bus: u8)
         return;
     }
 
+    let bus_count = (end_bus as u64)
+        .saturating_sub(start_bus as u64)
+        .saturating_add(1);
+    let mmconfig_phys_base = base_address + ((start_bus as u64) << 20);
+    let mmconfig_size = bus_count << 20;
+
+    let mmconfig_virt_base = match crate::paging::map_mmio(mmconfig_phys_base, mmconfig_size) {
+        Ok(virt_addr) => virt_addr,
+        Err(err) => {
+            info!(
+                "  Warning: failed to map MMCONFIG (phys=0x{:X}, size={} MB): {:?}. Falling back to legacy PCI I/O",
+                mmconfig_phys_base,
+                mmconfig_size >> 20,
+                err
+            );
+            MMCONFIG_BASE.store(0, Ordering::SeqCst);
+            MMCONFIG_START_BUS.store(0, Ordering::SeqCst);
+            MMCONFIG_END_BUS.store(0, Ordering::SeqCst);
+            MMCONFIG_VIRT_BASE.store(0, Ordering::SeqCst);
+            return;
+        }
+    };
+
     MMCONFIG_BASE.store(base_address, Ordering::SeqCst);
     MMCONFIG_START_BUS.store(start_bus as u64, Ordering::SeqCst);
     MMCONFIG_END_BUS.store(end_bus as u64, Ordering::SeqCst);
+    MMCONFIG_VIRT_BASE.store(mmconfig_virt_base, Ordering::SeqCst);
 
     info!(
-        "  MMCONFIG enabled: Base=0x{:X}, Buses={}-{}",
-        base_address, start_bus, end_bus
+        "  MMCONFIG enabled: Base=0x{:X}, Buses={}-{}, mapped virt=0x{:X} ({} MB)",
+        base_address,
+        start_bus,
+        end_bus,
+        mmconfig_virt_base,
+        mmconfig_size >> 20
     );
 }
 
 /// MMCONFIGが利用可能かチェック
 fn is_mmconfig_available(bus: u8) -> bool {
     let base = MMCONFIG_BASE.load(Ordering::SeqCst);
-    if base == 0 {
+    let virt_base = MMCONFIG_VIRT_BASE.load(Ordering::SeqCst);
+    if base == 0 || virt_base == 0 {
         return false;
     }
 
@@ -336,21 +365,19 @@ fn is_mmconfig_available(bus: u8) -> bool {
 /// - `is_mmconfig_available(bus)` が `true` を返すこと
 /// - `device` < 32, `function` < 8
 /// - `offset` < 4096 かつ 4バイト境界にアラインされていること
-/// - 対象のPCI Configuration Spaceがカーネル空間にマッピング済みであること
-///   （`KERNEL_VIRTUAL_BASE`を使用した直接マッピングが有効なこと）
+/// - 対象のPCI Configuration Spaceが `map_mmio()` によりマッピング済みであること
 unsafe fn mmconfig_read_u32(bus: u8, device: u8, function: u8, offset: u16) -> u32 {
-    let base = MMCONFIG_BASE.load(Ordering::SeqCst);
+    let virt_base = MMCONFIG_VIRT_BASE.load(Ordering::SeqCst);
+    let start_bus = MMCONFIG_START_BUS.load(Ordering::SeqCst) as u8;
+    let bus_index = (bus - start_bus) as u64;
 
     // MMCONFIGアドレス計算
-    // Address = Base + (Bus << 20 | Device << 15 | Function << 12 | Offset)
-    let phys_addr = base
-        + ((bus as u64) << 20)
+    // Address = VirtBase + ((Bus-StartBus) << 20 | Device << 15 | Function << 12 | Offset)
+    let virt_addr = virt_base
+        + (bus_index << 20)
         + ((device as u64) << 15)
         + ((function as u64) << 12)
         + (offset as u64);
-
-    // 高位仮想アドレスに変換
-    let virt_addr = KERNEL_VIRTUAL_BASE + phys_addr;
 
     unsafe { read_volatile(virt_addr as *const u32) }
 }
@@ -626,20 +653,19 @@ fn pci_config_write_u32(bus: u8, device: u8, function: u8, offset: u8, value: u3
 /// - `is_mmconfig_available(bus)` が `true` を返すこと
 /// - `device` < 32, `function` < 8
 /// - `offset` < 4096 かつ 4バイト境界にアラインされていること
-/// - 対象のPCI Configuration Spaceがカーネル空間にマッピング済みであること
-///   （`KERNEL_VIRTUAL_BASE`を使用した直接マッピングが有効なこと）
+/// - 対象のPCI Configuration Spaceが `map_mmio()` によりマッピング済みであること
 /// - 書き込み対象のレジスタが書き込み可能であること
 #[allow(dead_code)]
 unsafe fn mmconfig_write_u32(bus: u8, device: u8, function: u8, offset: u16, value: u32) {
-    let base = MMCONFIG_BASE.load(Ordering::SeqCst);
+    let virt_base = MMCONFIG_VIRT_BASE.load(Ordering::SeqCst);
+    let start_bus = MMCONFIG_START_BUS.load(Ordering::SeqCst) as u8;
+    let bus_index = (bus - start_bus) as u64;
 
-    let phys_addr = base
-        + ((bus as u64) << 20)
+    let virt_addr = virt_base
+        + (bus_index << 20)
         + ((device as u64) << 15)
         + ((function as u64) << 12)
         + (offset as u64);
-
-    let virt_addr = KERNEL_VIRTUAL_BASE + phys_addr;
 
     unsafe { write_volatile(virt_addr as *mut u32, value) }
 }
