@@ -292,7 +292,72 @@ struct DirectMapRange {
     end: u64,
 }
 
-/// メモリマップから直写対象範囲（非MMIO）を抽出して正規化する
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DirectMapLeafSize {
+    Page4Kb,
+    Huge2Mb,
+    Huge1Gb,
+}
+
+#[inline]
+fn is_direct_map_ram_type(region_type: u32) -> bool {
+    use vitros_common::uefi::{
+        EFI_ACPI_RECLAIM_MEMORY, EFI_BOOT_SERVICES_CODE, EFI_BOOT_SERVICES_DATA,
+        EFI_CONVENTIONAL_MEMORY, EFI_LOADER_CODE, EFI_LOADER_DATA,
+    };
+    matches!(
+        region_type,
+        EFI_CONVENTIONAL_MEMORY
+            | EFI_LOADER_CODE
+            | EFI_LOADER_DATA
+            | EFI_BOOT_SERVICES_CODE
+            | EFI_BOOT_SERVICES_DATA
+            | EFI_ACPI_RECLAIM_MEMORY
+    )
+}
+
+#[inline]
+fn ranges_overlap(start: u64, end: u64, other_start: u64, other_end: u64) -> bool {
+    start < other_end && end > other_start
+}
+
+#[inline]
+fn select_direct_map_leaf_size(
+    phys_addr: u64,
+    range_end: u64,
+    kernel_start: u64,
+    kernel_end: u64,
+    use_1gb_pages: bool,
+) -> DirectMapLeafSize {
+    if use_1gb_pages && is_1gb_aligned(phys_addr) {
+        if let Some(end) = phys_addr.checked_add(HUGE_PAGE_SIZE_1GB as u64) {
+            if end <= range_end && !ranges_overlap(phys_addr, end, kernel_start, kernel_end) {
+                return DirectMapLeafSize::Huge1Gb;
+            }
+        }
+    }
+
+    if is_2mb_aligned(phys_addr) {
+        if let Some(end) = phys_addr.checked_add(HUGE_PAGE_SIZE_2MB as u64) {
+            if end <= range_end && !ranges_overlap(phys_addr, end, kernel_start, kernel_end) {
+                return DirectMapLeafSize::Huge2Mb;
+            }
+        }
+    }
+
+    DirectMapLeafSize::Page4Kb
+}
+
+#[inline]
+fn next_direct_map_progress_threshold(current: u64, total: u64) -> u64 {
+    if current < DIRECT_MAP_PROGRESS_CHUNK_BYTES {
+        core::cmp::min(DIRECT_MAP_PROGRESS_CHUNK_BYTES, total)
+    } else {
+        core::cmp::min(current.saturating_add(DIRECT_MAP_PROGRESS_CHUNK_BYTES), total)
+    }
+}
+
+/// メモリマップから直写対象範囲（System RAM）を抽出して正規化する
 ///
 /// # Arguments
 /// * `memory_regions` - UEFIメモリマップのスライス
@@ -314,9 +379,9 @@ fn extract_direct_map_ranges(
         vitros_common::boot_info::MAX_MEMORY_REGIONS];
     let mut count = 0;
 
-    // 非MMIO領域を抽出し、4KB境界へ丸める
+    // direct-map対象のSystem RAMを抽出し、4KB境界へ丸める
     for region in memory_regions {
-        if is_mmio_memory_type(region.region_type) || region.size == 0 {
+        if !is_direct_map_ram_type(region.region_type) || region.size == 0 {
             continue;
         }
 
@@ -385,12 +450,6 @@ fn extract_direct_map_ranges(
     Ok((ranges, merged_count, total_pages, max_end))
 }
 
-#[inline]
-fn is_mmio_memory_type(region_type: u32) -> bool {
-    use vitros_common::uefi::{EFI_MEMORY_MAPPED_IO, EFI_MEMORY_MAPPED_IO_PORT_SPACE};
-    region_type == EFI_MEMORY_MAPPED_IO || region_type == EFI_MEMORY_MAPPED_IO_PORT_SPACE
-}
-
 // グローバルページテーブルを静的に確保
 // 物理メモリの直接マッピング（Direct Mapping）を実装
 
@@ -424,8 +483,9 @@ pub fn init(boot_info: &vitros_common::boot_info::BootInfo) -> Result<(), Paging
         let pml4 = addr_of_mut!(KERNEL_PML4);
         (*pml4).clear();
 
-        let flags = PageTableFlags::Present as u64 | PageTableFlags::Writable as u64;
-        let mut skipped_kernel_pages = 0usize;
+        let direct_4kb_flags = PageTableFlags::Present as u64 | PageTableFlags::Writable as u64;
+        let direct_huge_flags = direct_4kb_flags | PageTableFlags::HugePage as u64;
+        let mut skipped_kernel_pages = 0u64;
 
         let kernel_text_start = virt_to_phys(addr_of!(__text_start) as u64)?;
         let kernel_bss_end = virt_to_phys(addr_of!(__bss_end) as u64)?;
@@ -458,29 +518,35 @@ pub fn init(boot_info: &vitros_common::boot_info::BootInfo) -> Result<(), Paging
         let (direct_map_ranges, direct_map_range_count, total_pages, max_mapped_end) =
             extract_direct_map_ranges(memory_regions)?;
 
+        let use_1gb_pages = supports_1gb_pages();
         INITIAL_MAPPED_MAX_PHYS = max_mapped_end;
 
         let total_bytes = total_pages
             .checked_mul(PAGE_SIZE as u64)
             .ok_or(PagingError::AddressConversionFailed)?;
-        let required_pt_count = total_pages.div_ceil(PAGE_TABLE_ENTRY_COUNT as u64);
-        let required_pd_count = required_pt_count.div_ceil(PAGE_TABLE_ENTRY_COUNT as u64);
-        let required_pdp_count = required_pd_count.div_ceil(PAGE_TABLE_ENTRY_COUNT as u64);
 
         info!(
-            "Paging: mapping {} pages from {} ranges ({} MB)",
+            "Paging: mapping {} pages from {} RAM ranges ({} MB)",
             total_pages,
             direct_map_range_count,
             total_bytes >> 20
         );
         info!(
-            "Paging: estimated tables PDP/PD/PT = {}/{}/{}",
-            required_pdp_count, required_pd_count, required_pt_count
+            "Paging: direct-map policy {} + kernel W^X (kernel 4KB only)",
+            if use_1gb_pages {
+                "1GB -> 2MB -> 4KB"
+            } else {
+                "2MB -> 4KB (CPU 1GB page unsupported)"
+            }
         );
 
         let mut scanned_pages = 0u64;
         let mut mapped_pages = 0u64;
+        let mut mapped_1gb_leaves = 0u64;
+        let mut mapped_2mb_leaves = 0u64;
+        let mut mapped_4kb_leaves = 0u64;
         let mut next_progress_bytes = core::cmp::min(DIRECT_MAP_EARLY_PROGRESS_BYTES, total_bytes);
+        let mut last_logged_progress_bytes = 0u64;
         info!(
             "Paging: direct-map pass start ({} pages, ranges={}, first_chunk={} MB, chunk={} MB)",
             total_pages,
@@ -492,28 +558,77 @@ pub fn init(boot_info: &vitros_common::boot_info::BootInfo) -> Result<(), Paging
         let mut current_pt: *mut PageTable = core::ptr::null_mut();
         for range in direct_map_ranges.iter().take(direct_map_range_count) {
             let mut current_path: Option<(usize, usize, usize)> = None;
-            for physical_addr in (range.start..range.end).step_by(PAGE_SIZE) {
-                scanned_pages += 1;
+            let mut physical_addr = range.start;
+            while physical_addr < range.end {
+                let leaf_size = select_direct_map_leaf_size(
+                    physical_addr,
+                    range.end,
+                    kernel_text_start,
+                    kernel_bss_end,
+                    use_1gb_pages,
+                );
 
-                // カーネル領域はセクション毎のマッピング用に予約（4KBマッピングをスキップ）
-                if physical_addr >= kernel_text_start && physical_addr < kernel_bss_end {
-                    skipped_kernel_pages += 1;
-                } else {
-                    let (pml4_idx, pdp_idx, pd_idx, pt_idx) =
-                        direct_map_table_indices(physical_addr)?;
-                    let key = (pml4_idx, pdp_idx, pd_idx);
-                    if current_path != Some(key) {
-                        let pdp = ensure_pdp(pml4, pml4_idx)?;
-                        let pd = ensure_pd(pdp, pdp_idx)?;
-                        current_pt = ensure_pt(pd, pd_idx)?;
-                        current_path = Some(key);
+                let step_bytes = match leaf_size {
+                    DirectMapLeafSize::Huge1Gb => {
+                        map_1gb_page(pml4, physical_addr, direct_huge_flags)?;
+                        mapped_1gb_leaves += 1;
+                        mapped_pages += (HUGE_PAGE_SIZE_1GB / PAGE_SIZE) as u64;
+                        current_path = None;
+                        HUGE_PAGE_SIZE_1GB as u64
                     }
-                    (*current_pt).entry(pt_idx).set(physical_addr, flags);
-                    mapped_pages += 1;
+                    DirectMapLeafSize::Huge2Mb => {
+                        map_2mb_page(pml4, physical_addr, direct_huge_flags)?;
+                        mapped_2mb_leaves += 1;
+                        mapped_pages += (HUGE_PAGE_SIZE_2MB / PAGE_SIZE) as u64;
+                        current_path = None;
+                        HUGE_PAGE_SIZE_2MB as u64
+                    }
+                    DirectMapLeafSize::Page4Kb => {
+                        // カーネル領域はセクション毎のマッピング用に予約（4KBマッピングをスキップ）
+                        if physical_addr >= kernel_text_start && physical_addr < kernel_bss_end {
+                            skipped_kernel_pages += 1;
+                        } else {
+                            let (pml4_idx, pdp_idx, pd_idx, pt_idx) =
+                                direct_map_table_indices(physical_addr)?;
+                            let key = (pml4_idx, pdp_idx, pd_idx);
+                            if current_path != Some(key) {
+                                let pdp = ensure_pdp(pml4, pml4_idx)?;
+                                let pd = ensure_pd(pdp, pdp_idx)?;
+                                current_pt = ensure_pt(pd, pd_idx)?;
+                                current_path = Some(key);
+                            }
+                            (*current_pt).entry(pt_idx).set(physical_addr, direct_4kb_flags);
+                            mapped_pages += 1;
+                            mapped_4kb_leaves += 1;
+                        }
+
+                        PAGE_SIZE as u64
+                    }
+                };
+
+                scanned_pages += step_bytes / PAGE_SIZE as u64;
+                let scanned_bytes = scanned_pages * PAGE_SIZE as u64;
+
+                while scanned_bytes >= next_progress_bytes && next_progress_bytes < total_bytes {
+                    let percent = if total_bytes == 0 {
+                        100
+                    } else {
+                        next_progress_bytes.saturating_mul(100) / total_bytes
+                    };
+                    info!(
+                        "Paging: direct-map progress {}/{} MB ({}%, scanned_pages={}, mapped_pages={}, skipped_kernel={})",
+                        next_progress_bytes >> 20,
+                        total_bytes >> 20,
+                        percent,
+                        scanned_pages,
+                        mapped_pages,
+                        skipped_kernel_pages
+                    );
+                    last_logged_progress_bytes = next_progress_bytes;
+                    next_progress_bytes = next_direct_map_progress_threshold(next_progress_bytes, total_bytes);
                 }
 
-                let scanned_bytes = scanned_pages * PAGE_SIZE as u64;
-                if scanned_bytes >= next_progress_bytes || scanned_pages == total_pages {
+                if scanned_pages == total_pages && scanned_bytes > last_logged_progress_bytes {
                     let percent = if total_bytes == 0 {
                         100
                     } else {
@@ -528,24 +643,23 @@ pub fn init(boot_info: &vitros_common::boot_info::BootInfo) -> Result<(), Paging
                         mapped_pages,
                         skipped_kernel_pages
                     );
-
-                    while next_progress_bytes <= scanned_bytes && next_progress_bytes < total_bytes
-                    {
-                        if next_progress_bytes < DIRECT_MAP_PROGRESS_CHUNK_BYTES {
-                            next_progress_bytes =
-                                core::cmp::min(DIRECT_MAP_PROGRESS_CHUNK_BYTES, total_bytes);
-                        } else {
-                            next_progress_bytes =
-                                next_progress_bytes.saturating_add(DIRECT_MAP_PROGRESS_CHUNK_BYTES);
-                        }
-                    }
+                    last_logged_progress_bytes = scanned_bytes;
                 }
+
+                physical_addr = physical_addr
+                    .checked_add(step_bytes)
+                    .ok_or(PagingError::AddressConversionFailed)?;
             }
         }
 
         info!(
-            "Paging: direct-map pass complete (scanned_pages={}, mapped_pages={}, skipped_kernel={})",
-            scanned_pages, mapped_pages, skipped_kernel_pages
+            "Paging: direct-map pass complete (scanned_pages={}, mapped_pages={}, leaves[1GB/2MB/4KB]={}/{}/{}, skipped_kernel={})",
+            scanned_pages,
+            mapped_pages,
+            mapped_1gb_leaves,
+            mapped_2mb_leaves,
+            mapped_4kb_leaves,
+            skipped_kernel_pages
         );
 
         if skipped_kernel_pages > 0 {
@@ -756,6 +870,49 @@ unsafe fn map_4kb_page(
         let pd = ensure_pd(pdp, pdp_idx)?;
         let pt = ensure_pt(pd, pd_idx)?;
         (*pt).entry(pt_idx).set(phys_addr, flags);
+        Ok(())
+    }
+}
+
+unsafe fn map_2mb_page(
+    pml4: *mut PageTable,
+    phys_addr: u64,
+    flags: u64,
+) -> Result<(), PagingError> {
+    if !is_2mb_aligned(phys_addr) {
+        return Err(PagingError::InvalidAddress);
+    }
+
+    unsafe {
+        let (pml4_idx, pdp_idx, pd_idx, _) = direct_map_table_indices(phys_addr)?;
+        let pdp = ensure_pdp(pml4, pml4_idx)?;
+        let pd = ensure_pd(pdp, pdp_idx)?;
+        let entry = (*pd).entry(pd_idx);
+        if entry.is_present() && !entry.is_huge_page() {
+            return Err(PagingError::ExistingMappingConflict);
+        }
+        entry.set(phys_addr, flags);
+        Ok(())
+    }
+}
+
+unsafe fn map_1gb_page(
+    pml4: *mut PageTable,
+    phys_addr: u64,
+    flags: u64,
+) -> Result<(), PagingError> {
+    if !is_1gb_aligned(phys_addr) {
+        return Err(PagingError::InvalidAddress);
+    }
+
+    unsafe {
+        let (pml4_idx, pdp_idx, _, _) = direct_map_table_indices(phys_addr)?;
+        let pdp = ensure_pdp(pml4, pml4_idx)?;
+        let entry = (*pdp).entry(pdp_idx);
+        if entry.is_present() && !entry.is_huge_page() {
+            return Err(PagingError::ExistingMappingConflict);
+        }
+        entry.set(phys_addr, flags);
         Ok(())
     }
 }
@@ -1346,8 +1503,9 @@ mod tests {
     use super::*;
     use vitros_common::boot_info::{BootInfo, MemoryRegion};
     use vitros_common::uefi::{
-        EFI_ACPI_RECLAIM_MEMORY, EFI_CONVENTIONAL_MEMORY, EFI_MEMORY_MAPPED_IO,
-        EFI_MEMORY_MAPPED_IO_PORT_SPACE,
+        EFI_ACPI_RECLAIM_MEMORY, EFI_BOOT_SERVICES_DATA, EFI_CONVENTIONAL_MEMORY,
+        EFI_LOADER_CODE, EFI_MEMORY_MAPPED_IO, EFI_MEMORY_MAPPED_IO_PORT_SPACE,
+        EFI_RUNTIME_SERVICES_DATA,
     };
 
     const TEST_TABLE_ALLOC_LIMIT: u64 = 0x20_0000; // 2 MiB
@@ -1375,7 +1533,7 @@ mod tests {
     }
 
     #[test_case]
-    fn test_extract_direct_map_ranges_filters_mmio_and_aligns() {
+    fn test_extract_direct_map_ranges_filters_system_ram_and_aligns() {
         let regions = [
             MemoryRegion {
                 start: 0x1003,
@@ -1383,17 +1541,32 @@ mod tests {
                 region_type: EFI_CONVENTIONAL_MEMORY,
             },
             MemoryRegion {
+                start: 0x3000,
+                size: 0x1000,
+                region_type: EFI_LOADER_CODE,
+            },
+            MemoryRegion {
                 start: 0x5000,
+                size: 0x1000,
+                region_type: EFI_BOOT_SERVICES_DATA,
+            },
+            MemoryRegion {
+                start: 0x7000,
                 size: 0x1000,
                 region_type: EFI_ACPI_RECLAIM_MEMORY,
             },
             MemoryRegion {
                 start: 0x8000,
+                size: 0x1000,
+                region_type: EFI_RUNTIME_SERVICES_DATA,
+            },
+            MemoryRegion {
+                start: 0x9000,
                 size: 0x2000,
                 region_type: EFI_MEMORY_MAPPED_IO,
             },
             MemoryRegion {
-                start: 0xA000,
+                start: 0xB000,
                 size: 0x1000,
                 region_type: EFI_MEMORY_MAPPED_IO_PORT_SPACE,
             },
@@ -1402,13 +1575,15 @@ mod tests {
         let (ranges, count, total_pages, max_end) =
             extract_direct_map_ranges(&regions).expect("extract direct-map ranges failed");
 
-        assert_eq!(count, 2);
+        assert_eq!(count, 3);
         assert_eq!(ranges[0].start, 0x1000);
-        assert_eq!(ranges[0].end, 0x3000);
+        assert_eq!(ranges[0].end, 0x4000);
         assert_eq!(ranges[1].start, 0x5000);
         assert_eq!(ranges[1].end, 0x6000);
-        assert_eq!(total_pages, 3);
-        assert_eq!(max_end, 0x6000);
+        assert_eq!(ranges[2].start, 0x7000);
+        assert_eq!(ranges[2].end, 0x8000);
+        assert_eq!(total_pages, 5);
+        assert_eq!(max_end, 0x8000);
     }
 
     #[test_case]
@@ -1472,6 +1647,54 @@ mod tests {
         assert_eq!(empty_count, 0);
         assert_eq!(empty_pages, 0);
         assert_eq!(empty_max_end, 0);
+    }
+
+    #[test_case]
+    fn test_select_direct_map_leaf_size_prefers_larger_pages() {
+        let kernel_start = 0x1000_0000;
+        let kernel_end = 0x1008_0000;
+
+        let one_gb_aligned = 0x8000_0000;
+        let range_end = one_gb_aligned + HUGE_PAGE_SIZE_1GB as u64;
+        assert_eq!(
+            select_direct_map_leaf_size(one_gb_aligned, range_end, kernel_start, kernel_end, true),
+            DirectMapLeafSize::Huge1Gb
+        );
+        assert_eq!(
+            select_direct_map_leaf_size(
+                one_gb_aligned,
+                range_end,
+                kernel_start,
+                kernel_end,
+                false
+            ),
+            DirectMapLeafSize::Huge2Mb
+        );
+
+        assert_eq!(
+            select_direct_map_leaf_size(0x8123_4000, range_end, kernel_start, kernel_end, true),
+            DirectMapLeafSize::Page4Kb
+        );
+    }
+
+    #[test_case]
+    fn test_select_direct_map_leaf_size_avoids_kernel_overlap() {
+        let one_gb_aligned = 0x4000_0000;
+        let range_end = one_gb_aligned + HUGE_PAGE_SIZE_1GB as u64;
+        let kernel_start = one_gb_aligned + 0x2000_0000;
+        let kernel_end = kernel_start + PAGE_SIZE as u64;
+
+        // 1GBチャンク全体はカーネルと重なるため、2MBへフォールバックする
+        assert_eq!(
+            select_direct_map_leaf_size(one_gb_aligned, range_end, kernel_start, kernel_end, true),
+            DirectMapLeafSize::Huge2Mb
+        );
+
+        // カーネルを含む2MBチャンクは4KBへフォールバックする
+        assert_eq!(
+            select_direct_map_leaf_size(kernel_start & !((HUGE_PAGE_SIZE_2MB as u64) - 1), range_end, kernel_start, kernel_end, true),
+            DirectMapLeafSize::Page4Kb
+        );
     }
 
     #[test_case]
