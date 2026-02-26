@@ -78,9 +78,6 @@ const HUGE_PAGE_2MB_OFFSET_MASK: u64 = 0x1F_FFFF;
 /// 1GBヒュージページのオフセットマスク（下位30ビット）
 const HUGE_PAGE_1GB_OFFSET_MASK: u64 = 0x3FFF_FFFF;
 
-/// 1つのPage Tableがカバーする領域サイズ（2MB = 512 * 4KB）
-const PAGE_TABLE_COVERAGE: u64 = (PAGE_TABLE_ENTRY_COUNT * PAGE_SIZE) as u64;
-
 /// ページオフセットマスク（下位12ビット）
 const PAGE_OFFSET_MASK: u64 = 0xFFF;
 
@@ -492,10 +489,9 @@ pub fn init(boot_info: &vitros_common::boot_info::BootInfo) -> Result<(), Paging
             DIRECT_MAP_PROGRESS_CHUNK_BYTES >> 20
         );
 
-        let mut current_path: Option<(usize, usize, usize)> = None;
         let mut current_pt: *mut PageTable = core::ptr::null_mut();
         for range in direct_map_ranges.iter().take(direct_map_range_count) {
-            current_path = None;
+            let mut current_path: Option<(usize, usize, usize)> = None;
             for physical_addr in (range.start..range.end).step_by(PAGE_SIZE) {
                 scanned_pages += 1;
 
@@ -1349,7 +1345,10 @@ pub fn map_framebuffer_huge(fb_base: u64, fb_size: u64) -> Result<u64, PagingErr
 mod tests {
     use super::*;
     use vitros_common::boot_info::{BootInfo, MemoryRegion};
-    use vitros_common::uefi::EFI_CONVENTIONAL_MEMORY;
+    use vitros_common::uefi::{
+        EFI_ACPI_RECLAIM_MEMORY, EFI_CONVENTIONAL_MEMORY, EFI_MEMORY_MAPPED_IO,
+        EFI_MEMORY_MAPPED_IO_PORT_SPACE,
+    };
 
     const TEST_TABLE_ALLOC_LIMIT: u64 = 0x20_0000; // 2 MiB
     const TEST_TABLE_ALLOC_REGION_SIZE: u64 = 0x80_0000; // 8 MiB
@@ -1373,6 +1372,106 @@ mod tests {
             let pml4 = addr_of_mut!(KERNEL_PML4);
             (*pml4).clear();
         }
+    }
+
+    #[test_case]
+    fn test_extract_direct_map_ranges_filters_mmio_and_aligns() {
+        let regions = [
+            MemoryRegion {
+                start: 0x1003,
+                size: 0x1FFD,
+                region_type: EFI_CONVENTIONAL_MEMORY,
+            },
+            MemoryRegion {
+                start: 0x5000,
+                size: 0x1000,
+                region_type: EFI_ACPI_RECLAIM_MEMORY,
+            },
+            MemoryRegion {
+                start: 0x8000,
+                size: 0x2000,
+                region_type: EFI_MEMORY_MAPPED_IO,
+            },
+            MemoryRegion {
+                start: 0xA000,
+                size: 0x1000,
+                region_type: EFI_MEMORY_MAPPED_IO_PORT_SPACE,
+            },
+        ];
+
+        let (ranges, count, total_pages, max_end) =
+            extract_direct_map_ranges(&regions).expect("extract direct-map ranges failed");
+
+        assert_eq!(count, 2);
+        assert_eq!(ranges[0].start, 0x1000);
+        assert_eq!(ranges[0].end, 0x3000);
+        assert_eq!(ranges[1].start, 0x5000);
+        assert_eq!(ranges[1].end, 0x6000);
+        assert_eq!(total_pages, 3);
+        assert_eq!(max_end, 0x6000);
+    }
+
+    #[test_case]
+    fn test_extract_direct_map_ranges_merges_overlap_and_adjacent() {
+        let regions = [
+            MemoryRegion {
+                start: 0x1000,
+                size: 0x1000,
+                region_type: EFI_CONVENTIONAL_MEMORY,
+            },
+            MemoryRegion {
+                start: 0x1800,
+                size: 0x2000,
+                region_type: EFI_CONVENTIONAL_MEMORY,
+            },
+            MemoryRegion {
+                start: 0x4000,
+                size: 0x1000,
+                region_type: EFI_CONVENTIONAL_MEMORY,
+            },
+        ];
+
+        let (ranges, count, total_pages, max_end) =
+            extract_direct_map_ranges(&regions).expect("extract direct-map ranges failed");
+
+        assert_eq!(count, 1);
+        assert_eq!(ranges[0].start, 0x1000);
+        assert_eq!(ranges[0].end, 0x5000);
+        assert_eq!(total_pages, 4);
+        assert_eq!(max_end, 0x5000);
+    }
+
+    #[test_case]
+    fn test_extract_direct_map_ranges_sorted_and_empty() {
+        let regions = [
+            MemoryRegion {
+                start: 0x9000,
+                size: 0x1000,
+                region_type: EFI_CONVENTIONAL_MEMORY,
+            },
+            MemoryRegion {
+                start: 0x2000,
+                size: 0x1000,
+                region_type: EFI_ACPI_RECLAIM_MEMORY,
+            },
+        ];
+
+        let (ranges, count, total_pages, max_end) =
+            extract_direct_map_ranges(&regions).expect("extract direct-map ranges failed");
+        assert_eq!(count, 2);
+        assert_eq!(ranges[0].start, 0x2000);
+        assert_eq!(ranges[0].end, 0x3000);
+        assert_eq!(ranges[1].start, 0x9000);
+        assert_eq!(ranges[1].end, 0xA000);
+        assert_eq!(total_pages, 2);
+        assert_eq!(max_end, 0xA000);
+
+        let empty_regions: [MemoryRegion; 0] = [];
+        let (_, empty_count, empty_pages, empty_max_end) =
+            extract_direct_map_ranges(&empty_regions).expect("empty extraction failed");
+        assert_eq!(empty_count, 0);
+        assert_eq!(empty_pages, 0);
+        assert_eq!(empty_max_end, 0);
     }
 
     #[test_case]
