@@ -78,19 +78,12 @@ const HUGE_PAGE_2MB_OFFSET_MASK: u64 = 0x1F_FFFF;
 /// 1GBヒュージページのオフセットマスク（下位30ビット）
 const HUGE_PAGE_1GB_OFFSET_MASK: u64 = 0x3FFF_FFFF;
 
-/// 1つのPage Tableがカバーする領域サイズ（2MB = 512 * 4KB）
-const PAGE_TABLE_COVERAGE: u64 = (PAGE_TABLE_ENTRY_COUNT * PAGE_SIZE) as u64;
-
 /// ページオフセットマスク（下位12ビット）
 const PAGE_OFFSET_MASK: u64 = 0xFFF;
 
 /// ページテーブルエントリから物理アドレスを抽出するためのマスク
 /// ビット12〜51が物理アドレス（4KB境界アライメント、最大52ビット物理アドレス対応）
 const PHYSICAL_ADDRESS_MASK: u64 = 0x000F_FFFF_FFFF_F000;
-
-/// カーネル空間のPML4エントリインデックス (0xFFFF_8000_0000_0000に対応)
-/// x86_64では仮想アドレスのビット47:39がPML4インデックスとなる
-const PML4_KERNEL_INDEX: usize = 256;
 
 /// アドレスが2MB境界にアライメントされているかチェック
 #[inline]
@@ -253,6 +246,11 @@ impl PageTable {
         }
     }
 
+    /// テーブル内に有効なエントリが存在しないか確認
+    pub fn is_empty(&self) -> bool {
+        self.entries.iter().all(|entry| !entry.is_present())
+    }
+
     /// 指定インデックスのエントリを読み取り専用で取得（デバッグビルド用）
     #[cfg(debug_assertions)]
     pub fn get_entry(&self, index: usize) -> &PageTableEntry {
@@ -287,107 +285,180 @@ pub fn reload_cr3() {
     write_cr3(cr3);
 }
 
-/// MMIO領域の範囲を表す構造体（二分探索用）
+/// 直写対象の物理範囲
 #[derive(Clone, Copy)]
-struct MmioRange {
+struct DirectMapRange {
     start: u64,
     end: u64,
 }
 
-/// メモリマップからMMIO領域を抽出し、開始アドレスでソートして返す
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DirectMapLeafSize {
+    Page4Kb,
+    Huge2Mb,
+    Huge1Gb,
+}
+
+#[inline]
+fn is_direct_map_ram_type(region_type: u32) -> bool {
+    use vitros_common::uefi::{
+        EFI_ACPI_RECLAIM_MEMORY, EFI_BOOT_SERVICES_CODE, EFI_BOOT_SERVICES_DATA,
+        EFI_CONVENTIONAL_MEMORY, EFI_LOADER_CODE, EFI_LOADER_DATA,
+    };
+    matches!(
+        region_type,
+        EFI_CONVENTIONAL_MEMORY
+            | EFI_LOADER_CODE
+            | EFI_LOADER_DATA
+            | EFI_BOOT_SERVICES_CODE
+            | EFI_BOOT_SERVICES_DATA
+            | EFI_ACPI_RECLAIM_MEMORY
+    )
+}
+
+#[inline]
+fn ranges_overlap(start: u64, end: u64, other_start: u64, other_end: u64) -> bool {
+    start < other_end && end > other_start
+}
+
+#[inline]
+fn select_direct_map_leaf_size(
+    phys_addr: u64,
+    range_end: u64,
+    kernel_start: u64,
+    kernel_end: u64,
+    use_1gb_pages: bool,
+) -> DirectMapLeafSize {
+    if use_1gb_pages && is_1gb_aligned(phys_addr) {
+        if let Some(end) = phys_addr.checked_add(HUGE_PAGE_SIZE_1GB as u64) {
+            if end <= range_end && !ranges_overlap(phys_addr, end, kernel_start, kernel_end) {
+                return DirectMapLeafSize::Huge1Gb;
+            }
+        }
+    }
+
+    if is_2mb_aligned(phys_addr) {
+        if let Some(end) = phys_addr.checked_add(HUGE_PAGE_SIZE_2MB as u64) {
+            if end <= range_end && !ranges_overlap(phys_addr, end, kernel_start, kernel_end) {
+                return DirectMapLeafSize::Huge2Mb;
+            }
+        }
+    }
+
+    DirectMapLeafSize::Page4Kb
+}
+
+#[inline]
+fn next_direct_map_progress_threshold(current: u64, total: u64) -> u64 {
+    if current < DIRECT_MAP_PROGRESS_CHUNK_BYTES {
+        core::cmp::min(DIRECT_MAP_PROGRESS_CHUNK_BYTES, total)
+    } else {
+        core::cmp::min(current.saturating_add(DIRECT_MAP_PROGRESS_CHUNK_BYTES), total)
+    }
+}
+
+/// メモリマップから直写対象範囲（System RAM）を抽出して正規化する
 ///
 /// # Arguments
 /// * `memory_regions` - UEFIメモリマップのスライス
 ///
 /// # Returns
-/// MMIO領域の配列（最大64個）とその個数
-fn extract_mmio_regions(
+/// 正規化済み範囲配列、範囲数、総ページ数、最大終端アドレス（exclusive）
+fn extract_direct_map_ranges(
     memory_regions: &[vitros_common::boot_info::MemoryRegion],
-) -> ([MmioRange; 64], usize) {
-    use vitros_common::uefi::{EFI_MEMORY_MAPPED_IO, EFI_MEMORY_MAPPED_IO_PORT_SPACE};
-
-    let mut mmio_ranges = [MmioRange { start: 0, end: 0 }; 64];
+) -> Result<
+    (
+        [DirectMapRange; vitros_common::boot_info::MAX_MEMORY_REGIONS],
+        usize,
+        u64,
+        u64,
+    ),
+    PagingError,
+> {
+    let mut ranges = [DirectMapRange { start: 0, end: 0 };
+        vitros_common::boot_info::MAX_MEMORY_REGIONS];
     let mut count = 0;
 
-    // MMIO領域を抽出
+    // direct-map対象のSystem RAMを抽出し、4KB境界へ丸める
     for region in memory_regions {
-        if region.region_type == EFI_MEMORY_MAPPED_IO
-            || region.region_type == EFI_MEMORY_MAPPED_IO_PORT_SPACE
-        {
-            if count < 64 {
-                mmio_ranges[count] = MmioRange {
-                    start: region.start,
-                    end: region.start + region.size,
-                };
-                count += 1;
-            }
+        if !is_direct_map_ram_type(region.region_type) || region.size == 0 {
+            continue;
         }
+
+        let region_end = region
+            .start
+            .checked_add(region.size)
+            .ok_or(PagingError::AddressConversionFailed)?;
+        let start_aligned = region.start & !(PAGE_SIZE as u64 - 1);
+        let end_aligned = region_end
+            .checked_add(PAGE_SIZE as u64 - 1)
+            .ok_or(PagingError::AddressConversionFailed)?
+            & !(PAGE_SIZE as u64 - 1);
+
+        if start_aligned >= end_aligned {
+            continue;
+        }
+        if count >= ranges.len() {
+            break;
+        }
+
+        ranges[count] = DirectMapRange {
+            start: start_aligned,
+            end: end_aligned,
+        };
+        count += 1;
+    }
+
+    if count == 0 {
+        return Ok((ranges, 0, 0, 0));
     }
 
     // 開始アドレスでソート（挿入ソート: 小規模配列向け）
     for i in 1..count {
-        let key = mmio_ranges[i];
+        let key = ranges[i];
         let mut j = i;
-        while j > 0 && mmio_ranges[j - 1].start > key.start {
-            mmio_ranges[j] = mmio_ranges[j - 1];
+        while j > 0 && ranges[j - 1].start > key.start {
+            ranges[j] = ranges[j - 1];
             j -= 1;
         }
-        mmio_ranges[j] = key;
+        ranges[j] = key;
     }
 
-    (mmio_ranges, count)
-}
-
-/// 二分探索によるMMIO領域判定（O(log m)）
-///
-/// # Arguments
-/// * `phys_addr` - 判定する物理アドレス
-/// * `mmio_ranges` - ソート済みMMIO領域配列
-/// * `count` - 有効なMMIO領域の数
-fn is_mmio_region_binary(phys_addr: u64, mmio_ranges: &[MmioRange; 64], count: usize) -> bool {
-    if count == 0 {
-        return false;
+    // 隣接/重複範囲をマージ
+    let mut write_idx = 0usize;
+    for i in 1..count {
+        let curr = ranges[i];
+        let write = &mut ranges[write_idx];
+        if curr.start <= write.end {
+            write.end = write.end.max(curr.end);
+        } else {
+            write_idx += 1;
+            ranges[write_idx] = curr;
+        }
     }
 
-    // partition_point: phys_addr >= range.start となる最初の位置を超える位置を返す
-    // つまり、phys_addr以下のstartを持つ領域の数を返す
-    let ranges = &mmio_ranges[..count];
-    let idx = ranges.partition_point(|range| range.start <= phys_addr);
-
-    // idxが0の場合、すべてのMMIO領域のstartがphys_addrより大きいため、MMIO外
-    if idx == 0 {
-        return false;
+    let merged_count = write_idx + 1;
+    let mut total_pages = 0u64;
+    let mut max_end = 0u64;
+    for range in ranges.iter().take(merged_count) {
+        total_pages = total_pages
+            .checked_add((range.end - range.start) / PAGE_SIZE as u64)
+            .ok_or(PagingError::AddressConversionFailed)?;
+        max_end = max_end.max(range.end);
     }
 
-    // idx-1 の領域が phys_addr を含むかチェック
-    let candidate = &ranges[idx - 1];
-    phys_addr < candidate.end
+    Ok((ranges, merged_count, total_pages, max_end))
 }
 
 // グローバルページテーブルを静的に確保
 // 物理メモリの直接マッピング（Direct Mapping）を実装
 
-/// 最大サポートメモリ（GB単位）
-/// 静的配列のサイズを決定する - 8GBまでサポート
-/// MMIOホール（3-4GB付近）を超えてメモリマッピングするため8GBに拡張
-pub const MAX_SUPPORTED_MEMORY_GB: usize = 8;
-
-/// Page Table数（各PTは2MBをカバー）
-/// 8GB = 4096個のPT（512 * 8 = 4096）
-const PT_COUNT: usize = MAX_SUPPORTED_MEMORY_GB * 512;
+/// 直写フェーズ開始直後の進捗ログ出力間隔（最初の1本）
+const DIRECT_MAP_EARLY_PROGRESS_BYTES: u64 = 1 * 1024 * 1024;
+/// 直写フェーズの通常進捗ログ出力間隔
+const DIRECT_MAP_PROGRESS_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
 
 static mut KERNEL_PML4: PageTable = PageTable::new();
-static mut KERNEL_PDP_HIGH: PageTable = PageTable::new(); // 高位アドレス用（0xFFFF_8000_0000_0000〜）
-
-// Page Directory（4GB分確保、高位アドレスのみ）
-static mut KERNEL_PD_HIGH: [PageTable; MAX_SUPPORTED_MEMORY_GB] =
-    [PageTable::new(); MAX_SUPPORTED_MEMORY_GB];
-
-// Page Table（4GB全体を4KBページでマップするため2,048個のPTが必要、高位アドレスのみ）
-// 各PT = 512エントリ × 4KB = 2MB
-// 4GB = 2,048個のPT
-// 低位アドレスはアンマップ（ハイヤーハーフカーネル）
-static mut KERNEL_PT_HIGH: [PageTable; PT_COUNT] = [PageTable::new(); PT_COUNT];
 
 // map_mmio() がページテーブル拡張に使えるフレームの上限（初期直写済み範囲）
 static mut INITIAL_MAPPED_MAX_PHYS: u64 = 0;
@@ -398,7 +469,6 @@ static mut INITIAL_MAPPED_MAX_PHYS: u64 = 0;
 /// - 高位アドレス（0xFFFF_8000_0000_0000+）: カーネル用の直接マッピング
 ///
 /// UEFIメモリマップに基づいて、実際に利用可能なメモリ範囲のみをマッピングする。
-/// 最大サポートメモリは MAX_SUPPORTED_MEMORY_GB (8GB) まで。
 ///
 /// # Arguments
 /// * `boot_info` - ブートローダから渡されたメモリ情報
@@ -407,175 +477,229 @@ static mut INITIAL_MAPPED_MAX_PHYS: u64 = 0;
 /// * `PagingError::AddressConversionFailed` - アドレス変換に失敗した場合
 /// * `PagingError::GuardPageSetupFailed` - Guard Page設定に失敗した場合
 pub fn init(boot_info: &vitros_common::boot_info::BootInfo) -> Result<(), PagingError> {
-    // サポートする最大アドレスを計算
-    let max_supported = (MAX_SUPPORTED_MEMORY_GB as u64) << 30; // 8GB
-    let actual_max = boot_info.max_physical_address.min(max_supported);
-
-    unsafe {
-        INITIAL_MAPPED_MAX_PHYS = actual_max;
-    }
-
-    // 必要なPD数とPT数を計算
-    // 1 PT = 512 * 4KB = 2MB
-    let required_pt_count = ((actual_max + PAGE_TABLE_COVERAGE - 1) / PAGE_TABLE_COVERAGE) as usize;
-    let required_pd_count = (required_pt_count + 511) / 512;
-
     use crate::info;
-    info!(
-        "Paging: Mapping {} MB of physical memory",
-        actual_max / (1 << 20)
-    );
-    info!(
-        "Paging: Using {} PDs and {} PTs",
-        required_pd_count, required_pt_count
-    );
 
     unsafe {
-        // 生ポインタを取得（高位アドレス用のみ）
         let pml4 = addr_of_mut!(KERNEL_PML4);
-        let pdp_high = addr_of_mut!(KERNEL_PDP_HIGH);
-        let pd_high = addr_of_mut!(KERNEL_PD_HIGH);
-        let pt_high = addr_of_mut!(KERNEL_PT_HIGH);
-
-        // すべてのテーブルをクリア
         (*pml4).clear();
-        (*pdp_high).clear();
-        for i in 0..MAX_SUPPORTED_MEMORY_GB {
-            (*pd_high)[i].clear();
-        }
-        for i in 0..PT_COUNT {
-            (*pt_high)[i].clear();
-        }
 
-        // 基本フラグ: Present + Writable
-        let flags = PageTableFlags::Present as u64 | PageTableFlags::Writable as u64;
+        let direct_4kb_flags = PageTableFlags::Present as u64 | PageTableFlags::Writable as u64;
+        let direct_huge_flags = direct_4kb_flags | PageTableFlags::HugePage as u64;
+        let mut skipped_kernel_pages = 0u64;
 
-        // === PML4の設定 ===
-        // 低位アドレス（0x0〜）はアンマップ（ハイヤーハーフカーネル）
-        // PML4[0]は設定しない（Present=0のまま）
-
-        // PML4[PML4_KERNEL_INDEX] -> PDP_HIGH (高位アドレス用: 0xFFFF_8000_0000_0000〜)
-        (*pml4)
-            .entry(PML4_KERNEL_INDEX)
-            .set((*pdp_high).physical_address()?, flags);
-
-        // === 必要なPDPエントリのみ設定（高位のみ）===
-        for i in 0..required_pd_count {
-            (*pdp_high)
-                .entry(i)
-                .set((*pd_high)[i].physical_address()?, flags);
-        }
-
-        // === 必要なPTのみリンク（高位のみ）===
-        for pt_idx in 0..required_pt_count {
-            let pd_idx = pt_idx / PAGE_TABLE_ENTRY_COUNT;
-            let entry_idx = pt_idx % PAGE_TABLE_ENTRY_COUNT;
-
-            (*pd_high)[pd_idx]
-                .entry(entry_idx)
-                .set((*pt_high)[pt_idx].physical_address()?, flags);
-        }
-
-        // === 必要なページのみマッピング（高位のみ）===
-        // MMIO領域とカーネル領域はスキップ
-        // - MMIO領域: 後でmap_mmio()でUC属性でマッピング
-        // - カーネル領域: この後セクション毎に適切なフラグでマッピング
-        let mut skipped_mmio_pages = 0usize;
-        let mut skipped_kernel_pages = 0usize;
-
-        // カーネルセクション境界を取得（仮想アドレス→物理アドレス変換）
         let kernel_text_start = virt_to_phys(addr_of!(__text_start) as u64)?;
         let kernel_bss_end = virt_to_phys(addr_of!(__bss_end) as u64)?;
+        let kernel_image_size = kernel_bss_end
+            .checked_sub(kernel_text_start)
+            .ok_or(PagingError::PageTableInitFailed)?;
+        crate::frame_allocator::reserve_range(kernel_text_start, kernel_image_size)
+            .map_err(|_| PagingError::FrameAllocationFailed)?;
+        info!(
+            "Paging: reserved kernel image frames phys=0x{:X}-0x{:X}",
+            kernel_text_start, kernel_bss_end
+        );
+        if let Some(stack_guard_virt) = crate::stack::guard_page_address() {
+            let stack_top_virt = crate::stack::stack_top();
+            let stack_guard_phys = virt_to_phys(stack_guard_virt)?;
+            let stack_top_phys = virt_to_phys(stack_top_virt)?;
+            let stack_size = stack_top_phys
+                .checked_sub(stack_guard_phys)
+                .ok_or(PagingError::PageTableInitFailed)?;
+            crate::frame_allocator::reserve_range(stack_guard_phys, stack_size)
+                .map_err(|_| PagingError::FrameAllocationFailed)?;
+            info!(
+                "Paging: reserved kernel stack frames phys=0x{:X}-0x{:X}",
+                stack_guard_phys, stack_top_phys
+            );
+        }
 
-        // メモリマップからMMIO領域を抽出し、ソート済み配列を作成（ループ前に1回だけ）
         let memory_region_count = boot_info.memory_map_count.min(boot_info.memory_map.len());
         let memory_regions = &boot_info.memory_map[..memory_region_count];
-        let (mmio_ranges, mmio_count) = extract_mmio_regions(memory_regions);
-        for pt_idx in 0..required_pt_count {
-            for page_idx in 0..PAGE_TABLE_ENTRY_COUNT {
-                let physical_addr =
-                    ((pt_idx * PAGE_TABLE_ENTRY_COUNT + page_idx) * PAGE_SIZE) as u64;
-                if physical_addr < actual_max {
-                    // カーネル領域はセクション毎のマッピング用に予約（4KBマッピングをスキップ）
-                    if physical_addr >= kernel_text_start && physical_addr < kernel_bss_end {
-                        skipped_kernel_pages += 1;
-                        continue;
+        let (direct_map_ranges, direct_map_range_count, total_pages, max_mapped_end) =
+            extract_direct_map_ranges(memory_regions)?;
+
+        let use_1gb_pages = supports_1gb_pages();
+        INITIAL_MAPPED_MAX_PHYS = max_mapped_end;
+
+        let total_bytes = total_pages
+            .checked_mul(PAGE_SIZE as u64)
+            .ok_or(PagingError::AddressConversionFailed)?;
+
+        info!(
+            "Paging: mapping {} pages from {} RAM ranges ({} MB)",
+            total_pages,
+            direct_map_range_count,
+            total_bytes >> 20
+        );
+        info!(
+            "Paging: direct-map policy {} + kernel W^X (kernel 4KB only)",
+            if use_1gb_pages {
+                "1GB -> 2MB -> 4KB"
+            } else {
+                "2MB -> 4KB (CPU 1GB page unsupported)"
+            }
+        );
+
+        let mut scanned_pages = 0u64;
+        let mut mapped_pages = 0u64;
+        let mut mapped_1gb_leaves = 0u64;
+        let mut mapped_2mb_leaves = 0u64;
+        let mut mapped_4kb_leaves = 0u64;
+        let mut next_progress_bytes = core::cmp::min(DIRECT_MAP_EARLY_PROGRESS_BYTES, total_bytes);
+        let mut last_logged_progress_bytes = 0u64;
+        info!(
+            "Paging: direct-map pass start ({} pages, ranges={}, first_chunk={} MB, chunk={} MB)",
+            total_pages,
+            direct_map_range_count,
+            DIRECT_MAP_EARLY_PROGRESS_BYTES >> 20,
+            DIRECT_MAP_PROGRESS_CHUNK_BYTES >> 20
+        );
+
+        let mut current_pt: *mut PageTable = core::ptr::null_mut();
+        for range in direct_map_ranges.iter().take(direct_map_range_count) {
+            let mut current_path: Option<(usize, usize, usize)> = None;
+            let mut physical_addr = range.start;
+            while physical_addr < range.end {
+                let leaf_size = select_direct_map_leaf_size(
+                    physical_addr,
+                    range.end,
+                    kernel_text_start,
+                    kernel_bss_end,
+                    use_1gb_pages,
+                );
+
+                let step_bytes = match leaf_size {
+                    DirectMapLeafSize::Huge1Gb => {
+                        map_1gb_page(pml4, physical_addr, direct_huge_flags)?;
+                        mapped_1gb_leaves += 1;
+                        mapped_pages += (HUGE_PAGE_SIZE_1GB / PAGE_SIZE) as u64;
+                        current_path = None;
+                        HUGE_PAGE_SIZE_1GB as u64
                     }
-                    if is_mmio_region_binary(physical_addr, &mmio_ranges, mmio_count) {
-                        // MMIO領域はスキップ（Present=0のまま）
-                        skipped_mmio_pages += 1;
+                    DirectMapLeafSize::Huge2Mb => {
+                        map_2mb_page(pml4, physical_addr, direct_huge_flags)?;
+                        mapped_2mb_leaves += 1;
+                        mapped_pages += (HUGE_PAGE_SIZE_2MB / PAGE_SIZE) as u64;
+                        current_path = None;
+                        HUGE_PAGE_SIZE_2MB as u64
+                    }
+                    DirectMapLeafSize::Page4Kb => {
+                        // カーネル領域はセクション毎のマッピング用に予約（4KBマッピングをスキップ）
+                        if physical_addr >= kernel_text_start && physical_addr < kernel_bss_end {
+                            skipped_kernel_pages += 1;
+                        } else {
+                            let (pml4_idx, pdp_idx, pd_idx, pt_idx) =
+                                direct_map_table_indices(physical_addr)?;
+                            let key = (pml4_idx, pdp_idx, pd_idx);
+                            if current_path != Some(key) {
+                                let pdp = ensure_pdp(pml4, pml4_idx)?;
+                                let pd = ensure_pd(pdp, pdp_idx)?;
+                                current_pt = ensure_pt(pd, pd_idx)?;
+                                current_path = Some(key);
+                            }
+                            (*current_pt).entry(pt_idx).set(physical_addr, direct_4kb_flags);
+                            mapped_pages += 1;
+                            mapped_4kb_leaves += 1;
+                        }
+
+                        PAGE_SIZE as u64
+                    }
+                };
+
+                scanned_pages += step_bytes / PAGE_SIZE as u64;
+                let scanned_bytes = scanned_pages * PAGE_SIZE as u64;
+
+                while scanned_bytes >= next_progress_bytes && next_progress_bytes < total_bytes {
+                    let percent = if total_bytes == 0 {
+                        100
                     } else {
-                        (*pt_high)[pt_idx].entry(page_idx).set(physical_addr, flags);
-                    }
+                        next_progress_bytes.saturating_mul(100) / total_bytes
+                    };
+                    info!(
+                        "Paging: direct-map progress {}/{} MB ({}%, scanned_pages={}, mapped_pages={}, skipped_kernel={})",
+                        next_progress_bytes >> 20,
+                        total_bytes >> 20,
+                        percent,
+                        scanned_pages,
+                        mapped_pages,
+                        skipped_kernel_pages
+                    );
+                    last_logged_progress_bytes = next_progress_bytes;
+                    next_progress_bytes = next_direct_map_progress_threshold(next_progress_bytes, total_bytes);
                 }
+
+                if scanned_pages == total_pages && scanned_bytes > last_logged_progress_bytes {
+                    let percent = if total_bytes == 0 {
+                        100
+                    } else {
+                        scanned_bytes.saturating_mul(100) / total_bytes
+                    };
+                    info!(
+                        "Paging: direct-map progress {}/{} MB ({}%, scanned_pages={}, mapped_pages={}, skipped_kernel={})",
+                        scanned_bytes >> 20,
+                        total_bytes >> 20,
+                        percent,
+                        scanned_pages,
+                        mapped_pages,
+                        skipped_kernel_pages
+                    );
+                    last_logged_progress_bytes = scanned_bytes;
+                }
+
+                physical_addr = physical_addr
+                    .checked_add(step_bytes)
+                    .ok_or(PagingError::AddressConversionFailed)?;
             }
         }
+
+        info!(
+            "Paging: direct-map pass complete (scanned_pages={}, mapped_pages={}, leaves[1GB/2MB/4KB]={}/{}/{}, skipped_kernel={})",
+            scanned_pages,
+            mapped_pages,
+            mapped_1gb_leaves,
+            mapped_2mb_leaves,
+            mapped_4kb_leaves,
+            skipped_kernel_pages
+        );
+
         if skipped_kernel_pages > 0 {
             info!(
                 "Skipped {} pages for kernel section mapping",
                 skipped_kernel_pages
             );
         }
-        if skipped_mmio_pages > 0 {
-            info!("Skipped {} pages as MMIO regions", skipped_mmio_pages);
-        }
 
-        // === Guard Page の設定 ===
-        // スタック領域のガードページをPresent=0に設定
-        // リンカスクリプトで__stack_guardが直接ガードページアドレスを指す
-        // テスト環境ではリンカスクリプトが使われないためスキップ
         #[cfg(not(test))]
         if let Some(guard_page_virt_addr) = crate::stack::guard_page_address() {
-            // 仮想アドレスを物理アドレスに変換
             let guard_page_phys_addr = virt_to_phys(guard_page_virt_addr)?;
-            let physical_offset = guard_page_phys_addr;
-
-            // ページ番号を計算
-            let page_num = (physical_offset >> 12) as usize;
-
-            // PT配列内のインデックスとPT内のエントリ番号を計算
-            let pt_array_idx = page_num / PAGE_TABLE_ENTRY_COUNT;
-            let page_idx_in_pt = page_num % PAGE_TABLE_ENTRY_COUNT;
-
-            // インデックスの範囲検証
-            if pt_array_idx >= PT_COUNT {
+            if clear_4kb_mapping_entry(pml4, guard_page_phys_addr).is_err() {
                 return Err(PagingError::GuardPageSetupFailed);
             }
-            if page_idx_in_pt >= PAGE_TABLE_ENTRY_COUNT {
-                return Err(PagingError::GuardPageSetupFailed);
-            }
-
-            // Guard PageのPTエントリをPresent=0に設定（アクセス時にPage Faultが発生）
-            // 高位アドレスのみ設定（低位はアンマップ済み）
-            (*pt_high)[pt_array_idx]
-                .entry(page_idx_in_pt)
-                .set(guard_page_phys_addr, 0);
 
             // デバッグ: Guard Page設定を確認（リリースビルドでは省略）
             #[cfg(debug_assertions)]
             {
+                let (pml4_idx, pdp_idx, pd_idx, pt_idx) =
+                    direct_map_table_indices(guard_page_phys_addr)?;
+                let pdp = walk_table(pml4, pml4_idx)?;
+                let pd = walk_table(pdp, pdp_idx)?;
+                let pt = walk_table(pd, pd_idx)?;
                 info!("Guard Page setup:");
                 info!("  Virtual address: 0x{:016X}", guard_page_virt_addr);
-                info!("  Physical offset: 0x{:X}", physical_offset);
-                info!("  Page number: {}", page_num);
-                info!("  PT array index: {}", pt_array_idx);
-                info!("  Entry in PT: {}", page_idx_in_pt);
+                info!("  Physical offset: 0x{:X}", guard_page_phys_addr);
                 info!(
-                    "  Entry value: 0x{:016X}",
-                    (*pt_high)[pt_array_idx].entry(page_idx_in_pt).get_raw()
+                    "  PML4/PDP/PD/PT index: {}/{}/{}/{}",
+                    pml4_idx, pdp_idx, pd_idx, pt_idx
                 );
+                info!("  Entry value: 0x{:016X}", (*pt).entry(pt_idx).get_raw());
                 info!(
                     "  Entry is Present: {}",
-                    (*pt_high)[pt_array_idx].entry(page_idx_in_pt).get_raw() & 1 != 0
+                    (*pt).entry(pt_idx).get_raw() & 1 != 0
                 );
             }
         }
 
-        // === カーネル領域を4KBページでセクション毎にマッピング ===
-        // W^X原則: 実行可能なページは書き込み不可、書き込み可能なページは実行不可
-        // write_cr3()前に行わないと、カーネルコード自体がアンマップされてしまう
         {
-            // セクション境界を取得
             let text_start = virt_to_phys(addr_of!(__text_start) as u64)?;
             let text_end = virt_to_phys(addr_of!(__text_end) as u64)?;
             let rodata_start = virt_to_phys(addr_of!(__rodata_start) as u64)?;
@@ -583,33 +707,21 @@ pub fn init(boot_info: &vitros_common::boot_info::BootInfo) -> Result<(), Paging
             let data_start = virt_to_phys(addr_of!(__data_start) as u64)?;
             let bss_end = virt_to_phys(addr_of!(__bss_end) as u64)?;
 
-            // .text: RO+X (実行可能、書き込み不可)
             let text_flags = PageTableFlags::Present as u64;
             for phys in (text_start..text_end).step_by(PAGE_SIZE) {
-                let page_num = (phys >> 12) as usize;
-                let pt_idx = page_num / PAGE_TABLE_ENTRY_COUNT;
-                let entry_idx = page_num % PAGE_TABLE_ENTRY_COUNT;
-                (*pt_high)[pt_idx].entry(entry_idx).set(phys, text_flags);
+                map_4kb_page(pml4, phys, text_flags)?;
             }
 
-            // .rodata: RO+NX (読み取り専用、実行不可)
             let rodata_flags = PageTableFlags::Present as u64 | PageTableFlags::NoExecute as u64;
             for phys in (rodata_start..rodata_end).step_by(PAGE_SIZE) {
-                let page_num = (phys >> 12) as usize;
-                let pt_idx = page_num / PAGE_TABLE_ENTRY_COUNT;
-                let entry_idx = page_num % PAGE_TABLE_ENTRY_COUNT;
-                (*pt_high)[pt_idx].entry(entry_idx).set(phys, rodata_flags);
+                map_4kb_page(pml4, phys, rodata_flags)?;
             }
 
-            // .data + .bss: RW+NX (書き込み可能、実行不可)
             let data_flags = PageTableFlags::Present as u64
                 | PageTableFlags::Writable as u64
                 | PageTableFlags::NoExecute as u64;
             for phys in (data_start..bss_end).step_by(PAGE_SIZE) {
-                let page_num = (phys >> 12) as usize;
-                let pt_idx = page_num / PAGE_TABLE_ENTRY_COUNT;
-                let entry_idx = page_num % PAGE_TABLE_ENTRY_COUNT;
-                (*pt_high)[pt_idx].entry(entry_idx).set(phys, data_flags);
+                map_4kb_page(pml4, phys, data_flags)?;
             }
 
             info!(
@@ -618,7 +730,6 @@ pub fn init(boot_info: &vitros_common::boot_info::BootInfo) -> Result<(), Paging
             );
         }
 
-        // CR3レジスタにPML4のアドレスを設定
         let pml4_addr = (*pml4).physical_address()?;
         write_cr3(pml4_addr);
 
@@ -653,12 +764,19 @@ fn assert_interrupts_disabled(context: &str) {
 
 #[inline]
 fn direct_map_table_indices(phys_addr: u64) -> Result<(usize, usize, usize, usize), PagingError> {
-    let virt_addr = phys_to_virt(phys_addr)?;
+    let virt_addr = KERNEL_VIRTUAL_BASE
+        .checked_add(phys_addr)
+        .ok_or(PagingError::AddressConversionFailed)?;
     let pml4_idx = ((virt_addr >> 39) & 0x1FF) as usize;
     let pdp_idx = ((virt_addr >> 30) & 0x1FF) as usize;
     let pd_idx = ((virt_addr >> 21) & 0x1FF) as usize;
     let pt_idx = ((virt_addr >> 12) & 0x1FF) as usize;
     Ok((pml4_idx, pdp_idx, pd_idx, pt_idx))
+}
+
+#[inline]
+fn table_link_flags() -> u64 {
+    PageTableFlags::Present as u64 | PageTableFlags::Writable as u64
 }
 
 unsafe fn table_from_entry(entry: &PageTableEntry) -> Result<*mut PageTable, PagingError> {
@@ -671,6 +789,27 @@ unsafe fn table_from_entry(entry: &PageTableEntry) -> Result<*mut PageTable, Pag
     let table_phys = entry.get_address();
     let table_virt = phys_to_virt(table_phys)?;
     Ok(table_virt as *mut PageTable)
+}
+
+#[cfg_attr(test, allow(dead_code))]
+unsafe fn walk_table(
+    parent: *mut PageTable,
+    entry_idx: usize,
+) -> Result<*mut PageTable, PagingError> {
+    unsafe { table_from_entry((*parent).entry(entry_idx)) }
+}
+
+unsafe fn walk_table_if_present(
+    parent: *mut PageTable,
+    entry_idx: usize,
+) -> Result<Option<*mut PageTable>, PagingError> {
+    unsafe {
+        let entry = (*parent).entry(entry_idx);
+        if !entry.is_present() {
+            return Ok(None);
+        }
+        table_from_entry(entry).map(Some)
+    }
 }
 
 unsafe fn alloc_page_table_frame() -> Result<*mut PageTable, PagingError> {
@@ -689,6 +828,143 @@ unsafe fn alloc_page_table_frame() -> Result<*mut PageTable, PagingError> {
     }
 
     Ok(frame_ptr)
+}
+
+unsafe fn ensure_child_table(
+    parent: *mut PageTable,
+    entry_idx: usize,
+) -> Result<*mut PageTable, PagingError> {
+    unsafe {
+        let entry = (*parent).entry(entry_idx);
+        if entry.is_present() {
+            return table_from_entry(entry);
+        }
+
+        let table = alloc_page_table_frame()?;
+        let table_phys = virt_to_phys(table as u64)?;
+        entry.set(table_phys, table_link_flags());
+        Ok(table)
+    }
+}
+
+unsafe fn ensure_pdp(pml4: *mut PageTable, pml4_idx: usize) -> Result<*mut PageTable, PagingError> {
+    unsafe { ensure_child_table(pml4, pml4_idx) }
+}
+
+unsafe fn ensure_pd(pdp: *mut PageTable, pdp_idx: usize) -> Result<*mut PageTable, PagingError> {
+    unsafe { ensure_child_table(pdp, pdp_idx) }
+}
+
+unsafe fn ensure_pt(pd: *mut PageTable, pd_idx: usize) -> Result<*mut PageTable, PagingError> {
+    unsafe { ensure_child_table(pd, pd_idx) }
+}
+
+unsafe fn map_4kb_page(
+    pml4: *mut PageTable,
+    phys_addr: u64,
+    flags: u64,
+) -> Result<(), PagingError> {
+    unsafe {
+        let (pml4_idx, pdp_idx, pd_idx, pt_idx) = direct_map_table_indices(phys_addr)?;
+        let pdp = ensure_pdp(pml4, pml4_idx)?;
+        let pd = ensure_pd(pdp, pdp_idx)?;
+        let pt = ensure_pt(pd, pd_idx)?;
+        (*pt).entry(pt_idx).set(phys_addr, flags);
+        Ok(())
+    }
+}
+
+unsafe fn map_2mb_page(
+    pml4: *mut PageTable,
+    phys_addr: u64,
+    flags: u64,
+) -> Result<(), PagingError> {
+    if !is_2mb_aligned(phys_addr) {
+        return Err(PagingError::InvalidAddress);
+    }
+
+    unsafe {
+        let (pml4_idx, pdp_idx, pd_idx, _) = direct_map_table_indices(phys_addr)?;
+        let pdp = ensure_pdp(pml4, pml4_idx)?;
+        let pd = ensure_pd(pdp, pdp_idx)?;
+        let entry = (*pd).entry(pd_idx);
+        if entry.is_present() && !entry.is_huge_page() {
+            return Err(PagingError::ExistingMappingConflict);
+        }
+        entry.set(phys_addr, flags);
+        Ok(())
+    }
+}
+
+unsafe fn map_1gb_page(
+    pml4: *mut PageTable,
+    phys_addr: u64,
+    flags: u64,
+) -> Result<(), PagingError> {
+    if !is_1gb_aligned(phys_addr) {
+        return Err(PagingError::InvalidAddress);
+    }
+
+    unsafe {
+        let (pml4_idx, pdp_idx, _, _) = direct_map_table_indices(phys_addr)?;
+        let pdp = ensure_pdp(pml4, pml4_idx)?;
+        let entry = (*pdp).entry(pdp_idx);
+        if entry.is_present() && !entry.is_huge_page() {
+            return Err(PagingError::ExistingMappingConflict);
+        }
+        entry.set(phys_addr, flags);
+        Ok(())
+    }
+}
+
+#[cfg_attr(test, allow(dead_code))]
+unsafe fn clear_4kb_mapping_entry(pml4: *mut PageTable, phys_addr: u64) -> Result<(), PagingError> {
+    unsafe {
+        let (pml4_idx, pdp_idx, pd_idx, pt_idx) = direct_map_table_indices(phys_addr)?;
+        let pdp = walk_table(pml4, pml4_idx)?;
+        let pd = walk_table(pdp, pdp_idx)?;
+        let pt = walk_table(pd, pd_idx)?;
+        (*pt).entry(pt_idx).set(phys_addr, 0);
+        Ok(())
+    }
+}
+
+unsafe fn free_table_frame(entry: &mut PageTableEntry) -> Result<(), PagingError> {
+    if !entry.is_present() || entry.is_huge_page() {
+        return Ok(());
+    }
+
+    let table_phys = entry.get_address();
+    entry.set(0, 0);
+    crate::frame_allocator::free_frame(table_phys).map_err(|_| PagingError::FrameAllocationFailed)
+}
+
+unsafe fn prune_empty_tables(
+    pml4: *mut PageTable,
+    pml4_idx: usize,
+    pdp_idx: usize,
+) -> Result<(), PagingError> {
+    unsafe {
+        let pdp_entry = (*pml4).entry(pml4_idx);
+        if !pdp_entry.is_present() || pdp_entry.is_huge_page() {
+            return Ok(());
+        }
+
+        let pdp = table_from_entry(pdp_entry)?;
+        let pd_entry = (*pdp).entry(pdp_idx);
+        if pd_entry.is_present() && !pd_entry.is_huge_page() {
+            let pd = table_from_entry(pd_entry)?;
+            if (*pd).is_empty() {
+                free_table_frame(pd_entry)?;
+            }
+        }
+
+        if (*pdp).is_empty() {
+            free_table_frame(pdp_entry)?;
+        }
+
+        Ok(())
+    }
 }
 
 /// MMIO領域をUC（Uncacheable）属性でマッピングする
@@ -736,7 +1012,6 @@ pub fn map_mmio(phys_addr: u64, size: u64) -> Result<u64, PagingError> {
     let uc_flags = PageTableFlags::Present as u64
         | PageTableFlags::Writable as u64
         | PageTableFlags::CacheDisable as u64;
-    let table_flags = PageTableFlags::Present as u64 | PageTableFlags::Writable as u64;
 
     unsafe {
         let pml4 = addr_of_mut!(KERNEL_PML4);
@@ -744,54 +1019,9 @@ pub fn map_mmio(phys_addr: u64, size: u64) -> Result<u64, PagingError> {
         for i in 0..page_count {
             let addr = phys_addr + (i * PAGE_SIZE) as u64;
             let (pml4_idx, pdp_idx, pd_idx, pt_idx) = direct_map_table_indices(addr)?;
-            if pml4_idx != PML4_KERNEL_INDEX {
-                return Err(PagingError::AddressOutOfRange);
-            }
-
-            // PML4 -> PDP は init() で固定設定済み
-            let pdp_entry = (*pml4).entry(pml4_idx);
-            if !pdp_entry.is_present() {
-                return Err(PagingError::PageTableInitFailed);
-            }
-            let pdp = table_from_entry(pdp_entry)?;
-
-            // PDP[pdp_idx] -> PD を必要時に動的確保
-            let pdp_entry = (*pdp).entry(pdp_idx);
-            let pd = if pdp_entry.is_present() {
-                if pdp_entry.is_huge_page() {
-                    return Err(PagingError::ExistingMappingConflict);
-                }
-                table_from_entry(pdp_entry)?
-            } else {
-                let new_pd = alloc_page_table_frame()?;
-                let new_pd_phys = virt_to_phys(new_pd as u64)?;
-                pdp_entry.set(new_pd_phys, table_flags);
-                #[cfg(debug_assertions)]
-                info!(
-                    "map_mmio: allocated PD table phys=0x{:X} for PDP index {}",
-                    new_pd_phys, pdp_idx
-                );
-                new_pd
-            };
-
-            // PD[pd_idx] -> PT を必要時に動的確保
-            let pd_entry = (*pd).entry(pd_idx);
-            let pt = if pd_entry.is_present() {
-                if pd_entry.is_huge_page() {
-                    return Err(PagingError::ExistingMappingConflict);
-                }
-                table_from_entry(pd_entry)?
-            } else {
-                let new_pt = alloc_page_table_frame()?;
-                let new_pt_phys = virt_to_phys(new_pt as u64)?;
-                pd_entry.set(new_pt_phys, table_flags);
-                #[cfg(debug_assertions)]
-                info!(
-                    "map_mmio: allocated PT table phys=0x{:X} for PD index {}",
-                    new_pt_phys, pd_idx
-                );
-                new_pt
-            };
+            let pdp = ensure_pdp(pml4, pml4_idx)?;
+            let pd = ensure_pd(pdp, pdp_idx)?;
+            let pt = ensure_pt(pd, pd_idx)?;
 
             // デバッグビルド時のみ重複マッピングを警告
             #[cfg(debug_assertions)]
@@ -847,43 +1077,32 @@ fn clear_4kb_mappings_for_huge_page(phys_addr: u64) -> Result<(), PagingError> {
         return Err(PagingError::InvalidAddress);
     }
 
-    // PT配列内のインデックスを計算
-    // 1 PT = 512 * 4KB = 2MB なので、2MB境界のアドレスはPT境界に対応
-    let pt_array_idx = (phys_addr / PAGE_TABLE_COVERAGE) as usize;
+    let (pml4_idx, pdp_idx, pd_idx, _) = direct_map_table_indices(phys_addr)?;
 
-    // インデックスの範囲検証
-    if pt_array_idx >= PT_COUNT {
-        return Err(PagingError::AddressOutOfRange);
-    }
-
-    // PDインデックスを計算（2MB単位）
-    let pd_global_idx = (phys_addr / HUGE_PAGE_SIZE_2MB as u64) as usize;
-    let pd_array_idx = pd_global_idx / PAGE_TABLE_ENTRY_COUNT;
-    let pd_entry_idx = pd_global_idx % PAGE_TABLE_ENTRY_COUNT;
-
-    // pd_array_idxの範囲検証
-    if pd_array_idx >= MAX_SUPPORTED_MEMORY_GB {
-        return Err(PagingError::AddressOutOfRange);
-    }
-
-    // SAFETY:
-    // - KERNEL_PT_HIGH, KERNEL_PD_HIGHは静的に確保された配列で、カーネル存続期間中有効
-    // - pt_array_idx, pd_array_idx, pd_entry_idxは上記で範囲チェック済み
-    // - この関数は割り込み無効状態で呼び出される（呼び出し元で保証）
     unsafe {
-        let pt_high = addr_of_mut!(KERNEL_PT_HIGH);
-        let pd_high = addr_of_mut!(KERNEL_PD_HIGH);
+        let pml4 = addr_of_mut!(KERNEL_PML4);
+        let Some(pdp) = walk_table_if_present(pml4, pml4_idx)? else {
+            return Ok(());
+        };
+        let Some(pd) = walk_table_if_present(pdp, pdp_idx)? else {
+            return Ok(());
+        };
 
-        // PT内の全512エントリをクリア
-        (*pt_high)[pt_array_idx].clear();
+        let pd_entry = (*pd).entry(pd_idx);
+        if !pd_entry.is_present() || pd_entry.is_huge_page() {
+            return Ok(());
+        }
 
-        // PDエントリもクリア（PTへの参照を解除）
-        (*pd_high)[pd_array_idx].entry(pd_entry_idx).set(0, 0);
+        let pt_phys = pd_entry.get_address();
+        pd_entry.set(0, 0);
+        crate::frame_allocator::free_frame(pt_phys)
+            .map_err(|_| PagingError::FrameAllocationFailed)?;
+        prune_empty_tables(pml4, pml4_idx, pdp_idx)?;
     }
 
     info!(
-        "Cleared 4KB mappings for huge page at 0x{:X} (PT index {}, PD[{}][{}])",
-        phys_addr, pt_array_idx, pd_array_idx, pd_entry_idx
+        "Cleared 4KB mappings for huge page at 0x{:X} (PML4/PDP/PD={}/{}/{})",
+        phys_addr, pml4_idx, pdp_idx, pd_idx
     );
 
     Ok(())
@@ -929,15 +1148,7 @@ pub fn map_huge_2mb(phys_addr: u64, additional_flags: u64) -> Result<u64, Paging
         return Err(PagingError::InvalidAddress);
     }
 
-    // PDインデックスを計算（2MB単位）
-    let pd_global_idx = (phys_addr / HUGE_PAGE_SIZE_2MB as u64) as usize;
-    let pd_array_idx = pd_global_idx / PAGE_TABLE_ENTRY_COUNT; // KERNEL_PD_HIGH配列のインデックス
-    let pd_entry_idx = pd_global_idx % PAGE_TABLE_ENTRY_COUNT; // PD内のエントリインデックス
-
-    // インデックスの範囲検証
-    if pd_array_idx >= MAX_SUPPORTED_MEMORY_GB {
-        return Err(PagingError::AddressOutOfRange);
-    }
+    let (pml4_idx, pdp_idx, pd_idx, _) = direct_map_table_indices(phys_addr)?;
 
     // HugePageフラグ: Present | Writable | HugePage + 追加フラグ
     let huge_flags = PageTableFlags::Present as u64
@@ -946,19 +1157,19 @@ pub fn map_huge_2mb(phys_addr: u64, additional_flags: u64) -> Result<u64, Paging
         | additional_flags;
 
     unsafe {
-        let pd_high = addr_of_mut!(KERNEL_PD_HIGH);
+        let pml4 = addr_of_mut!(KERNEL_PML4);
+        let pdp = ensure_pdp(pml4, pml4_idx)?;
+        let pd = ensure_pd(pdp, pdp_idx)?;
 
         // 既存のマッピング競合チェック
         // エントリがPresent=1かつHugePage=0の場合、PT参照が設定されている
-        let existing_entry = (*pd_high)[pd_array_idx].entry(pd_entry_idx);
+        let existing_entry = (*pd).entry(pd_idx);
         if existing_entry.is_present() && !existing_entry.is_huge_page() {
             return Err(PagingError::ExistingMappingConflict);
         }
 
         // PDエントリにHugePageフラグ付きで物理アドレスを設定
-        (*pd_high)[pd_array_idx]
-            .entry(pd_entry_idx)
-            .set(phys_addr, huge_flags);
+        existing_entry.set(phys_addr, huge_flags);
 
         // TLBフラッシュ
         reload_cr3();
@@ -1003,21 +1214,20 @@ pub fn unmap_huge_2mb(phys_addr: u64) -> Result<(), PagingError> {
         return Err(PagingError::InvalidAddress);
     }
 
-    // PDインデックスを計算（2MB単位）
-    let pd_global_idx = (phys_addr / HUGE_PAGE_SIZE_2MB as u64) as usize;
-    let pd_array_idx = pd_global_idx / PAGE_TABLE_ENTRY_COUNT;
-    let pd_entry_idx = pd_global_idx % PAGE_TABLE_ENTRY_COUNT;
-
-    // インデックスの範囲検証
-    if pd_array_idx >= MAX_SUPPORTED_MEMORY_GB {
-        return Err(PagingError::AddressOutOfRange);
-    }
+    let (pml4_idx, pdp_idx, pd_idx, _) = direct_map_table_indices(phys_addr)?;
 
     unsafe {
-        let pd_high = addr_of_mut!(KERNEL_PD_HIGH);
+        let pml4 = addr_of_mut!(KERNEL_PML4);
+        let Some(pdp) = walk_table_if_present(pml4, pml4_idx)? else {
+            return Ok(());
+        };
+        let Some(pd) = walk_table_if_present(pdp, pdp_idx)? else {
+            return Ok(());
+        };
 
         // PDエントリをクリア（Present=0）
-        (*pd_high)[pd_array_idx].entry(pd_entry_idx).set(0, 0);
+        (*pd).entry(pd_idx).set(0, 0);
+        prune_empty_tables(pml4, pml4_idx, pdp_idx)?;
 
         // TLBフラッシュ
         reload_cr3();
@@ -1138,13 +1348,7 @@ pub fn map_huge_1gb(phys_addr: u64, additional_flags: u64) -> Result<u64, Paging
         return Err(PagingError::FeatureNotSupported);
     }
 
-    // PDPインデックスを計算（1GB単位）
-    let pdp_entry_idx = (phys_addr / HUGE_PAGE_SIZE_1GB as u64) as usize;
-
-    // インデックスの範囲検証（MAX_SUPPORTED_MEMORY_GB個のエントリまで）
-    if pdp_entry_idx >= MAX_SUPPORTED_MEMORY_GB {
-        return Err(PagingError::AddressOutOfRange);
-    }
+    let (pml4_idx, pdp_idx, _, _) = direct_map_table_indices(phys_addr)?;
 
     // HugePageフラグ: Present | Writable | HugePage + 追加フラグ
     let huge_flags = PageTableFlags::Present as u64
@@ -1153,17 +1357,18 @@ pub fn map_huge_1gb(phys_addr: u64, additional_flags: u64) -> Result<u64, Paging
         | additional_flags;
 
     unsafe {
-        let pdp_high = addr_of_mut!(KERNEL_PDP_HIGH);
+        let pml4 = addr_of_mut!(KERNEL_PML4);
+        let pdp = ensure_pdp(pml4, pml4_idx)?;
 
         // 既存のマッピング競合チェック
         // エントリがPresent=1かつHugePage=0の場合、PD参照が設定されている
-        let existing_entry = (*pdp_high).entry(pdp_entry_idx);
+        let existing_entry = (*pdp).entry(pdp_idx);
         if existing_entry.is_present() && !existing_entry.is_huge_page() {
             return Err(PagingError::ExistingMappingConflict);
         }
 
         // PDPエントリにHugePageフラグ付きで物理アドレスを設定
-        (*pdp_high).entry(pdp_entry_idx).set(phys_addr, huge_flags);
+        existing_entry.set(phys_addr, huge_flags);
 
         // TLBフラッシュ
         reload_cr3();
@@ -1208,19 +1413,17 @@ pub fn unmap_huge_1gb(phys_addr: u64) -> Result<(), PagingError> {
         return Err(PagingError::InvalidAddress);
     }
 
-    // PDPインデックスを計算（1GB単位）
-    let pdp_entry_idx = (phys_addr / HUGE_PAGE_SIZE_1GB as u64) as usize;
-
-    // インデックスの範囲検証
-    if pdp_entry_idx >= MAX_SUPPORTED_MEMORY_GB {
-        return Err(PagingError::AddressOutOfRange);
-    }
+    let (pml4_idx, pdp_idx, _, _) = direct_map_table_indices(phys_addr)?;
 
     unsafe {
-        let pdp_high = addr_of_mut!(KERNEL_PDP_HIGH);
+        let pml4 = addr_of_mut!(KERNEL_PML4);
+        let Some(pdp) = walk_table_if_present(pml4, pml4_idx)? else {
+            return Ok(());
+        };
 
         // PDPエントリをクリア（Present=0）
-        (*pdp_high).entry(pdp_entry_idx).set(0, 0);
+        (*pdp).entry(pdp_idx).set(0, 0);
+        prune_empty_tables(pml4, pml4_idx, pdp_idx)?;
 
         // TLBフラッシュ
         reload_cr3();
@@ -1298,6 +1501,201 @@ pub fn map_framebuffer_huge(fb_base: u64, fb_size: u64) -> Result<u64, PagingErr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vitros_common::boot_info::{BootInfo, MemoryRegion};
+    use vitros_common::uefi::{
+        EFI_ACPI_RECLAIM_MEMORY, EFI_BOOT_SERVICES_DATA, EFI_CONVENTIONAL_MEMORY,
+        EFI_LOADER_CODE, EFI_MEMORY_MAPPED_IO, EFI_MEMORY_MAPPED_IO_PORT_SPACE,
+        EFI_RUNTIME_SERVICES_DATA,
+    };
+
+    const TEST_TABLE_ALLOC_LIMIT: u64 = 0x20_0000; // 2 MiB
+    const TEST_TABLE_ALLOC_REGION_SIZE: u64 = 0x80_0000; // 8 MiB
+
+    fn setup_table_allocator_for_test() {
+        crate::frame_allocator::reset_for_test();
+
+        let mut boot_info = BootInfo::new();
+        boot_info.memory_map[0] = MemoryRegion {
+            start: 0x1000,
+            size: TEST_TABLE_ALLOC_REGION_SIZE,
+            region_type: EFI_CONVENTIONAL_MEMORY,
+        };
+        boot_info.memory_map_count = 1;
+        boot_info.max_physical_address = TEST_TABLE_ALLOC_LIMIT;
+
+        crate::frame_allocator::init(&boot_info).expect("frame allocator init failed");
+
+        unsafe {
+            INITIAL_MAPPED_MAX_PHYS = TEST_TABLE_ALLOC_LIMIT;
+            let pml4 = addr_of_mut!(KERNEL_PML4);
+            (*pml4).clear();
+        }
+    }
+
+    #[test_case]
+    fn test_extract_direct_map_ranges_filters_system_ram_and_aligns() {
+        let regions = [
+            MemoryRegion {
+                start: 0x1003,
+                size: 0x1FFD,
+                region_type: EFI_CONVENTIONAL_MEMORY,
+            },
+            MemoryRegion {
+                start: 0x3000,
+                size: 0x1000,
+                region_type: EFI_LOADER_CODE,
+            },
+            MemoryRegion {
+                start: 0x5000,
+                size: 0x1000,
+                region_type: EFI_BOOT_SERVICES_DATA,
+            },
+            MemoryRegion {
+                start: 0x7000,
+                size: 0x1000,
+                region_type: EFI_ACPI_RECLAIM_MEMORY,
+            },
+            MemoryRegion {
+                start: 0x8000,
+                size: 0x1000,
+                region_type: EFI_RUNTIME_SERVICES_DATA,
+            },
+            MemoryRegion {
+                start: 0x9000,
+                size: 0x2000,
+                region_type: EFI_MEMORY_MAPPED_IO,
+            },
+            MemoryRegion {
+                start: 0xB000,
+                size: 0x1000,
+                region_type: EFI_MEMORY_MAPPED_IO_PORT_SPACE,
+            },
+        ];
+
+        let (ranges, count, total_pages, max_end) =
+            extract_direct_map_ranges(&regions).expect("extract direct-map ranges failed");
+
+        assert_eq!(count, 3);
+        assert_eq!(ranges[0].start, 0x1000);
+        assert_eq!(ranges[0].end, 0x4000);
+        assert_eq!(ranges[1].start, 0x5000);
+        assert_eq!(ranges[1].end, 0x6000);
+        assert_eq!(ranges[2].start, 0x7000);
+        assert_eq!(ranges[2].end, 0x8000);
+        assert_eq!(total_pages, 5);
+        assert_eq!(max_end, 0x8000);
+    }
+
+    #[test_case]
+    fn test_extract_direct_map_ranges_merges_overlap_and_adjacent() {
+        let regions = [
+            MemoryRegion {
+                start: 0x1000,
+                size: 0x1000,
+                region_type: EFI_CONVENTIONAL_MEMORY,
+            },
+            MemoryRegion {
+                start: 0x1800,
+                size: 0x2000,
+                region_type: EFI_CONVENTIONAL_MEMORY,
+            },
+            MemoryRegion {
+                start: 0x4000,
+                size: 0x1000,
+                region_type: EFI_CONVENTIONAL_MEMORY,
+            },
+        ];
+
+        let (ranges, count, total_pages, max_end) =
+            extract_direct_map_ranges(&regions).expect("extract direct-map ranges failed");
+
+        assert_eq!(count, 1);
+        assert_eq!(ranges[0].start, 0x1000);
+        assert_eq!(ranges[0].end, 0x5000);
+        assert_eq!(total_pages, 4);
+        assert_eq!(max_end, 0x5000);
+    }
+
+    #[test_case]
+    fn test_extract_direct_map_ranges_sorted_and_empty() {
+        let regions = [
+            MemoryRegion {
+                start: 0x9000,
+                size: 0x1000,
+                region_type: EFI_CONVENTIONAL_MEMORY,
+            },
+            MemoryRegion {
+                start: 0x2000,
+                size: 0x1000,
+                region_type: EFI_ACPI_RECLAIM_MEMORY,
+            },
+        ];
+
+        let (ranges, count, total_pages, max_end) =
+            extract_direct_map_ranges(&regions).expect("extract direct-map ranges failed");
+        assert_eq!(count, 2);
+        assert_eq!(ranges[0].start, 0x2000);
+        assert_eq!(ranges[0].end, 0x3000);
+        assert_eq!(ranges[1].start, 0x9000);
+        assert_eq!(ranges[1].end, 0xA000);
+        assert_eq!(total_pages, 2);
+        assert_eq!(max_end, 0xA000);
+
+        let empty_regions: [MemoryRegion; 0] = [];
+        let (_, empty_count, empty_pages, empty_max_end) =
+            extract_direct_map_ranges(&empty_regions).expect("empty extraction failed");
+        assert_eq!(empty_count, 0);
+        assert_eq!(empty_pages, 0);
+        assert_eq!(empty_max_end, 0);
+    }
+
+    #[test_case]
+    fn test_select_direct_map_leaf_size_prefers_larger_pages() {
+        let kernel_start = 0x1000_0000;
+        let kernel_end = 0x1008_0000;
+
+        let one_gb_aligned = 0x8000_0000;
+        let range_end = one_gb_aligned + HUGE_PAGE_SIZE_1GB as u64;
+        assert_eq!(
+            select_direct_map_leaf_size(one_gb_aligned, range_end, kernel_start, kernel_end, true),
+            DirectMapLeafSize::Huge1Gb
+        );
+        assert_eq!(
+            select_direct_map_leaf_size(
+                one_gb_aligned,
+                range_end,
+                kernel_start,
+                kernel_end,
+                false
+            ),
+            DirectMapLeafSize::Huge2Mb
+        );
+
+        assert_eq!(
+            select_direct_map_leaf_size(0x8123_4000, range_end, kernel_start, kernel_end, true),
+            DirectMapLeafSize::Page4Kb
+        );
+    }
+
+    #[test_case]
+    fn test_select_direct_map_leaf_size_avoids_kernel_overlap() {
+        let one_gb_aligned = 0x4000_0000;
+        let range_end = one_gb_aligned + HUGE_PAGE_SIZE_1GB as u64;
+        let kernel_start = one_gb_aligned + 0x2000_0000;
+        let kernel_end = kernel_start + PAGE_SIZE as u64;
+
+        // 1GBチャンク全体はカーネルと重なるため、2MBへフォールバックする
+        assert_eq!(
+            select_direct_map_leaf_size(one_gb_aligned, range_end, kernel_start, kernel_end, true),
+            DirectMapLeafSize::Huge2Mb
+        );
+
+        // カーネルを含む2MBチャンクは4KBへフォールバックする
+        assert_eq!(
+            select_direct_map_leaf_size(kernel_start & !((HUGE_PAGE_SIZE_2MB as u64) - 1), range_end, kernel_start, kernel_end, true),
+            DirectMapLeafSize::Page4Kb
+        );
+    }
 
     #[test_case]
     fn test_is_2mb_aligned() {
@@ -1319,6 +1717,115 @@ mod tests {
         assert!(!is_1gb_aligned(0x1));
         assert!(!is_1gb_aligned(0x20_0000)); // 2MB
         assert!(!is_1gb_aligned(0x4000_0001));
+    }
+
+    #[test_case]
+    fn test_direct_map_indices_cross_512gb_boundary() {
+        let boundary = 512u64 * HUGE_PAGE_SIZE_1GB as u64;
+        let just_before = boundary - PAGE_SIZE as u64;
+
+        let (pml4_before, pdp_before, pd_before, pt_before) =
+            direct_map_table_indices(just_before).expect("index before boundary");
+        let (pml4_after, pdp_after, pd_after, pt_after) =
+            direct_map_table_indices(boundary).expect("index at boundary");
+
+        assert_eq!(pml4_before, 256);
+        assert_eq!(pdp_before, 511);
+        assert_eq!(pd_before, 511);
+        assert_eq!(pt_before, 511);
+
+        assert_eq!(pml4_after, 257);
+        assert_eq!(pdp_after, 0);
+        assert_eq!(pd_after, 0);
+        assert_eq!(pt_after, 0);
+    }
+
+    #[test_case]
+    fn test_ensure_tables_and_prune_empty_chain() {
+        setup_table_allocator_for_test();
+
+        let phys_addr = 512u64 * HUGE_PAGE_SIZE_1GB as u64; // PML4[257] を使う
+        unsafe {
+            let pml4 = addr_of_mut!(KERNEL_PML4);
+            let map_flags = PageTableFlags::Present as u64 | PageTableFlags::Writable as u64;
+            map_4kb_page(pml4, phys_addr, map_flags).expect("map_4kb_page failed");
+
+            let (pml4_idx, pdp_idx, pd_idx, pt_idx) =
+                direct_map_table_indices(phys_addr).expect("indices failed");
+            assert_eq!(pml4_idx, 257);
+
+            let pdp = walk_table(pml4, pml4_idx).expect("walk pdp failed");
+            let pd = walk_table(pdp, pdp_idx).expect("walk pd failed");
+            let pt = walk_table(pd, pd_idx).expect("walk pt failed");
+            assert!((*pt).entry(pt_idx).is_present());
+
+            clear_4kb_mappings_for_huge_page(phys_addr).expect("clear 4kb mappings failed");
+            assert!(
+                !(*pml4).entry(pml4_idx).is_present(),
+                "PML4 entry should be pruned when chain is empty"
+            );
+        }
+    }
+
+    #[test_case]
+    fn test_map_huge_2mb_replace_and_restore_4kb() {
+        setup_table_allocator_for_test();
+
+        let phys_addr = (512u64 * HUGE_PAGE_SIZE_1GB as u64) + HUGE_PAGE_SIZE_2MB as u64;
+        unsafe {
+            let pml4 = addr_of_mut!(KERNEL_PML4);
+            let map_flags = PageTableFlags::Present as u64 | PageTableFlags::Writable as u64;
+            map_4kb_page(pml4, phys_addr, map_flags).expect("initial 4kb map failed");
+        }
+
+        crate::io::without_interrupts(|| {
+            assert_eq!(
+                map_huge_2mb(phys_addr, 0),
+                Err(PagingError::ExistingMappingConflict)
+            );
+        });
+
+        clear_4kb_mappings_for_huge_page(phys_addr).expect("clear 4kb mapping failed");
+
+        crate::io::without_interrupts(|| {
+            map_huge_2mb(phys_addr, PageTableFlags::NoExecute as u64).expect("map_huge_2mb failed");
+        });
+
+        unsafe {
+            let pml4 = addr_of_mut!(KERNEL_PML4);
+            let (pml4_idx, pdp_idx, pd_idx, _) =
+                direct_map_table_indices(phys_addr).expect("indices failed");
+            let pdp = walk_table(pml4, pml4_idx).expect("walk pdp failed");
+            let pd = walk_table(pdp, pdp_idx).expect("walk pd failed");
+            let pd_entry = (*pd).entry(pd_idx);
+            assert!(pd_entry.is_present());
+            assert!(pd_entry.is_huge_page());
+        }
+
+        crate::io::without_interrupts(|| {
+            unmap_huge_2mb(phys_addr).expect("unmap_huge_2mb failed");
+        });
+
+        unsafe {
+            let pml4 = addr_of_mut!(KERNEL_PML4);
+            let (pml4_idx, _, _, _) = direct_map_table_indices(phys_addr).expect("indices failed");
+            assert!(
+                !(*pml4).entry(pml4_idx).is_present(),
+                "Huge-page unmap should prune empty upper tables"
+            );
+
+            let map_flags = PageTableFlags::Present as u64 | PageTableFlags::Writable as u64;
+            map_4kb_page(pml4, phys_addr, map_flags).expect("restore 4kb map failed");
+
+            let (pml4_idx, pdp_idx, pd_idx, pt_idx) =
+                direct_map_table_indices(phys_addr).expect("indices failed");
+            let pdp = walk_table(pml4, pml4_idx).expect("walk pdp failed");
+            let pd = walk_table(pdp, pdp_idx).expect("walk pd failed");
+            let pt = walk_table(pd, pd_idx).expect("walk pt failed");
+            let pt_entry = (*pt).entry(pt_idx);
+            assert!(pt_entry.is_present());
+            assert!(!pt_entry.is_huge_page());
+        }
     }
 
     #[test_case]
