@@ -1,9 +1,14 @@
 // UEFI型定義
 pub type EfiHandle = *mut core::ffi::c_void;
 pub type EfiStatus = usize;
+pub type EfiAllocateType = u32;
+pub type EfiPhysicalAddress = u64;
 
 // EFIステータスコード
 pub const EFI_SUCCESS: EfiStatus = 0;
+pub const EFI_ERROR_MASK: EfiStatus = 1usize << (usize::BITS - 1);
+pub const EFI_INVALID_PARAMETER: EfiStatus = EFI_ERROR_MASK | 2;
+pub const EFI_BUFFER_TOO_SMALL: EfiStatus = EFI_ERROR_MASK | 5;
 
 // GUID (プロトコル識別子)
 #[repr(C)]
@@ -127,6 +132,11 @@ pub const EFI_MEMORY_MAPPED_IO: u32 = 11;
 pub const EFI_MEMORY_MAPPED_IO_PORT_SPACE: u32 = 12;
 pub const EFI_PAL_CODE: u32 = 13;
 
+// AllocateType
+pub const EFI_ALLOCATE_ANY_PAGES: EfiAllocateType = 0;
+pub const EFI_ALLOCATE_MAX_ADDRESS: EfiAllocateType = 1;
+pub const EFI_ALLOCATE_ADDRESS: EfiAllocateType = 2;
+
 // メモリディスクリプタ
 #[repr(C)]
 pub struct EfiMemoryDescriptor {
@@ -141,7 +151,18 @@ pub struct EfiMemoryDescriptor {
 #[repr(C)]
 pub struct EfiBootServices {
     pub hdr: EfiTableHeader,
-    _pad1: [usize; 4], // 1-4: RaiseTPL, RestoreTPL, AllocatePages, FreePages
+    pub raise_tpl: usize,
+    pub restore_tpl: usize,
+    pub allocate_pages: extern "efiapi" fn(
+        EfiAllocateType,         // Type
+        u32,                     // MemoryType
+        usize,                   // Pages
+        *mut EfiPhysicalAddress, // Memory
+    ) -> EfiStatus,
+    pub free_pages: extern "efiapi" fn(
+        EfiPhysicalAddress, // Memory
+        usize,              // Pages
+    ) -> EfiStatus,
     pub get_memory_map: extern "efiapi" fn(
         *mut usize,               // MemoryMapSize
         *mut EfiMemoryDescriptor, // MemoryMap

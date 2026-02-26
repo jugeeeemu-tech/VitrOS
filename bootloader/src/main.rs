@@ -4,7 +4,7 @@
 use core::fmt::Write;
 #[cfg(not(test))]
 use core::panic::PanicInfo;
-use vitros_common::boot_info::{BootInfo, FramebufferInfo, MemoryRegion};
+use vitros_common::boot_info::{BootInfo, BootloaderPageTableRange, FramebufferInfo, MemoryRegion};
 use vitros_common::elf::{Elf64Header, Elf64ProgramHeader, PT_LOAD};
 use vitros_common::uefi::*;
 
@@ -14,6 +14,7 @@ static mut BOOT_INFO: BootInfo = BootInfo::new();
 
 // グローバルなConOut（初期化後に設定）
 static mut CON_OUT: Option<*mut EfiSimpleTextOutputProtocol> = None;
+static mut MEMORY_MAP_BUFFER: [u8; 4096 * 64] = [0; 4096 * 64];
 
 // ConOutに文字列を出力するヘルパー関数
 fn print_con(s: &str) {
@@ -115,6 +116,13 @@ fn memory_type_str(mem_type: u32) -> &'static str {
 const PAGE_PRESENT: u64 = 1 << 0;
 const PAGE_WRITABLE: u64 = 1 << 1;
 const PAGE_HUGE: u64 = 1 << 7;
+const PAGE_SIZE_4KB: u64 = 4096;
+const PAGE_SIZE_4KB_USIZE: usize = 4096;
+const PAGE_SIZE_2MB: u64 = 2 * 1024 * 1024;
+const PAGE_SIZE_1GB: u64 = 1024 * 1024 * 1024;
+const DIRECT_MAP_WINDOW_BYTES: u64 = 1u64 << 47; // 48bit paging前提での高位半分直写窓
+const EXIT_BOOT_SERVICES_RETRY_LIMIT: usize = 8;
+const PAGE_TABLE_ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 
 // カーネル仮想アドレスベース
 const KERNEL_VMA: u64 = 0xFFFF800000000000;
@@ -126,106 +134,274 @@ struct PageTable {
 }
 
 impl PageTable {
-    const fn new() -> Self {
-        Self { entries: [0; 512] }
+    fn clear(&mut self) {
+        self.entries = [0; 512];
     }
 }
 
-// グローバルページテーブル（静的に確保）
-static mut BOOT_PML4: PageTable = PageTable::new();
-static mut BOOT_PDP_LOW: PageTable = PageTable::new();
-static mut BOOT_PDP_HIGH: PageTable = PageTable::new();
-static mut BOOT_PD_LOW: [PageTable; 8] = [
-    PageTable::new(),
-    PageTable::new(),
-    PageTable::new(),
-    PageTable::new(),
-    PageTable::new(),
-    PageTable::new(),
-    PageTable::new(),
-    PageTable::new(),
-];
-static mut BOOT_PD_HIGH: [PageTable; 8] = [
-    PageTable::new(),
-    PageTable::new(),
-    PageTable::new(),
-    PageTable::new(),
-    PageTable::new(),
-    PageTable::new(),
-    PageTable::new(),
-    PageTable::new(),
-];
+struct AllocatedPageTablePool {
+    base_phys: u64,
+    total_pages: usize,
+    next_page: usize,
+}
 
-/// メモリマップを解析して最大物理アドレスを計算
-///
-/// # Arguments
-/// * `buffer` - メモリディスクリプタが格納されたバッファ
-/// * `entry_count` - エントリ数
-/// * `descriptor_size` - 各ディスクリプタのサイズ
-///
-/// # Returns
-/// 最大物理アドレス（メモリの終端）
-fn analyze_memory_map(buffer: &[u8], entry_count: usize, descriptor_size: usize) -> u64 {
-    let mut max_phys_addr: u64 = 0;
+impl AllocatedPageTablePool {
+    unsafe fn allocate(
+        boot_services: *mut EfiBootServices,
+        pages: usize,
+    ) -> Result<Self, EfiStatus> {
+        let mut base = 0u64;
+        let status = unsafe {
+            ((*boot_services).allocate_pages)(
+                EFI_ALLOCATE_ANY_PAGES,
+                EFI_LOADER_DATA,
+                pages,
+                &mut base,
+            )
+        };
+        if status != EFI_SUCCESS {
+            return Err(status);
+        }
+
+        let byte_len = pages
+            .checked_mul(PAGE_SIZE_4KB_USIZE)
+            .ok_or(EFI_INVALID_PARAMETER)?;
+        unsafe {
+            core::ptr::write_bytes(base as *mut u8, 0, byte_len);
+        }
+
+        Ok(Self {
+            base_phys: base,
+            total_pages: pages,
+            next_page: 0,
+        })
+    }
+
+    fn range(&self) -> BootloaderPageTableRange {
+        BootloaderPageTableRange {
+            start: self.base_phys,
+            size: (self.total_pages as u64) * PAGE_SIZE_4KB,
+        }
+    }
+
+    fn used_pages(&self) -> usize {
+        self.next_page
+    }
+
+    fn alloc_table(&mut self) -> Option<*mut PageTable> {
+        if self.next_page >= self.total_pages {
+            return None;
+        }
+        let phys = self.base_phys + (self.next_page as u64) * PAGE_SIZE_4KB;
+        self.next_page += 1;
+        Some(phys as *mut PageTable)
+    }
+}
+
+#[inline]
+fn ceil_div_u64(value: u64, divisor: u64) -> u64 {
+    if value == 0 {
+        0
+    } else {
+        1 + ((value - 1) / divisor)
+    }
+}
+
+#[inline]
+fn is_bootstrap_map_type(mem_type: u32) -> bool {
+    matches!(
+        mem_type,
+        EFI_CONVENTIONAL_MEMORY
+            | EFI_LOADER_CODE
+            | EFI_LOADER_DATA
+            | EFI_BOOT_SERVICES_CODE
+            | EFI_BOOT_SERVICES_DATA
+            | EFI_ACPI_RECLAIM_MEMORY
+    )
+}
+
+fn analyze_bootstrap_map_limit(
+    buffer: &[u8],
+    entry_count: usize,
+    descriptor_size: usize,
+) -> Option<u64> {
+    let mut max_phys_addr = 0u64;
 
     for i in 0..entry_count {
-        let offset = i * descriptor_size;
+        let offset = i.checked_mul(descriptor_size)?;
         let desc = unsafe { &*(buffer.as_ptr().add(offset) as *const EfiMemoryDescriptor) };
 
-        let region_end = desc.physical_start + (desc.number_of_pages * 4096);
+        if !is_bootstrap_map_type(desc.r#type) {
+            continue;
+        }
+
+        let region_size = desc.number_of_pages.checked_mul(PAGE_SIZE_4KB)?;
+        let region_end = desc.physical_start.checked_add(region_size)?;
         if region_end > max_phys_addr {
             max_phys_addr = region_end;
         }
     }
 
-    max_phys_addr
+    Some(max_phys_addr)
 }
 
-/// ブートローダー用の初期ページテーブルをセットアップ
-///
-/// UEFIメモリマップから計算された最大物理アドレスに基づいて、
-/// 必要な範囲のみをマッピングする。
-///
-/// # Arguments
-/// * `max_phys_addr` - マッピングが必要な最大物理アドレス
-///
-/// # Returns
-/// PML4テーブルの物理アドレス
-unsafe fn setup_initial_page_tables(max_phys_addr: u64) -> u64 {
-    let flags = PAGE_PRESENT | PAGE_WRITABLE;
-    let huge_flags = flags | PAGE_HUGE;
+fn estimate_page_table_pages(max_phys_addr: u64) -> Option<usize> {
+    let required_gb = ceil_div_u64(max_phys_addr, PAGE_SIZE_1GB);
+    let pdp_tables_per_side = ceil_div_u64(required_gb, 512);
+    let total_tables = 1u64
+        .checked_add(2u64.checked_mul(pdp_tables_per_side)?)?
+        .checked_add(2u64.checked_mul(required_gb)?)?;
+    usize::try_from(total_tables).ok()
+}
 
-    // 必要なGB数を計算（切り上げ、最大8GBに制限）
-    let required_gb = (((max_phys_addr + (1 << 30) - 1) >> 30) as usize).min(8);
+#[inline]
+fn pml4_index(virt_addr: u64) -> usize {
+    ((virt_addr >> 39) & 0x1FF) as usize
+}
 
+#[inline]
+fn pdp_index(virt_addr: u64) -> usize {
+    ((virt_addr >> 30) & 0x1FF) as usize
+}
+
+#[inline]
+fn pd_index(virt_addr: u64) -> usize {
+    ((virt_addr >> 21) & 0x1FF) as usize
+}
+
+unsafe fn ensure_child_table(
+    parent: *mut PageTable,
+    index: usize,
+    link_flags: u64,
+    pool: &mut AllocatedPageTablePool,
+) -> Option<*mut PageTable> {
     unsafe {
-        // PML4[0] -> PDP_LOW (低位アドレス: 0x0-0x7FFFFFFFFF)
-        BOOT_PML4.entries[0] = &raw const BOOT_PDP_LOW as u64 | flags;
-
-        // PML4[256] -> PDP_HIGH (高位アドレス: 0xFFFF800000000000-)
-        BOOT_PML4.entries[256] = &raw const BOOT_PDP_HIGH as u64 | flags;
-
-        // 必要なGB数分のみマッピング
-        for i in 0..required_gb {
-            // 低位: アイデンティティマッピング
-            BOOT_PDP_LOW.entries[i] = &raw const BOOT_PD_LOW[i] as u64 | flags;
-
-            // 高位: 0xFFFF800000000000+にマッピング
-            BOOT_PDP_HIGH.entries[i] = &raw const BOOT_PD_HIGH[i] as u64 | flags;
-
-            for j in 0..512 {
-                let phys_addr = ((i * 512 + j) * 2 * 1024 * 1024) as u64;
-                // 実際に必要なアドレス範囲のみマッピング
-                if phys_addr < max_phys_addr {
-                    BOOT_PD_LOW[i].entries[j] = phys_addr | huge_flags;
-                    BOOT_PD_HIGH[i].entries[j] = phys_addr | huge_flags;
-                }
+        let entry = (*parent).entries[index];
+        if entry & PAGE_PRESENT != 0 {
+            if entry & PAGE_HUGE != 0 {
+                return None;
             }
+            let child_phys = entry & PAGE_TABLE_ADDR_MASK;
+            if child_phys == 0 {
+                return None;
+            }
+            return Some(child_phys as *mut PageTable);
         }
 
-        // PML4のアドレスを返す
-        &raw const BOOT_PML4 as u64
+        let table = pool.alloc_table()?;
+        (*table).clear();
+        (*parent).entries[index] = (table as u64) | link_flags;
+        Some(table)
     }
+}
+
+unsafe fn ensure_pd_for_virt(
+    pml4: *mut PageTable,
+    virt_addr: u64,
+    link_flags: u64,
+    pool: &mut AllocatedPageTablePool,
+) -> Option<*mut PageTable> {
+    unsafe {
+        let pdp = ensure_child_table(pml4, pml4_index(virt_addr), link_flags, pool)?;
+        ensure_child_table(pdp, pdp_index(virt_addr), link_flags, pool)
+    }
+}
+
+unsafe fn setup_initial_page_tables(
+    max_phys_addr: u64,
+    pool: &mut AllocatedPageTablePool,
+) -> Option<u64> {
+    let link_flags = PAGE_PRESENT | PAGE_WRITABLE;
+    let huge_flags = link_flags | PAGE_HUGE;
+    let pml4 = pool.alloc_table()?;
+    unsafe {
+        (*pml4).clear();
+    }
+
+    let mut phys_addr = 0u64;
+    while phys_addr < max_phys_addr {
+        let low_pd = unsafe { ensure_pd_for_virt(pml4, phys_addr, link_flags, pool)? };
+        let high_virt = KERNEL_VMA.checked_add(phys_addr)?;
+        let high_pd = unsafe { ensure_pd_for_virt(pml4, high_virt, link_flags, pool)? };
+
+        unsafe {
+            (*low_pd).entries[pd_index(phys_addr)] = phys_addr | huge_flags;
+            (*high_pd).entries[pd_index(high_virt)] = phys_addr | huge_flags;
+        }
+
+        phys_addr = phys_addr.checked_add(PAGE_SIZE_2MB)?;
+    }
+
+    Some(pml4 as u64)
+}
+
+unsafe fn fetch_memory_map(
+    boot_services: *mut EfiBootServices,
+    buffer: &mut [u8],
+    map_key: &mut usize,
+    descriptor_size: &mut usize,
+    descriptor_version: &mut u32,
+) -> Result<usize, EfiStatus> {
+    let mut required_size = 0usize;
+    let status = unsafe {
+        ((*boot_services).get_memory_map)(
+            &mut required_size,
+            core::ptr::null_mut(),
+            map_key,
+            descriptor_size,
+            descriptor_version,
+        )
+    };
+
+    if status != EFI_BUFFER_TOO_SMALL && status != EFI_SUCCESS {
+        return Err(status);
+    }
+    if *descriptor_size == 0 {
+        return Err(EFI_INVALID_PARAMETER);
+    }
+
+    let mut map_size = required_size
+        .checked_add(*descriptor_size)
+        .ok_or(EFI_INVALID_PARAMETER)?;
+    if map_size > buffer.len() {
+        return Err(EFI_BUFFER_TOO_SMALL);
+    }
+
+    let status = unsafe {
+        ((*boot_services).get_memory_map)(
+            &mut map_size,
+            buffer.as_mut_ptr() as *mut EfiMemoryDescriptor,
+            map_key,
+            descriptor_size,
+            descriptor_version,
+        )
+    };
+    if status != EFI_SUCCESS {
+        return Err(status);
+    }
+
+    Ok(map_size)
+}
+
+fn copy_memory_map_to_boot_info(
+    boot_info: &mut BootInfo,
+    buffer: &[u8],
+    map_size: usize,
+    descriptor_size: usize,
+) -> usize {
+    let entry_count = map_size / descriptor_size;
+    for i in 0..entry_count.min(boot_info.memory_map.len()) {
+        let offset = i * descriptor_size;
+        let desc = unsafe { &*(buffer.as_ptr().add(offset) as *const EfiMemoryDescriptor) };
+
+        boot_info.memory_map[i] = MemoryRegion {
+            start: desc.physical_start,
+            size: desc.number_of_pages.saturating_mul(PAGE_SIZE_4KB),
+            region_type: desc.r#type,
+        };
+    }
+    boot_info.memory_map_count = entry_count.min(boot_info.memory_map.len());
+    entry_count
 }
 
 /// CR3にページテーブルをロードしてページングを有効化（既に有効なのでCR3のみ更新）
@@ -299,36 +475,31 @@ extern "efiapi" fn efi_main(
 
     println_uefi!("\nVitrOS - Memory Map\n");
 
-    // メモリマップを取得
-    let mut map_size: usize = 0;
     let mut map_key: usize = 0;
     let mut descriptor_size: usize = 0;
     let mut descriptor_version: u32 = 0;
+    let memory_map_buffer = unsafe { &mut *core::ptr::addr_of_mut!(MEMORY_MAP_BUFFER) };
 
-    // SAFETY: UEFI 関数呼び出し - メモリマップサイズ取得
-    unsafe {
-        ((*boot_services).get_memory_map)(
-            &mut map_size,
-            core::ptr::null_mut(),
+    let mut map_size = unsafe {
+        match fetch_memory_map(
+            boot_services,
+            memory_map_buffer,
             &mut map_key,
             &mut descriptor_size,
             &mut descriptor_version,
-        );
-    }
-
-    // バッファを確保（スタック上に）
-    let mut buffer = [0u8; 4096 * 4];
-    map_size = buffer.len();
-
-    // SAFETY: UEFI 関数呼び出し - 実際のメモリマップ取得
-    let status = unsafe {
-        ((*boot_services).get_memory_map)(
-            &mut map_size,
-            buffer.as_mut_ptr() as *mut EfiMemoryDescriptor,
-            &mut map_key,
-            &mut descriptor_size,
-            &mut descriptor_version,
-        )
+        ) {
+            Ok(size) => size,
+            Err(status) => {
+                println_uefi!(
+                    "[ERROR] Failed to get initial memory map! Status: 0x{:X}, BufferSize={} bytes",
+                    status,
+                    memory_map_buffer.len()
+                );
+                loop {
+                    core::arch::asm!("hlt");
+                }
+            }
+        }
     };
 
     // BOOT_INFOを静的変数から取得
@@ -342,6 +513,7 @@ extern "efiapi" fn efi_main(
         height,
         stride: width,
     };
+    boot_info.bootloader_page_table_range_count = 0;
 
     // RSDP (ACPI Root System Description Pointer) を UEFI Configuration Table から取得
     unsafe {
@@ -372,69 +544,74 @@ extern "efiapi" fn efi_main(
         boot_info.rsdp_address = rsdp_addr;
     }
 
-    if status == EFI_SUCCESS {
-        let entry_count = map_size / descriptor_size;
-        println_uefi!("[INFO] Memory map retrieved: {} entries", entry_count);
+    let entry_count = map_size / descriptor_size;
+    println_uefi!("[INFO] Memory map retrieved: {} entries", entry_count);
 
-        // メモリマップを表示
-        let max_display = 20;
+    // メモリマップを表示
+    let max_display = 20;
+    println_uefi!(
+        "\nMemory Map (first {} entries):",
+        max_display.min(entry_count)
+    );
+    for i in 0..entry_count.min(max_display) {
+        let offset = i * descriptor_size;
+        let desc = unsafe {
+            &*(memory_map_buffer.as_ptr().add(offset) as *const EfiMemoryDescriptor)
+        };
 
+        let type_str = memory_type_str(desc.r#type);
         println_uefi!(
-            "\nMemory Map (first {} entries):",
-            max_display.min(entry_count)
-        );
-        for i in 0..entry_count.min(max_display) {
-            let offset = i * descriptor_size;
-
-            // SAFETY: バッファ内の有効なメモリディスクリプタを参照
-            let desc = unsafe { &*(buffer.as_ptr().add(offset) as *const EfiMemoryDescriptor) };
-
-            let type_str = memory_type_str(desc.r#type);
-            println_uefi!(
-                "  {:<12} 0x{:016X}  Pages: 0x{:X}",
-                type_str,
-                desc.physical_start,
-                desc.number_of_pages
-            );
-        }
-
-        println_uefi!("\nTotal entries: {}", entry_count);
-
-        // BootInfo にメモリマップをコピー
-        for i in 0..entry_count.min(boot_info.memory_map.len()) {
-            let offset = i * descriptor_size;
-            let desc = unsafe { &*(buffer.as_ptr().add(offset) as *const EfiMemoryDescriptor) };
-
-            boot_info.memory_map[i] = MemoryRegion {
-                start: desc.physical_start,
-                size: desc.number_of_pages * 4096,
-                region_type: desc.r#type,
-            };
-        }
-        boot_info.memory_map_count = entry_count.min(boot_info.memory_map.len());
-
-        // メモリマップを解析して最大物理アドレスを計算
-        let max_phys_addr = analyze_memory_map(&buffer[..map_size], entry_count, descriptor_size);
-        boot_info.max_physical_address = max_phys_addr;
-
-        let boot_info_addr = core::ptr::addr_of!(BOOT_INFO) as u64;
-        println_uefi!("[INFO] BOOT_INFO at 0x{:X}", boot_info_addr);
-        println_uefi!(
-            "[INFO] BOOT_INFO.memory_map_count = {}",
-            boot_info.memory_map_count
-        );
-        println_uefi!(
-            "[INFO] BOOT_INFO.max_physical_address = 0x{:X} ({} MB)",
-            boot_info.max_physical_address,
-            boot_info.max_physical_address / (1024 * 1024)
-        );
-        println_uefi!(
-            "[INFO] BOOT_INFO.memory_map[0]: start=0x{:X}, size=0x{:X}, type={}",
-            boot_info.memory_map[0].start,
-            boot_info.memory_map[0].size,
-            boot_info.memory_map[0].region_type
+            "  {:<12} 0x{:016X}  Pages: 0x{:X}",
+            type_str,
+            desc.physical_start,
+            desc.number_of_pages
         );
     }
+    println_uefi!("\nTotal entries: {}", entry_count);
+
+    copy_memory_map_to_boot_info(boot_info, &memory_map_buffer[..map_size], map_size, descriptor_size);
+    let initial_max_phys = match analyze_bootstrap_map_limit(
+        &memory_map_buffer[..map_size],
+        entry_count,
+        descriptor_size,
+    ) {
+        Some(value) if value != 0 => value,
+        _ => {
+            println_uefi!("[ERROR] Bootstrap max physical address analysis failed");
+            loop {
+                unsafe { core::arch::asm!("hlt") }
+            }
+        }
+    };
+    if initial_max_phys > DIRECT_MAP_WINDOW_BYTES {
+        println_uefi!(
+            "[ERROR] Direct-map window overflow: max_phys=0x{:X}, limit=0x{:X}",
+            initial_max_phys,
+            DIRECT_MAP_WINDOW_BYTES
+        );
+        loop {
+            unsafe { core::arch::asm!("hlt") }
+        }
+    }
+    boot_info.max_physical_address = initial_max_phys;
+
+    let boot_info_addr = core::ptr::addr_of!(BOOT_INFO) as u64;
+    println_uefi!("[INFO] BOOT_INFO at 0x{:X}", boot_info_addr);
+    println_uefi!(
+        "[INFO] BOOT_INFO.memory_map_count = {}",
+        boot_info.memory_map_count
+    );
+    println_uefi!(
+        "[INFO] BOOT_INFO.max_physical_address = 0x{:X} ({} MB)",
+        boot_info.max_physical_address,
+        boot_info.max_physical_address / (1024 * 1024)
+    );
+    println_uefi!(
+        "[INFO] BOOT_INFO.memory_map[0]: start=0x{:X}, size=0x{:X}, type={}",
+        boot_info.memory_map[0].start,
+        boot_info.memory_map[0].size,
+        boot_info.memory_map[0].region_type
+    );
 
     // カーネルをロード (ブートサービス終了前に実行)
     println_uefi!("[INFO] Loading kernel from ELF...");
@@ -448,81 +625,261 @@ extern "efiapi" fn efi_main(
     println_uefi!("[INFO] Kernel entry point: 0x{:X}", kernel_entry);
 
     // カーネルロード後にメモリマップが変更されているので、再取得
-    println_uefi!("[INFO] Updating memory map before ExitBootServices...");
-
-    // まず必要なサイズを取得
-    map_size = 0;
-    unsafe {
-        ((*boot_services).get_memory_map)(
-            &mut map_size,
-            core::ptr::null_mut(),
+    println_uefi!("[INFO] Updating memory map before page-table allocation...");
+    map_size = unsafe {
+        match fetch_memory_map(
+            boot_services,
+            memory_map_buffer,
             &mut map_key,
             &mut descriptor_size,
             &mut descriptor_version,
-        );
-    }
-
-    map_size += descriptor_size;
-
-    if map_size > buffer.len() {
-        println_uefi!(
-            "[ERROR] Memory map too large! Required: {}, Available: {}",
-            map_size,
-            buffer.len()
-        );
-        loop {
-            unsafe { core::arch::asm!("hlt") }
+        ) {
+            Ok(size) => size,
+            Err(status) => {
+                println_uefi!(
+                    "[ERROR] Failed to get updated memory map! Status: 0x{:X}",
+                    status
+                );
+                loop {
+                    core::arch::asm!("hlt");
+                }
+            }
         }
-    }
-
-    let status = unsafe {
-        ((*boot_services).get_memory_map)(
-            &mut map_size,
-            buffer.as_mut_ptr() as *mut EfiMemoryDescriptor,
-            &mut map_key,
-            &mut descriptor_size,
-            &mut descriptor_version,
-        )
     };
-    if status != EFI_SUCCESS {
+
+    let updated_entry_count = map_size / descriptor_size;
+    let max_phys_addr = match analyze_bootstrap_map_limit(
+        &memory_map_buffer[..map_size],
+        updated_entry_count,
+        descriptor_size,
+    ) {
+        Some(value) if value != 0 => value,
+        _ => {
+            println_uefi!("[ERROR] Updated bootstrap max physical address analysis failed");
+            loop {
+                unsafe { core::arch::asm!("hlt") }
+            }
+        }
+    };
+    if max_phys_addr > DIRECT_MAP_WINDOW_BYTES {
         println_uefi!(
-            "[ERROR] Failed to get updated memory map! Status: 0x{:X}",
-            status
+            "[ERROR] Direct-map window overflow: max_phys=0x{:X}, limit=0x{:X}",
+            max_phys_addr,
+            DIRECT_MAP_WINDOW_BYTES
         );
         loop {
             unsafe { core::arch::asm!("hlt") }
         }
     }
 
-    // SAFETY: UEFI 関数呼び出し - ブートサービス終了
-    // GetMemoryMap後はBoot Serviceを使用しない（MapKeyが無効になるため）
-    let status = unsafe { ((*boot_services).exit_boot_services)(image_handle, map_key) };
+    let required_gb = ceil_div_u64(max_phys_addr, PAGE_SIZE_1GB);
+    let estimated_table_pages = match estimate_page_table_pages(max_phys_addr) {
+        Some(pages) if pages > 0 => pages,
+        _ => {
+            println_uefi!(
+                "[ERROR] Failed to estimate page-table pages (max_phys=0x{:X})",
+                max_phys_addr
+            );
+            loop {
+                unsafe { core::arch::asm!("hlt") }
+            }
+        }
+    };
+    println_uefi!("[INFO] required_gb = {}", required_gb);
+    println_uefi!(
+        "[INFO] Estimated page-table pages = {}",
+        estimated_table_pages
+    );
 
-    if status != EFI_SUCCESS {
-        // ExitBootServicesが失敗した場合は、まだBootServicesが有効なのでConOutが使える
+    let mut page_table_pool = unsafe {
+        match AllocatedPageTablePool::allocate(boot_services, estimated_table_pages) {
+            Ok(pool) => pool,
+            Err(status) => {
+                println_uefi!(
+                    "[ERROR] AllocatePages for page tables failed! Status: 0x{:X}",
+                    status
+                );
+                loop {
+                    core::arch::asm!("hlt");
+                }
+            }
+        }
+    };
+    boot_info.bootloader_page_table_ranges[0] = page_table_pool.range();
+    boot_info.bootloader_page_table_range_count = 1;
+    println_uefi!(
+        "[INFO] Bootloader page-table range[0]: start=0x{:X}, size=0x{:X}",
+        boot_info.bootloader_page_table_ranges[0].start,
+        boot_info.bootloader_page_table_ranges[0].size
+    );
+
+    let pml4_addr = unsafe {
+        match setup_initial_page_tables(max_phys_addr, &mut page_table_pool) {
+            Some(addr) => addr,
+            None => {
+                println_uefi!("[ERROR] Failed to build initial page tables");
+                loop {
+                    core::arch::asm!("hlt");
+                }
+            }
+        }
+    };
+    println_uefi!(
+        "[INFO] Page-table allocation used {}/{} pages",
+        page_table_pool.used_pages(),
+        estimated_table_pages
+    );
+
+    println_uefi!("[INFO] Fetching final memory map before ExitBootServices...");
+    map_size = unsafe {
+        match fetch_memory_map(
+            boot_services,
+            memory_map_buffer,
+            &mut map_key,
+            &mut descriptor_size,
+            &mut descriptor_version,
+        ) {
+            Ok(size) => size,
+            Err(status) => {
+                println_uefi!(
+                    "[ERROR] Failed to get final memory map! Status: 0x{:X}",
+                    status
+                );
+                loop {
+                    core::arch::asm!("hlt");
+                }
+            }
+        }
+    };
+
+    let final_entry_count =
+        copy_memory_map_to_boot_info(boot_info, &memory_map_buffer[..map_size], map_size, descriptor_size);
+    let final_max_phys = match analyze_bootstrap_map_limit(
+        &memory_map_buffer[..map_size],
+        final_entry_count,
+        descriptor_size,
+    ) {
+        Some(value) if value != 0 => value,
+        _ => {
+            println_uefi!("[ERROR] Final bootstrap max physical address analysis failed");
+            loop {
+                unsafe { core::arch::asm!("hlt") }
+            }
+        }
+    };
+    if final_max_phys > DIRECT_MAP_WINDOW_BYTES {
         println_uefi!(
-            "[ERROR] Failed to exit boot services! Status: 0x{:X}",
-            status
+            "[ERROR] Direct-map window overflow: max_phys=0x{:X}, limit=0x{:X}",
+            final_max_phys,
+            DIRECT_MAP_WINDOW_BYTES
         );
         loop {
             unsafe { core::arch::asm!("hlt") }
         }
+    }
+    boot_info.max_physical_address = final_max_phys;
+    println_uefi!(
+        "[INFO] BOOT_INFO.memory_map_count(final) = {}",
+        boot_info.memory_map_count
+    );
+    println_uefi!(
+        "[INFO] BOOT_INFO.max_physical_address(final) = 0x{:X} ({} MB)",
+        boot_info.max_physical_address,
+        boot_info.max_physical_address / (1024 * 1024)
+    );
+    println_uefi!(
+        "[INFO] BOOT_INFO.bootloader_page_table_range_count = {}",
+        boot_info.bootloader_page_table_range_count
+    );
+
+    let mut exit_retry = 0usize;
+    loop {
+        let status = unsafe { ((*boot_services).exit_boot_services)(image_handle, map_key) };
+        if status == EFI_SUCCESS {
+            break;
+        }
+
+        if status != EFI_INVALID_PARAMETER || exit_retry >= EXIT_BOOT_SERVICES_RETRY_LIMIT {
+            println_uefi!(
+                "[ERROR] Failed to exit boot services! Status: 0x{:X}, retries={}",
+                status,
+                exit_retry
+            );
+            loop {
+                unsafe { core::arch::asm!("hlt") }
+            }
+        }
+
+        exit_retry += 1;
+        println_uefi!(
+            "[WARN] ExitBootServices returned EFI_INVALID_PARAMETER, retrying ({}/{})",
+            exit_retry,
+            EXIT_BOOT_SERVICES_RETRY_LIMIT
+        );
+
+        map_size = unsafe {
+            match fetch_memory_map(
+                boot_services,
+                memory_map_buffer,
+                &mut map_key,
+                &mut descriptor_size,
+                &mut descriptor_version,
+            ) {
+                Ok(size) => size,
+                Err(retry_status) => {
+                    println_uefi!(
+                        "[ERROR] Retry GetMemoryMap failed! Status: 0x{:X}",
+                        retry_status
+                    );
+                    loop {
+                        core::arch::asm!("hlt");
+                    }
+                }
+            }
+        };
+
+        let retry_entry_count = copy_memory_map_to_boot_info(
+            boot_info,
+            &memory_map_buffer[..map_size],
+            map_size,
+            descriptor_size,
+        );
+        let retry_max_phys = match analyze_bootstrap_map_limit(
+            &memory_map_buffer[..map_size],
+            retry_entry_count,
+            descriptor_size,
+        ) {
+            Some(value) if value != 0 => value,
+            _ => {
+                println_uefi!("[ERROR] Retry max physical address analysis failed");
+                loop {
+                    unsafe { core::arch::asm!("hlt") }
+                }
+            }
+        };
+        if retry_max_phys > DIRECT_MAP_WINDOW_BYTES {
+            println_uefi!(
+                "[ERROR] Direct-map window overflow during retry: max_phys=0x{:X}, limit=0x{:X}",
+                retry_max_phys,
+                DIRECT_MAP_WINDOW_BYTES
+            );
+            loop {
+                unsafe { core::arch::asm!("hlt") }
+            }
+        }
+        boot_info.max_physical_address = retry_max_phys;
     }
 
     // ExitBootServices成功 - ここから先はBoot Servicesは使用不可
-
-    // BOOT_INFOの物理アドレスを取得
-    // カーネルは8GBまでマッピングされているので、高位アドレスに配置されても問題なし
     let boot_info_phys_addr = core::ptr::addr_of!(BOOT_INFO) as u64;
-
-    // ページテーブルをセットアップ（UEFIメモリマップに基づいて必要な範囲のみマッピング）
-    let pml4_addr = unsafe { setup_initial_page_tables(boot_info.max_physical_address) };
-
-    // CR3にページテーブルをロード
     unsafe { load_page_tables(pml4_addr) };
 
-    // カーネルの高位仮想アドレスを計算（kernel_entryは物理アドレス）
-    let kernel_high_addr = kernel_entry + KERNEL_VMA;
+    let kernel_high_addr = match kernel_entry.checked_add(KERNEL_VMA) {
+        Some(addr) => addr,
+        None => loop {
+            unsafe { core::arch::asm!("hlt") }
+        },
+    };
 
     // カーネルにジャンプ（BOOT_INFOの物理アドレスを渡す）
     type KernelEntry = extern "efiapi" fn(u64) -> !;
