@@ -9,6 +9,17 @@ use core::ptr::{addr_of, addr_of_mut};
 /// x86_64のカノニカルアドレス空間の上位半分の開始位置
 pub const KERNEL_VIRTUAL_BASE: u64 = 0xFFFF_8000_0000_0000;
 
+/// 仮想ヒープ窓の開始アドレス（inclusive）
+/// PML4[508] から開始する。
+pub const KERNEL_HEAP_WINDOW_START: u64 = 0xFFFF_FE00_0000_0000;
+
+/// 仮想ヒープ窓のサイズ（1TiB）
+pub const KERNEL_HEAP_WINDOW_SIZE: u64 = 1 << 40;
+
+/// 仮想ヒープ窓の終端アドレス（exclusive）
+/// PML4[510] の先頭（PML4[508..509] を使用）。
+pub const KERNEL_HEAP_WINDOW_END: u64 = KERNEL_HEAP_WINDOW_START + KERNEL_HEAP_WINDOW_SIZE;
+
 // リンカスクリプトで定義されたセクション境界シンボル
 unsafe extern "C" {
     static __text_start: u8;
@@ -39,6 +50,8 @@ pub enum PagingError {
     FeatureNotSupported,
     /// 既存のマッピングと競合（PT/PD参照が既に存在）
     ExistingMappingConflict,
+    /// 指定した仮想アドレスにマッピングが存在しない
+    MappingNotPresent,
     /// ページテーブル用フレームの確保に失敗
     FrameAllocationFailed,
 }
@@ -55,6 +68,7 @@ impl core::fmt::Display for PagingError {
             PagingError::ExistingMappingConflict => {
                 write!(f, "Existing page table mapping conflict")
             }
+            PagingError::MappingNotPresent => write!(f, "Page mapping not present"),
             PagingError::FrameAllocationFailed => write!(f, "Page-table frame allocation failed"),
         }
     }
@@ -132,6 +146,12 @@ pub fn virt_to_phys(virt_addr: u64) -> Result<u64, PagingError> {
     virt_addr
         .checked_sub(KERNEL_VIRTUAL_BASE)
         .ok_or(PagingError::AddressConversionFailed)
+}
+
+/// 仮想アドレスが仮想ヒープ窓内にあるか判定する
+#[inline]
+pub fn is_heap_window_virt_addr(virt_addr: u64) -> bool {
+    (KERNEL_HEAP_WINDOW_START..KERNEL_HEAP_WINDOW_END).contains(&virt_addr)
 }
 
 /// ページテーブルエントリのフラグ
@@ -512,8 +532,17 @@ pub fn init(boot_info: &vitros_common::boot_info::BootInfo) -> Result<(), Paging
 
         let memory_region_count = boot_info.memory_map_count.min(boot_info.memory_map.len());
         let memory_regions = &boot_info.memory_map[..memory_region_count];
-        let (direct_map_ranges, direct_map_range_count, total_pages, _) =
+        let (direct_map_ranges, direct_map_range_count, total_pages, direct_map_max_end) =
             extract_direct_map_ranges(memory_regions)?;
+
+        if direct_map_max_end > 0 {
+            let direct_map_virt_end = KERNEL_VIRTUAL_BASE
+                .checked_add(direct_map_max_end)
+                .ok_or(PagingError::AddressConversionFailed)?;
+            if direct_map_virt_end > KERNEL_HEAP_WINDOW_START {
+                return Err(PagingError::AddressOutOfRange);
+            }
+        }
 
         let use_1gb_pages = supports_1gb_pages();
 
@@ -771,6 +800,18 @@ fn direct_map_table_indices(phys_addr: u64) -> Result<(usize, usize, usize, usiz
 }
 
 #[inline]
+fn table_indices_from_virt(virt_addr: u64) -> Result<(usize, usize, usize, usize), PagingError> {
+    if virt_addr < KERNEL_VIRTUAL_BASE || virt_addr & PAGE_OFFSET_MASK != 0 {
+        return Err(PagingError::InvalidAddress);
+    }
+    let pml4_idx = ((virt_addr >> 39) & 0x1FF) as usize;
+    let pdp_idx = ((virt_addr >> 30) & 0x1FF) as usize;
+    let pd_idx = ((virt_addr >> 21) & 0x1FF) as usize;
+    let pt_idx = ((virt_addr >> 12) & 0x1FF) as usize;
+    Ok((pml4_idx, pdp_idx, pd_idx, pt_idx))
+}
+
+#[inline]
 fn table_link_flags() -> u64 {
     PageTableFlags::Present as u64 | PageTableFlags::Writable as u64
 }
@@ -961,6 +1002,107 @@ unsafe fn prune_empty_tables(
         }
 
         Ok(())
+    }
+}
+
+/// 任意のカーネル仮想アドレスに4KBページをマップする
+///
+/// # Safety Preconditions
+/// * 割り込み無効状態で呼び出すこと
+///
+/// # Arguments
+/// * `virt_addr` - マップ先の仮想アドレス（4KB境界、上位半分）
+/// * `phys_addr` - マップ元の物理アドレス（4KB境界）
+/// * `additional_flags` - 追加のページフラグ
+///
+/// # Errors
+/// * `PagingError::InvalidAddress` - 仮想/物理アドレスが不正な場合
+/// * `PagingError::ExistingMappingConflict` - 既存マッピングと衝突する場合
+/// * `PagingError::FrameAllocationFailed` - ページテーブル用フレーム確保に失敗した場合
+pub fn map_kernel_page_at(
+    virt_addr: u64,
+    phys_addr: u64,
+    additional_flags: u64,
+) -> Result<(), PagingError> {
+    assert_interrupts_disabled("map_kernel_page_at");
+
+    if phys_addr & PAGE_OFFSET_MASK != 0 {
+        return Err(PagingError::InvalidAddress);
+    }
+
+    let (pml4_idx, pdp_idx, pd_idx, pt_idx) = table_indices_from_virt(virt_addr)?;
+    let map_flags =
+        PageTableFlags::Present as u64 | PageTableFlags::Writable as u64 | additional_flags;
+
+    unsafe {
+        let pml4 = addr_of_mut!(KERNEL_PML4);
+        let pdp = ensure_pdp(pml4, pml4_idx)?;
+        let pd = ensure_pd(pdp, pdp_idx)?;
+        let pt = ensure_pt(pd, pd_idx)?;
+        let entry = (*pt).entry(pt_idx);
+        if entry.is_present() {
+            return Err(PagingError::ExistingMappingConflict);
+        }
+        entry.set(phys_addr, map_flags);
+        reload_cr3();
+    }
+
+    Ok(())
+}
+
+/// 任意のカーネル仮想アドレスにある4KBページのマップを解除する
+///
+/// # Safety Preconditions
+/// * 割り込み無効状態で呼び出すこと
+///
+/// # Arguments
+/// * `virt_addr` - マップ解除対象の仮想アドレス（4KB境界、上位半分）
+///
+/// # Returns
+/// 解除した物理アドレス
+///
+/// # Errors
+/// * `PagingError::InvalidAddress` - 仮想アドレスが不正な場合
+/// * `PagingError::MappingNotPresent` - 指定VAにマッピングが存在しない場合
+/// * `PagingError::ExistingMappingConflict` - 既存HugePageと衝突する場合
+/// * `PagingError::FrameAllocationFailed` - 空ページテーブル解放に失敗した場合
+pub fn unmap_kernel_page_at(virt_addr: u64) -> Result<u64, PagingError> {
+    assert_interrupts_disabled("unmap_kernel_page_at");
+
+    let (pml4_idx, pdp_idx, pd_idx, pt_idx) = table_indices_from_virt(virt_addr)?;
+
+    unsafe {
+        let pml4 = addr_of_mut!(KERNEL_PML4);
+        let Some(pdp) = walk_table_if_present(pml4, pml4_idx)? else {
+            return Err(PagingError::MappingNotPresent);
+        };
+        let Some(pd) = walk_table_if_present(pdp, pdp_idx)? else {
+            return Err(PagingError::MappingNotPresent);
+        };
+        let Some(pt) = walk_table_if_present(pd, pd_idx)? else {
+            return Err(PagingError::MappingNotPresent);
+        };
+
+        let mapped_phys = {
+            let entry = (*pt).entry(pt_idx);
+            if !entry.is_present() {
+                return Err(PagingError::MappingNotPresent);
+            }
+            if entry.is_huge_page() {
+                return Err(PagingError::ExistingMappingConflict);
+            }
+            let phys = entry.get_address();
+            entry.set(0, 0);
+            phys
+        };
+
+        if (*pt).is_empty() {
+            free_table_frame((*pd).entry(pd_idx))?;
+        }
+        prune_empty_tables(pml4, pml4_idx, pdp_idx)?;
+        reload_cr3();
+
+        Ok(mapped_phys)
     }
 }
 
@@ -1883,5 +2025,127 @@ mod tests {
         // KERNEL_VIRTUAL_BASE未満はエラー
         let result = virt_to_phys(0x1000);
         assert_eq!(result, Err(PagingError::InvalidAddress));
+    }
+
+    #[test_case]
+    fn test_heap_window_constants() {
+        assert_eq!(KERNEL_HEAP_WINDOW_END - KERNEL_HEAP_WINDOW_START, KERNEL_HEAP_WINDOW_SIZE);
+        assert_eq!(KERNEL_HEAP_WINDOW_SIZE, 1u64 << 40);
+        assert_eq!(KERNEL_HEAP_WINDOW_START & PAGE_OFFSET_MASK, 0);
+        assert_eq!(KERNEL_HEAP_WINDOW_END & PAGE_OFFSET_MASK, 0);
+
+        let start_pml4 = ((KERNEL_HEAP_WINDOW_START >> 39) & 0x1FF) as usize;
+        let end_minus_1_pml4 = (((KERNEL_HEAP_WINDOW_END - 1) >> 39) & 0x1FF) as usize;
+        assert_eq!(start_pml4, 508);
+        assert_eq!(end_minus_1_pml4, 509);
+    }
+
+    #[test_case]
+    fn test_heap_window_range_check() {
+        assert!(is_heap_window_virt_addr(KERNEL_HEAP_WINDOW_START));
+        assert!(is_heap_window_virt_addr(KERNEL_HEAP_WINDOW_END - PAGE_SIZE as u64));
+        assert!(!is_heap_window_virt_addr(KERNEL_HEAP_WINDOW_START - PAGE_SIZE as u64));
+        assert!(!is_heap_window_virt_addr(KERNEL_HEAP_WINDOW_END));
+    }
+
+    #[test_case]
+    fn test_map_unmap_kernel_page_at_success() {
+        setup_table_allocator_for_test();
+
+        let virt_addr = KERNEL_HEAP_WINDOW_START + PAGE_SIZE as u64;
+        let phys_addr = 0x4000;
+
+        crate::io::without_interrupts(|| {
+            map_kernel_page_at(virt_addr, phys_addr, PageTableFlags::NoExecute as u64)
+                .expect("map_kernel_page_at failed");
+            let unmapped = unmap_kernel_page_at(virt_addr).expect("unmap_kernel_page_at failed");
+            assert_eq!(unmapped, phys_addr);
+        });
+
+        unsafe {
+            let pml4 = addr_of_mut!(KERNEL_PML4);
+            let (pml4_idx, _, _, _) =
+                table_indices_from_virt(virt_addr).expect("virt indices failed");
+            assert!(
+                !(*pml4).entry(pml4_idx).is_present(),
+                "unmap should prune empty page-table chain"
+            );
+        }
+    }
+
+    #[test_case]
+    fn test_map_kernel_page_at_detects_existing_mapping_conflict() {
+        setup_table_allocator_for_test();
+
+        let virt_addr = KERNEL_HEAP_WINDOW_START + PAGE_SIZE as u64;
+        let phys_addr = 0x4000;
+
+        crate::io::without_interrupts(|| {
+            map_kernel_page_at(virt_addr, phys_addr, 0).expect("first map failed");
+            assert_eq!(
+                map_kernel_page_at(virt_addr, phys_addr + PAGE_SIZE as u64, 0),
+                Err(PagingError::ExistingMappingConflict)
+            );
+        });
+    }
+
+    #[test_case]
+    fn test_map_kernel_page_at_conflict_with_huge_page() {
+        setup_table_allocator_for_test();
+
+        let phys_huge = (512u64 * HUGE_PAGE_SIZE_1GB as u64) + HUGE_PAGE_SIZE_2MB as u64;
+        let virt_addr = KERNEL_VIRTUAL_BASE + phys_huge;
+
+        crate::io::without_interrupts(|| {
+            map_huge_2mb(phys_huge, 0).expect("map_huge_2mb failed");
+            assert_eq!(
+                map_kernel_page_at(virt_addr, 0x8000, 0),
+                Err(PagingError::ExistingMappingConflict)
+            );
+        });
+    }
+
+    #[test_case]
+    fn test_map_kernel_page_at_conflict_with_mmio_mapping() {
+        setup_table_allocator_for_test();
+
+        let mmio_phys = (512u64 * HUGE_PAGE_SIZE_1GB as u64) + (2 * PAGE_SIZE as u64);
+        let virt_addr = KERNEL_VIRTUAL_BASE + mmio_phys;
+
+        crate::io::without_interrupts(|| {
+            map_mmio(mmio_phys, PAGE_SIZE as u64).expect("map_mmio failed");
+            assert_eq!(
+                map_kernel_page_at(virt_addr, 0x9000, 0),
+                Err(PagingError::ExistingMappingConflict)
+            );
+        });
+    }
+
+    #[test_case]
+    fn test_map_kernel_page_at_invalid_alignment() {
+        setup_table_allocator_for_test();
+
+        crate::io::without_interrupts(|| {
+            assert_eq!(
+                map_kernel_page_at(KERNEL_HEAP_WINDOW_START + 1, 0x4000, 0),
+                Err(PagingError::InvalidAddress)
+            );
+            assert_eq!(
+                map_kernel_page_at(KERNEL_HEAP_WINDOW_START + PAGE_SIZE as u64, 0x4001, 0),
+                Err(PagingError::InvalidAddress)
+            );
+        });
+    }
+
+    #[test_case]
+    fn test_unmap_kernel_page_at_mapping_not_present() {
+        setup_table_allocator_for_test();
+
+        crate::io::without_interrupts(|| {
+            assert_eq!(
+                unmap_kernel_page_at(KERNEL_HEAP_WINDOW_START + PAGE_SIZE as u64),
+                Err(PagingError::MappingNotPresent)
+            );
+        });
     }
 }

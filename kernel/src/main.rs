@@ -254,6 +254,12 @@ extern "C" fn kernel_main_inner(boot_info_phys_addr: u64) -> ! {
     // カーネル用のページテーブルを作成（UEFIメモリマップに基づいて動的にマッピング）
     info!("Creating kernel page tables...");
     paging::init(boot_info).expect("Failed to initialize paging system");
+    info!(
+        "Kernel heap window reserved: virt=0x{:X}-0x{:X} ({} GiB)",
+        paging::KERNEL_HEAP_WINDOW_START,
+        paging::KERNEL_HEAP_WINDOW_END,
+        paging::KERNEL_HEAP_WINDOW_SIZE >> 30
+    );
     info!("Kernel page tables created and loaded");
 
     // GDTを高位アドレスで再ロード（念のため）
@@ -335,6 +341,14 @@ extern "C" fn kernel_main_inner(boot_info_phys_addr: u64) -> ! {
         info!(
             "Heap: phys=0x{:X} virt=0x{:X}",
             largest_start_phys, largest_start_virt
+        );
+        let heap_end_virt = largest_start_virt
+            .checked_add(heap_size as u64)
+            .unwrap_or(u64::MAX);
+        debug_assert!(
+            heap_end_virt <= paging::KERNEL_HEAP_WINDOW_START
+                || largest_start_virt >= paging::KERNEL_HEAP_WINDOW_END,
+            "Initial direct-map heap must not overlap reserved heap window"
         );
 
         // SAFETY: largest_start_virtはphys_to_virtで変換された有効な仮想アドレス。
