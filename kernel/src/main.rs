@@ -23,7 +23,7 @@ use vitros_kernel::timer;
 use vitros_kernel::usb;
 
 // マクロをインポート
-use vitros_kernel::{error, info, print, println, warn};
+use vitros_kernel::{info, println, warn};
 
 // 後方互換性のためのエイリアス
 use sched as task;
@@ -44,6 +44,10 @@ use vitros_common::uefi;
 
 // カーネル仮想アドレスベース（ブートローダと同じ値）
 const KERNEL_VMA: u64 = 0xFFFF800000000000;
+const INITIAL_HEAP_POOL_MIN_BYTES: usize = 256 * 1024;
+const INITIAL_HEAP_POOL_BASELINE_BYTES: usize = 4 * 1024 * 1024;
+#[cfg(not(feature = "visualize-allocator"))]
+const INITIAL_HEAP_POOL_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 // パニックハンドラ
 #[panic_handler]
@@ -62,6 +66,19 @@ fn hlt() {
     unsafe {
         asm!("hlt");
     }
+}
+
+#[inline]
+fn is_allocator_ram_type(region_type: u32) -> bool {
+    matches!(
+        region_type,
+        uefi::EFI_CONVENTIONAL_MEMORY
+            | uefi::EFI_LOADER_CODE
+            | uefi::EFI_LOADER_DATA
+            | uefi::EFI_BOOT_SERVICES_CODE
+            | uefi::EFI_BOOT_SERVICES_DATA
+            | uefi::EFI_ACPI_RECLAIM_MEMORY
+    )
 }
 
 /// カーネル起動完了マーカー
@@ -214,18 +231,18 @@ extern "C" fn kernel_main_inner(boot_info_phys_addr: u64) -> ! {
     let safe_count = boot_info.memory_map_count.min(boot_info.memory_map.len());
     let mut largest_start_phys: u64 = 0;
     let mut largest_size: usize = 0;
+    let mut total_allocator_ram: u64 = 0;
     for i in 0..safe_count {
         let region = &boot_info.memory_map[i];
+        if is_allocator_ram_type(region.region_type) {
+            total_allocator_ram = total_allocator_ram.saturating_add(region.size);
+        }
         if region.region_type == uefi::EFI_CONVENTIONAL_MEMORY && region.size > largest_size as u64
         {
             largest_start_phys = region.start;
             largest_size = region.size as usize;
         }
     }
-    #[cfg(feature = "visualize-allocator")]
-    let heap_size = largest_size.min(256 * 1024); // 可視化のため256KBに制限
-    #[cfg(not(feature = "visualize-allocator"))]
-    let heap_size = largest_size; // 本番環境では全て使用
 
     // GDTを初期化
     info!("Initializing GDT...");
@@ -241,15 +258,6 @@ extern "C" fn kernel_main_inner(boot_info_phys_addr: u64) -> ! {
     frame_allocator::reserve_range(0, 0x10_0000)
         .expect("Failed to reserve low 1MiB range in frame allocator");
     info!("Reserved low 1MiB range in frame allocator");
-    if heap_size > 0 {
-        frame_allocator::reserve_range(largest_start_phys, heap_size as u64)
-            .expect("Failed to reserve heap range in frame allocator");
-        info!(
-            "Reserved heap range in frame allocator: phys=0x{:X}, size={} KB",
-            largest_start_phys,
-            heap_size / 1024
-        );
-    }
 
     // カーネル用のページテーブルを作成（UEFIメモリマップに基づいて動的にマッピング）
     info!("Creating kernel page tables...");
@@ -262,6 +270,66 @@ extern "C" fn kernel_main_inner(boot_info_phys_addr: u64) -> ! {
     );
     allocator::init_heap_window_manager().expect("Failed to initialize heap window manager");
     info!("Heap window manager initialized");
+
+    #[cfg(feature = "visualize-allocator")]
+    let initial_heap_target = INITIAL_HEAP_POOL_MIN_BYTES;
+    #[cfg(not(feature = "visualize-allocator"))]
+    let initial_heap_target = {
+        let total_ram_usize = usize::try_from(total_allocator_ram).unwrap_or(usize::MAX);
+        (total_ram_usize / 128).clamp(INITIAL_HEAP_POOL_BASELINE_BYTES, INITIAL_HEAP_POOL_MAX_BYTES)
+    };
+    info!(
+        "Initial heap target: {} KB (allocator-eligible RAM: {} MB)",
+        initial_heap_target / 1024,
+        total_allocator_ram / 1024 / 1024
+    );
+
+    let mut attempt_size = initial_heap_target;
+    let mut initial_heap_alloc = None;
+    let mut last_heap_error = None;
+    loop {
+        match allocator::supply_heap_window_pages(attempt_size) {
+            Ok(allocation) => {
+                initial_heap_alloc = Some(allocation);
+                break;
+            }
+            Err(err) => {
+                warn!(
+                    "Initial heap supply failed: size={} KB, error={:?}",
+                    attempt_size / 1024,
+                    err
+                );
+                last_heap_error = Some(err);
+            }
+        }
+
+        if attempt_size <= INITIAL_HEAP_POOL_MIN_BYTES {
+            break;
+        }
+        attempt_size = if attempt_size > INITIAL_HEAP_POOL_BASELINE_BYTES {
+            INITIAL_HEAP_POOL_BASELINE_BYTES
+        } else {
+            (attempt_size / 2).max(INITIAL_HEAP_POOL_MIN_BYTES)
+        };
+    }
+    let initial_heap_alloc = initial_heap_alloc.unwrap_or_else(|| {
+        panic!(
+            "Failed to supply initial heap pool from heap window: {:?}",
+            last_heap_error
+        )
+    });
+    let heap_size = initial_heap_alloc.size_bytes;
+    let heap_start_virt = usize::try_from(initial_heap_alloc.virt_start)
+        .expect("Initial heap virtual address conversion failed");
+    unsafe {
+        allocator::init_heap(heap_start_virt, heap_size);
+    }
+    info!(
+        "Heap initialized: virt=0x{:X}, size={} KB",
+        heap_start_virt,
+        heap_size / 1024
+    );
+
     info!("Kernel page tables created and loaded");
 
     // GDTを高位アドレスで再ロード（念のため）
@@ -334,174 +402,161 @@ extern "C" fn kernel_main_inner(boot_info_phys_addr: u64) -> ! {
     info!("Memory map array len: {}", boot_info.memory_map.len());
     info!("Using safe count: {}", safe_count);
 
-    if largest_size > 0 {
-        info!("Found usable memory");
-
-        // 物理アドレスを高位仮想アドレスに変換
-        let largest_start_virt =
-            paging::phys_to_virt(largest_start_phys).expect("Failed to convert heap address");
+    let largest_start_virt = if largest_size > 0 {
+        paging::phys_to_virt(largest_start_phys).ok()
+    } else {
+        None
+    };
+    if let Some(virt) = largest_start_virt {
         info!(
-            "Heap: phys=0x{:X} virt=0x{:X}",
-            largest_start_phys, largest_start_virt
+            "Largest conventional memory: phys=0x{:X} virt=0x{:X} size={} MB",
+            largest_start_phys,
+            virt,
+            largest_size / 1024 / 1024
         );
-        let heap_end_virt = largest_start_virt
-            .checked_add(heap_size as u64)
-            .unwrap_or(u64::MAX);
-        debug_assert!(
-            heap_end_virt <= paging::KERNEL_HEAP_WINDOW_START
-                || largest_start_virt >= paging::KERNEL_HEAP_WINDOW_END,
-            "Initial direct-map heap must not overlap reserved heap window"
+    }
+
+    // 可視化テストを実行
+    #[cfg(feature = "visualize-allocator")]
+    {
+        info!("Starting allocator visualization");
+        allocator_visualization::on_framebuffer_init_hook(
+            fb_virt_base,
+            boot_info.framebuffer.width,
+            boot_info.framebuffer.height,
         );
+        allocator_visualization::run_visualization_tests();
+    }
 
-        // SAFETY: largest_start_virtはphys_to_virtで変換された有効な仮想アドレス。
-        // heap_sizeはEFI_CONVENTIONAL_MEMORYリージョンのサイズ以下に制限されている。
-        // この領域はUEFIメモリマップで使用可能と報告されており、
-        // カーネルの他の部分では使用されていない。
-        // init_heapは一度だけ呼び出され、以降はグローバルアロケータとして機能する。
-        unsafe {
-            allocator::init_heap(largest_start_virt as usize, heap_size);
-        }
+    info!("Heap initialized successfully");
 
-        // 可視化テストを実行
-        #[cfg(feature = "visualize-allocator")]
-        {
-            info!("Starting allocator visualization");
-            allocator_visualization::on_framebuffer_init_hook(
-                fb_virt_base,
-                boot_info.framebuffer.width,
-                boot_info.framebuffer.height,
-            );
-            allocator_visualization::run_visualization_tests();
-        }
+    // タイマーシステムを初期化（ヒープが必要）
+    const TIMER_FREQUENCY_HZ: u64 = 250;
+    timer::init(TIMER_FREQUENCY_HZ);
 
-        info!("Heap initialized successfully");
+    // APIC Timerを初期化（250Hz = 4msタイムスライス）
+    info!("Initializing APIC Timer...");
+    apic::init_timer(TIMER_FREQUENCY_HZ as u32).expect("Failed to initialize APIC Timer");
 
-        // タイマーシステムを初期化（ヒープが必要）
-        const TIMER_FREQUENCY_HZ: u64 = 250;
-        timer::init(TIMER_FREQUENCY_HZ);
+    // =================================================================
+    // Compositorを初期化
+    // =================================================================
+    info!("Initializing Compositor...");
+    graphics::compositor::init_compositor(graphics::compositor::CompositorConfig {
+        fb_base: fb_virt_base,
+        fb_width: boot_info.framebuffer.width,
+        fb_height: boot_info.framebuffer.height,
+        refresh_interval_ticks: 10,
+    });
+    info!("Compositor initialized");
 
-        // APIC Timerを初期化（250Hz = 4msタイムスライス）
-        info!("Initializing APIC Timer...");
-        apic::init_timer(TIMER_FREQUENCY_HZ as u32).expect("Failed to initialize APIC Timer");
+    // =================================================================
+    // プリエンプティブマルチタスキングのタスクを作成（割り込み無効状態で）
+    // =================================================================
+    info!("Creating tasks for preemptive multitasking...");
 
-        // =================================================================
-        // Compositorを初期化
-        // =================================================================
-        info!("Initializing Compositor...");
-        graphics::compositor::init_compositor(graphics::compositor::CompositorConfig {
-            fb_base: fb_virt_base,
-            fb_width: boot_info.framebuffer.width,
-            fb_height: boot_info.framebuffer.height,
-            refresh_interval_ticks: 10,
-        });
-        info!("Compositor initialized");
+    // Compositorタスク（Realtimeクラス、最高優先度）
+    let compositor = Box::new(
+        task::Task::new_realtime(
+            "Compositor",
+            task::rt_priority::MAX,
+            graphics::compositor::compositor_task,
+        )
+        .expect("Failed to create Compositor task"),
+    );
+    task::add_task(*compositor);
 
-        // =================================================================
-        // プリエンプティブマルチタスキングのタスクを作成（割り込み無効状態で）
-        // =================================================================
-        info!("Creating tasks for preemptive multitasking...");
+    // アイドルタスク（Idleクラス）
+    let idle =
+        Box::new(task::Task::new_idle("Idle", idle_task).expect("Failed to create idle task"));
+    task::add_task(*idle);
 
-        // Compositorタスク（Realtimeクラス、最高優先度）
-        let compositor = Box::new(
-            task::Task::new_realtime(
-                "Compositor",
-                task::rt_priority::MAX,
-                graphics::compositor::compositor_task,
-            )
-            .expect("Failed to create Compositor task"),
+    // 可視化モード: 専用の初期化処理へ（戻らない）
+    #[cfg(feature = "visualize-pipeline")]
+    pipeline_visualization::start_visualization();
+
+    // =================================================================
+    // 通常モード: ワーカータスク・デバッグオーバーレイを登録
+    // =================================================================
+
+    // ワーカータスク1（やや高い優先度）
+    let t1 = Box::new(
+        task::Task::new("Task1", task::nice::DEFAULT - 5, task1)
+            .expect("Failed to create Task1"),
+    );
+    task::add_task(*t1);
+
+    // ワーカータスク2（標準優先度）
+    let t2 = Box::new(
+        task::Task::new("Task2", task::nice::DEFAULT, task2).expect("Failed to create Task2"),
+    );
+    task::add_task(*t2);
+
+    // ワーカータスク3（最低優先度）
+    let t3 = Box::new(
+        task::Task::new("Task3", task::nice::MAX, task3).expect("Failed to create Task3"),
+    );
+    task::add_task(*t3);
+
+    // デバッグオーバーレイタスク（Normalクラス、標準優先度）
+    let debug = Box::new(
+        task::Task::new(
+            "DebugOverlay",
+            task::nice::DEFAULT,
+            debug_overlay::debug_overlay_task,
+        )
+        .expect("Failed to create DebugOverlay task"),
+    );
+    task::add_task(*debug);
+
+    info!("All tasks created. Setting up kernel main task...");
+
+    // kernel_main_innerを表すタスクを作成し、CURRENT_TASKに設定
+    // 注意：entry_pointとしてidle_taskを指定しているが、これは使われない
+    // このタスクはold_contextとして最初のswitch_context()で保存される側なので、
+    // 初期Contextの値（rip=task_wrapper, rdi=idle_task）は上書きされる
+    // 保存されるripは「schedule()から戻るアドレス」になる
+    let kernel_main = Box::new(
+        task::Task::new("KernelMain", task::nice::DEFAULT, idle_task)
+            .expect("Failed to create KernelMain task"),
+    );
+    task::set_current_task(*kernel_main);
+    info!("Kernel main task set as current");
+
+    // 最初のタスクにスケジュール
+    // これ以降、タイマー割り込みで自動的にタスクが切り替わる
+    info!("Calling schedule()...");
+    task::schedule();
+
+    // kernel_main_innerタスクが再スケジュールされた時、ここに戻ってくる
+    // 割り込みを有効化（schedule()から戻ってきた時点では割り込み無効）
+    // SAFETY: sti命令は割り込みフラグ(IF)をセットする特権命令。
+    // この時点でIDT、APIC、タイマーは全て初期化済みであり、
+    // 割り込みを安全に受け付けられる状態にある。
+    unsafe {
+        asm!("sti");
+    }
+
+    info!("Returned from scheduler! KernelMain task rescheduled, entering idle loop...");
+
+    // 通常モード: システム情報表示とテストタイマー登録
+    #[cfg(not(feature = "visualize-pipeline"))]
+    {
+        // TaskWriterで情報を表示（Compositor経由）
+        let region = graphics::Region::new(10, 350, 700, 80);
+        let buffer =
+            graphics::compositor::register_writer(region).expect("Failed to register writer");
+        let mut writer = graphics::TaskWriter::new(buffer, 0xFFFFFFFF);
+
+        let _ = writeln!(
+            writer,
+            "Framebuffer: 0x{:X}, {}x{}",
+            boot_info.framebuffer.base,
+            boot_info.framebuffer.width,
+            boot_info.framebuffer.height
         );
-        task::add_task(*compositor);
-
-        // アイドルタスク（Idleクラス）
-        let idle =
-            Box::new(task::Task::new_idle("Idle", idle_task).expect("Failed to create idle task"));
-        task::add_task(*idle);
-
-        // 可視化モード: 専用の初期化処理へ（戻らない）
-        #[cfg(feature = "visualize-pipeline")]
-        pipeline_visualization::start_visualization();
-
-        // =================================================================
-        // 通常モード: ワーカータスク・デバッグオーバーレイを登録
-        // =================================================================
-
-        // ワーカータスク1（やや高い優先度）
-        let t1 = Box::new(
-            task::Task::new("Task1", task::nice::DEFAULT - 5, task1)
-                .expect("Failed to create Task1"),
-        );
-        task::add_task(*t1);
-
-        // ワーカータスク2（標準優先度）
-        let t2 = Box::new(
-            task::Task::new("Task2", task::nice::DEFAULT, task2).expect("Failed to create Task2"),
-        );
-        task::add_task(*t2);
-
-        // ワーカータスク3（最低優先度）
-        let t3 = Box::new(
-            task::Task::new("Task3", task::nice::MAX, task3).expect("Failed to create Task3"),
-        );
-        task::add_task(*t3);
-
-        // デバッグオーバーレイタスク（Normalクラス、標準優先度）
-        let debug = Box::new(
-            task::Task::new(
-                "DebugOverlay",
-                task::nice::DEFAULT,
-                debug_overlay::debug_overlay_task,
-            )
-            .expect("Failed to create DebugOverlay task"),
-        );
-        task::add_task(*debug);
-
-        info!("All tasks created. Setting up kernel main task...");
-
-        // kernel_main_innerを表すタスクを作成し、CURRENT_TASKに設定
-        // 注意：entry_pointとしてidle_taskを指定しているが、これは使われない
-        // このタスクはold_contextとして最初のswitch_context()で保存される側なので、
-        // 初期Contextの値（rip=task_wrapper, rdi=idle_task）は上書きされる
-        // 保存されるripは「schedule()から戻るアドレス」になる
-        let kernel_main = Box::new(
-            task::Task::new("KernelMain", task::nice::DEFAULT, idle_task)
-                .expect("Failed to create KernelMain task"),
-        );
-        task::set_current_task(*kernel_main);
-        info!("Kernel main task set as current");
-
-        // 最初のタスクにスケジュール
-        // これ以降、タイマー割り込みで自動的にタスクが切り替わる
-        info!("Calling schedule()...");
-        task::schedule();
-
-        // kernel_main_innerタスクが再スケジュールされた時、ここに戻ってくる
-        // 割り込みを有効化（schedule()から戻ってきた時点では割り込み無効）
-        // SAFETY: sti命令は割り込みフラグ(IF)をセットする特権命令。
-        // この時点でIDT、APIC、タイマーは全て初期化済みであり、
-        // 割り込みを安全に受け付けられる状態にある。
-        unsafe {
-            asm!("sti");
-        }
-
-        info!("Returned from scheduler! KernelMain task rescheduled, entering idle loop...");
-
-        // 通常モード: システム情報表示とテストタイマー登録
-        #[cfg(not(feature = "visualize-pipeline"))]
-        {
-            // TaskWriterで情報を表示（Compositor経由）
-            let region = graphics::Region::new(10, 350, 700, 80);
-            let buffer =
-                graphics::compositor::register_writer(region).expect("Failed to register writer");
-            let mut writer = graphics::TaskWriter::new(buffer, 0xFFFFFFFF);
-
-            let _ = writeln!(
-                writer,
-                "Framebuffer: 0x{:X}, {}x{}",
-                boot_info.framebuffer.base,
-                boot_info.framebuffer.width,
-                boot_info.framebuffer.height
-            );
-            let _ = writeln!(writer, "Memory regions: {}", boot_info.memory_map_count);
+        let _ = writeln!(writer, "Memory regions: {}", boot_info.memory_map_count);
+        if let Some(largest_start_virt) = largest_start_virt {
             let _ = writeln!(
                 writer,
                 "Largest usable memory: phys=0x{:X} virt=0x{:X} - 0x{:X} ({} MB)",
@@ -510,48 +565,48 @@ extern "C" fn kernel_main_inner(boot_info_phys_addr: u64) -> ! {
                 largest_start_virt + largest_size as u64,
                 largest_size / 1024 / 1024
             );
-            let _ = writeln!(writer, "Heap initialized: {} KB", heap_size / 1024);
-
-            #[cfg(not(feature = "visualize-allocator"))]
-            {
-                let _ = writeln!(writer, "");
-                let _ = writeln!(writer, "Kernel running...");
-                let _ = writeln!(writer, "System ready.");
-            }
-            // ローカルバッファを共有バッファに一括転送
-            writer.flush();
-
-            // ヒープが初期化されたので、タイマーを登録できる
-            info!("Registering test timers...");
-
-            // 1秒後に実行されるタイマー
-            timer::register_timer(
-                timer::seconds_to_ticks(1),
-                Box::new(|| {
-                    info!("Timer 1: 1 second elapsed!");
-                }),
-            );
-
-            // 2秒後に実行されるタイマー
-            timer::register_timer(
-                timer::seconds_to_ticks(2),
-                Box::new(|| {
-                    info!("Timer 2: 2 seconds elapsed!");
-                }),
-            );
-
-            // 3秒後に実行されるタイマー
-            timer::register_timer(
-                timer::seconds_to_ticks(3),
-                Box::new(|| {
-                    info!("Timer 3: 3 seconds elapsed!");
-                }),
-            );
-
-            info!("Test timers registered");
+        } else {
+            let _ = writeln!(writer, "Largest usable memory: unavailable");
         }
-    } else {
-        error!("No usable memory found!");
+        let _ = writeln!(writer, "Heap initialized: {} KB", heap_size / 1024);
+
+        #[cfg(not(feature = "visualize-allocator"))]
+        {
+            let _ = writeln!(writer, "");
+            let _ = writeln!(writer, "Kernel running...");
+            let _ = writeln!(writer, "System ready.");
+        }
+        // ローカルバッファを共有バッファに一括転送
+        writer.flush();
+
+        // ヒープが初期化されたので、タイマーを登録できる
+        info!("Registering test timers...");
+
+        // 1秒後に実行されるタイマー
+        timer::register_timer(
+            timer::seconds_to_ticks(1),
+            Box::new(|| {
+                info!("Timer 1: 1 second elapsed!");
+            }),
+        );
+
+        // 2秒後に実行されるタイマー
+        timer::register_timer(
+            timer::seconds_to_ticks(2),
+            Box::new(|| {
+                info!("Timer 2: 2 seconds elapsed!");
+            }),
+        );
+
+        // 3秒後に実行されるタイマー
+        timer::register_timer(
+            timer::seconds_to_ticks(3),
+            Box::new(|| {
+                info!("Timer 3: 3 seconds elapsed!");
+            }),
+        );
+
+        info!("Test timers registered");
     }
 
     info!("Entering main loop");

@@ -36,6 +36,67 @@ const MAX_ORDER: usize = 13;
 /// 実際のヒープサイズ（約1GB）に対応
 const MAX_BITMAP_WORDS: usize = 4096;
 
+/// 現行ビットマップ実装が安全に扱えるバディ領域の最大サイズ（1GiB）
+const MAX_BUDDY_REGION_SIZE: usize = MIN_BLOCK_SIZE * 64 * MAX_BITMAP_WORDS;
+
+/// 動的ヒープ拡張の最小単位
+const HEAP_GROW_MIN_CHUNK_BYTES: usize = 2 * 1024 * 1024;
+/// 動的ヒープ拡張の最大単位
+const HEAP_GROW_MAX_CHUNK_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AllocGrowError {
+    HeapWindow(HeapWindowError),
+    BuddyCapacityExceeded {
+        current_bytes: usize,
+        requested_additional_bytes: usize,
+        max_bytes: usize,
+    },
+    NonContiguousRange {
+        expected_start: usize,
+        actual_start: usize,
+    },
+    AddressConversionFailed,
+    RetryAllocFailed,
+    AllocatorNotInitialized,
+    InvalidRequest,
+}
+
+impl core::fmt::Display for AllocGrowError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            AllocGrowError::HeapWindow(err) => write!(f, "Heap window supply failed: {}", err),
+            AllocGrowError::BuddyCapacityExceeded {
+                current_bytes,
+                requested_additional_bytes,
+                max_bytes,
+            } => write!(
+                f,
+                "Buddy capacity exceeded: current={} requested_additional={} max={}",
+                current_bytes, requested_additional_bytes, max_bytes
+            ),
+            AllocGrowError::NonContiguousRange {
+                expected_start,
+                actual_start,
+            } => write!(
+                f,
+                "Non-contiguous heap growth: expected_start=0x{:X}, actual_start=0x{:X}",
+                expected_start, actual_start
+            ),
+            AllocGrowError::AddressConversionFailed => write!(f, "Address conversion failed"),
+            AllocGrowError::RetryAllocFailed => write!(f, "Allocation retry failed after grow"),
+            AllocGrowError::AllocatorNotInitialized => write!(f, "Allocator not initialized"),
+            AllocGrowError::InvalidRequest => write!(f, "Invalid heap grow request"),
+        }
+    }
+}
+
+impl From<HeapWindowError> for AllocGrowError {
+    fn from(value: HeapWindowError) -> Self {
+        AllocGrowError::HeapWindow(value)
+    }
+}
+
 /// フリーブロックノード（双方向リンクリスト）
 #[repr(C)]
 struct BuddyFreeNode {
@@ -97,6 +158,12 @@ impl BuddyAllocator {
     pub fn region_start(&self) -> usize {
         // SAFETY: シングルコアシステムのため、データ競合は発生しない
         unsafe { *self.region_start.get() }
+    }
+
+    /// バディ領域サイズを取得
+    pub fn region_size(&self) -> usize {
+        // SAFETY: シングルコアシステムのため、データ競合は発生しない
+        unsafe { *self.region_size.get() }
     }
 
     // =========================================================================
@@ -311,6 +378,10 @@ impl BuddyAllocator {
             *self.region_start.get() = aligned_start;
             *self.region_size.get() = aligned_size;
         }
+        debug_assert!(
+            aligned_size <= MAX_BUDDY_REGION_SIZE,
+            "buddy region exceeds bitmap capacity"
+        );
 
         info!(
             "Buddy allocator region: 0x{:X} - 0x{:X} ({} MB)",
@@ -359,6 +430,72 @@ impl BuddyAllocator {
                 );
             }
         }
+    }
+
+    pub fn extend_contiguous(
+        &self,
+        extension_start: usize,
+        extension_size: usize,
+    ) -> Result<usize, AllocGrowError> {
+        without_interrupts(|| unsafe {
+            let region_start = *self.region_start.get();
+            let region_size = *self.region_size.get();
+            if region_size == 0 {
+                return Err(AllocGrowError::AllocatorNotInitialized);
+            }
+
+            let current_end = region_start
+                .checked_add(region_size)
+                .ok_or(AllocGrowError::AddressConversionFailed)?;
+            let extension_end = extension_start
+                .checked_add(extension_size)
+                .ok_or(AllocGrowError::AddressConversionFailed)?;
+
+            let aligned_start = align_up(extension_start, MIN_BLOCK_SIZE);
+            let aligned_end = align_down(extension_end, MIN_BLOCK_SIZE);
+            let aligned_size = aligned_end.saturating_sub(aligned_start);
+            if aligned_size < MIN_BLOCK_SIZE {
+                return Err(AllocGrowError::InvalidRequest);
+            }
+
+            if aligned_start != current_end {
+                return Err(AllocGrowError::NonContiguousRange {
+                    expected_start: current_end,
+                    actual_start: aligned_start,
+                });
+            }
+
+            let new_region_size = region_size
+                .checked_add(aligned_size)
+                .ok_or(AllocGrowError::AddressConversionFailed)?;
+            if new_region_size > MAX_BUDDY_REGION_SIZE {
+                return Err(AllocGrowError::BuddyCapacityExceeded {
+                    current_bytes: region_size,
+                    requested_additional_bytes: aligned_size,
+                    max_bytes: MAX_BUDDY_REGION_SIZE,
+                });
+            }
+
+            let mut current = aligned_start;
+            let mut remaining = aligned_size;
+            while remaining >= MIN_BLOCK_SIZE {
+                let max_order_by_size = Self::max_order_for_size(remaining).min(MAX_ORDER - 1);
+                let relative = current - region_start;
+                let max_order_by_align = if relative == 0 {
+                    MAX_ORDER - 1
+                } else {
+                    (relative.trailing_zeros()).saturating_sub(MIN_BLOCK_SIZE_LOG2) as usize
+                };
+                let order = max_order_by_size.min(max_order_by_align);
+                let block_size = Self::order_to_size(order);
+                self.add_to_free_list(current, order);
+                current += block_size;
+                remaining -= block_size;
+            }
+
+            *self.region_size.get() = new_region_size;
+            Ok(aligned_size)
+        })
     }
 
     /// 指定オーダーのフリーブロック数をカウント（デバッグ用）
@@ -544,6 +681,9 @@ pub struct KernelAllocator {
     slab_caches: [SlabCache; NUM_SIZE_CLASSES],
     // 大きなサイズ用（4KB超）
     buddy: BuddyAllocator,
+    heap_total_bytes: UnsafeCell<usize>,
+    last_grow_error: UnsafeCell<Option<AllocGrowError>>,
+    grow_attempts: UnsafeCell<usize>,
 }
 
 impl KernelAllocator {
@@ -562,11 +702,20 @@ impl KernelAllocator {
                 SlabCache::new(SIZE_CLASSES[9]),
             ],
             buddy: BuddyAllocator::new(),
+            heap_total_bytes: UnsafeCell::new(0),
+            last_grow_error: UnsafeCell::new(None),
+            grow_attempts: UnsafeCell::new(0),
         }
     }
 
     // ヒープを初期化
     pub unsafe fn init(&self, heap_start: usize, heap_size: usize) {
+        unsafe {
+            *self.heap_total_bytes.get() = heap_size;
+            *self.last_grow_error.get() = None;
+            *self.grow_attempts.get() = 0;
+        }
+
         info!("Initializing Kernel Allocator...");
         info!(
             "Heap: 0x{:X} - 0x{:X} ({} MB)",
@@ -604,6 +753,128 @@ impl KernelAllocator {
         info!("Kernel Allocator initialized successfully");
     }
 
+    fn clear_last_grow_error(&self) {
+        without_interrupts(|| unsafe {
+            *self.last_grow_error.get() = None;
+        });
+    }
+
+    fn set_last_grow_error(&self, error: AllocGrowError) {
+        without_interrupts(|| unsafe {
+            *self.last_grow_error.get() = Some(error);
+        });
+    }
+
+    fn heap_total_bytes(&self) -> usize {
+        without_interrupts(|| unsafe { *self.heap_total_bytes.get() })
+    }
+
+    fn bump_grow_attempts(&self) {
+        without_interrupts(|| unsafe {
+            *self.grow_attempts.get() = (*self.grow_attempts.get()).saturating_add(1);
+        });
+    }
+
+    fn compute_grow_bytes(&self, min_bytes: usize) -> Result<usize, AllocGrowError> {
+        if min_bytes == 0 {
+            return Err(AllocGrowError::InvalidRequest);
+        }
+
+        let aligned_min = checked_align_up(min_bytes, MIN_BLOCK_SIZE).ok_or(AllocGrowError::InvalidRequest)?;
+        let heap_total = self.heap_total_bytes();
+        let dynamic_target = heap_total / 8;
+        let grow = aligned_min
+            .max(dynamic_target)
+            .max(HEAP_GROW_MIN_CHUNK_BYTES)
+            .min(HEAP_GROW_MAX_CHUNK_BYTES);
+        checked_align_up(grow, MIN_BLOCK_SIZE).ok_or(AllocGrowError::InvalidRequest)
+    }
+
+    pub fn try_grow_heap(&self, min_bytes: usize) -> Result<(), AllocGrowError> {
+        self.bump_grow_attempts();
+
+        let grow_bytes = match self.compute_grow_bytes(min_bytes) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                self.set_last_grow_error(err);
+                return Err(err);
+            }
+        };
+
+        let current_buddy_size = self.buddy.region_size();
+        if current_buddy_size == 0 {
+            let err = AllocGrowError::AllocatorNotInitialized;
+            self.set_last_grow_error(err);
+            return Err(err);
+        }
+        if current_buddy_size.saturating_add(grow_bytes) > MAX_BUDDY_REGION_SIZE {
+            let err = AllocGrowError::BuddyCapacityExceeded {
+                current_bytes: current_buddy_size,
+                requested_additional_bytes: grow_bytes,
+                max_bytes: MAX_BUDDY_REGION_SIZE,
+            };
+            self.set_last_grow_error(err);
+            return Err(err);
+        }
+
+        let allocation = match self.request_grow_pages(grow_bytes) {
+            Ok(allocation) => allocation,
+            Err(err) => {
+                self.set_last_grow_error(err);
+                return Err(err);
+            }
+        };
+
+        let grow_start = match usize::try_from(allocation.virt_start) {
+            Ok(addr) => addr,
+            Err(_) => {
+                let err = AllocGrowError::AddressConversionFailed;
+                self.set_last_grow_error(err);
+                return Err(err);
+            }
+        };
+
+        let added = match self.buddy.extend_contiguous(grow_start, allocation.size_bytes) {
+            Ok(added) => added,
+            Err(err) => {
+                self.set_last_grow_error(err);
+                return Err(err);
+            }
+        };
+
+        without_interrupts(|| unsafe {
+            *self.heap_total_bytes.get() = (*self.heap_total_bytes.get()).saturating_add(added);
+        });
+        self.clear_last_grow_error();
+        info!(
+            "Heap grown successfully: start=0x{:X}, added={} KB, total={} KB",
+            grow_start,
+            added / 1024,
+            self.heap_total_bytes() / 1024
+        );
+        Ok(())
+    }
+
+    fn request_grow_pages(&self, grow_bytes: usize) -> Result<HeapWindowAllocation, AllocGrowError> {
+        #[cfg(test)]
+        {
+            if let Some(supplier) = *TEST_GROW_SUPPLIER.lock() {
+                return supplier(grow_bytes);
+            }
+        }
+
+        supply_heap_window_pages(grow_bytes).map_err(AllocGrowError::HeapWindow)
+    }
+
+    fn last_grow_error(&self) -> Option<AllocGrowError> {
+        without_interrupts(|| unsafe { *self.last_grow_error.get() })
+    }
+
+    #[cfg(test)]
+    fn test_grow_attempts(&self) -> usize {
+        without_interrupts(|| unsafe { *self.grow_attempts.get() })
+    }
+
     // サイズからサイズクラスのインデックスを取得（O(1)）
     fn size_to_class(size: usize) -> Option<usize> {
         if size == 0 {
@@ -618,14 +889,8 @@ impl KernelAllocator {
         let class_idx = bits.saturating_sub(MIN_SLAB_SIZE_LOG2) as usize;
         Some(class_idx)
     }
-}
 
-// GlobalAlloc トレイトを実装
-unsafe impl GlobalAlloc for KernelAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let size = layout.size().max(layout.align());
-
-        // サイズクラスを探す（4KB以下はスラブ）
+    unsafe fn allocate_once(&self, layout: Layout, size: usize) -> *mut u8 {
         if let Some(class_idx) = Self::size_to_class(size)
             && let Some(ptr) = unsafe { self.slab_caches[class_idx].allocate() }
         {
@@ -633,10 +898,34 @@ unsafe impl GlobalAlloc for KernelAllocator {
             return ptr.as_ptr();
         }
 
-        // スラブから割り当てできない場合はバディアロケータを使用
         unsafe { self.buddy.allocate(layout) }
             .map(|ptr| ptr.as_ptr())
             .unwrap_or(null_mut())
+    }
+}
+
+// GlobalAlloc トレイトを実装
+unsafe impl GlobalAlloc for KernelAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let size = layout.size().max(layout.align());
+        let first_try = unsafe { self.allocate_once(layout, size) };
+        if !first_try.is_null() {
+            self.clear_last_grow_error();
+            return first_try;
+        }
+
+        if let Err(err) = self.try_grow_heap(size.max(MIN_BLOCK_SIZE)) {
+            self.set_last_grow_error(err);
+            return null_mut();
+        }
+
+        let retry = unsafe { self.allocate_once(layout, size) };
+        if retry.is_null() {
+            self.set_last_grow_error(AllocGrowError::RetryAllocFailed);
+        } else {
+            self.clear_last_grow_error();
+        }
+        retry
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
@@ -681,6 +970,10 @@ fn align_up(addr: usize, align: usize) -> usize {
     (addr + align - 1) & !(align - 1)
 }
 
+fn checked_align_up(addr: usize, align: usize) -> Option<usize> {
+    addr.checked_add(align - 1).map(|value| value & !(align - 1))
+}
+
 // アドレスをアラインメントに合わせて切り下げ
 fn align_down(addr: usize, align: usize) -> usize {
     addr & !(align - 1)
@@ -689,6 +982,12 @@ fn align_down(addr: usize, align: usize) -> usize {
 // グローバルアロケータを登録
 #[global_allocator]
 static ALLOCATOR: KernelAllocator = KernelAllocator::new();
+
+#[cfg(test)]
+type TestGrowSupplier = fn(usize) -> Result<HeapWindowAllocation, AllocGrowError>;
+
+#[cfg(test)]
+static TEST_GROW_SUPPLIER: spin::Mutex<Option<TestGrowSupplier>> = spin::Mutex::new(None);
 
 // アロケータを初期化する公開関数
 pub unsafe fn init_heap(heap_start: usize, heap_size: usize) {
@@ -703,6 +1002,14 @@ pub fn init_heap_window_manager() -> Result<(), HeapWindowError> {
 
 pub fn supply_heap_window_pages(min_bytes: usize) -> Result<HeapWindowAllocation, HeapWindowError> {
     crate::heap_window::supply_pages(min_bytes)
+}
+
+pub fn try_grow_heap(min_bytes: usize) -> Result<(), AllocGrowError> {
+    ALLOCATOR.try_grow_heap(min_bytes)
+}
+
+pub fn last_alloc_grow_error() -> Option<AllocGrowError> {
+    ALLOCATOR.last_grow_error()
 }
 
 // =============================================================================
@@ -800,6 +1107,49 @@ pub fn init_test_heap() {
     }
 }
 
+#[cfg(test)]
+fn test_set_grow_supplier(supplier: Option<TestGrowSupplier>) {
+    *TEST_GROW_SUPPLIER.lock() = supplier;
+}
+
+#[cfg(test)]
+impl BuddyAllocator {
+    fn reset_for_test(&self) {
+        without_interrupts(|| unsafe {
+            for order in 0..MAX_ORDER {
+                *self.free_lists[order].get() = None;
+                *self.free_bitmaps[order].get() = [0u64; MAX_BITMAP_WORDS];
+            }
+            *self.region_start.get() = 0;
+            *self.region_size.get() = 0;
+        });
+    }
+}
+
+#[cfg(test)]
+impl KernelAllocator {
+    fn reset_for_test(&self) {
+        without_interrupts(|| unsafe {
+            for cache in &self.slab_caches {
+                *cache.free_list.get() = None;
+            }
+            *self.heap_total_bytes.get() = 0;
+            *self.last_grow_error.get() = None;
+            *self.grow_attempts.get() = 0;
+        });
+        self.buddy.reset_for_test();
+    }
+
+    fn test_force_buddy_state_for_capacity_check(&self, region_start: usize, region_size: usize) {
+        without_interrupts(|| unsafe {
+            *self.buddy.region_start.get() = region_start;
+            *self.buddy.region_size.get() = region_size;
+            *self.heap_total_bytes.get() = region_size.saturating_mul(2);
+            *self.last_grow_error.get() = None;
+        });
+    }
+}
+
 // =============================================================================
 // ビットマップ関連テスト
 // =============================================================================
@@ -883,6 +1233,151 @@ mod bitmap_tests {
             // 解放後、再割り当てが成功することを確認（ビットマップが正しく更新されていれば成功する）
             let ptr2 = ALLOCATOR.buddy.allocate(layout);
             assert!(ptr2.is_some(), "再割り当てが成功すべき");
+        }
+    }
+}
+
+#[cfg(test)]
+mod growth_tests {
+    use super::*;
+    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    static TEST_GROW_ALLOCATOR: KernelAllocator = KernelAllocator::new();
+    #[repr(C, align(4096))]
+    struct GrowArena([u8; 3 * 1024 * 1024]);
+    static mut GROW_ARENA: GrowArena = GrowArena([0; 3 * 1024 * 1024]);
+    static NEXT_OFFSET: AtomicUsize = AtomicUsize::new(0);
+    static MAX_OFFSET: AtomicUsize = AtomicUsize::new(0);
+    static FORCE_OOM: AtomicBool = AtomicBool::new(false);
+
+    fn test_supplier(min_bytes: usize) -> Result<HeapWindowAllocation, AllocGrowError> {
+        let alloc_bytes =
+            checked_align_up(min_bytes, MIN_BLOCK_SIZE).ok_or(AllocGrowError::InvalidRequest)?;
+        let requested_pages = alloc_bytes / MIN_BLOCK_SIZE;
+        if FORCE_OOM.load(Ordering::Acquire) {
+            return Err(AllocGrowError::HeapWindow(HeapWindowError::FrameOutOfMemory {
+                requested_pages,
+                mapped_pages: 0,
+            }));
+        }
+
+        let alloc_offset = loop {
+            let current = NEXT_OFFSET.load(Ordering::Acquire);
+            let next = current.checked_add(alloc_bytes).ok_or(AllocGrowError::InvalidRequest)?;
+            if next > MAX_OFFSET.load(Ordering::Acquire) {
+                return Err(AllocGrowError::HeapWindow(HeapWindowError::FrameOutOfMemory {
+                    requested_pages,
+                    mapped_pages: 0,
+                }));
+            }
+            if NEXT_OFFSET
+                .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break current;
+            }
+        };
+
+        let arena_start = core::ptr::addr_of!(GROW_ARENA) as usize;
+        Ok(HeapWindowAllocation {
+            virt_start: (arena_start + alloc_offset) as u64,
+            page_count: requested_pages,
+            size_bytes: alloc_bytes,
+        })
+    }
+
+    fn setup_local_growth_allocator(initial_bytes: usize, max_bytes: usize, force_oom: bool) {
+        TEST_GROW_ALLOCATOR.reset_for_test();
+        test_set_grow_supplier(Some(test_supplier));
+        FORCE_OOM.store(force_oom, Ordering::Release);
+        NEXT_OFFSET.store(initial_bytes, Ordering::Release);
+        MAX_OFFSET.store(max_bytes, Ordering::Release);
+        let arena_start = core::ptr::addr_of!(GROW_ARENA) as usize;
+        unsafe {
+            TEST_GROW_ALLOCATOR.init(arena_start, initial_bytes);
+        }
+    }
+
+    #[test_case]
+    fn test_global_alloc_grows_and_retries_once() {
+        setup_local_growth_allocator(256 * 1024, 3 * 1024 * 1024, false);
+
+        let layout = Layout::from_size_align(4096, 4096).unwrap();
+        let mut growth_triggered = false;
+
+        for _ in 0..1024 {
+            let ptr = unsafe { <KernelAllocator as GlobalAlloc>::alloc(&TEST_GROW_ALLOCATOR, layout) };
+            if TEST_GROW_ALLOCATOR.test_grow_attempts() > 0 {
+                growth_triggered = true;
+                assert!(!ptr.is_null(), "allocation should succeed after grow retry");
+                break;
+            }
+            assert!(!ptr.is_null(), "allocation should succeed before growth is needed");
+        }
+
+        assert!(growth_triggered, "grow path should be triggered at least once");
+        assert_eq!(TEST_GROW_ALLOCATOR.last_grow_error(), None);
+        test_set_grow_supplier(None);
+    }
+
+    #[test_case]
+    fn test_global_alloc_oom_returns_null_and_records_error() {
+        setup_local_growth_allocator(256 * 1024, 256 * 1024, true);
+
+        let layout = Layout::from_size_align(4096, 4096).unwrap();
+        let mut saw_null = false;
+
+        for _ in 0..256 {
+            let ptr = unsafe { <KernelAllocator as GlobalAlloc>::alloc(&TEST_GROW_ALLOCATOR, layout) };
+            if ptr.is_null() {
+                saw_null = true;
+                break;
+            }
+        }
+
+        assert!(saw_null, "allocator should eventually fail with null under OOM");
+        assert!(TEST_GROW_ALLOCATOR.test_grow_attempts() >= 1);
+        match TEST_GROW_ALLOCATOR.last_grow_error() {
+            Some(AllocGrowError::HeapWindow(HeapWindowError::FrameOutOfMemory { .. })) => {}
+            other => panic!("unexpected grow error: {:?}", other),
+        }
+        test_set_grow_supplier(None);
+    }
+
+    #[test_case]
+    fn test_global_alloc_retries_growth_only_once_per_call() {
+        setup_local_growth_allocator(256 * 1024, 256 * 1024, true);
+
+        let layout = Layout::from_size_align(4096, 4096).unwrap();
+
+        loop {
+            let ptr = unsafe { <KernelAllocator as GlobalAlloc>::alloc(&TEST_GROW_ALLOCATOR, layout) };
+            if ptr.is_null() {
+                break;
+            }
+        }
+
+        let before = TEST_GROW_ALLOCATOR.test_grow_attempts();
+        let ptr = unsafe { <KernelAllocator as GlobalAlloc>::alloc(&TEST_GROW_ALLOCATOR, layout) };
+        let after = TEST_GROW_ALLOCATOR.test_grow_attempts();
+
+        assert!(ptr.is_null(), "allocation should still fail under persistent OOM");
+        assert_eq!(after, before + 1, "exactly one grow retry should run per alloc call");
+        test_set_grow_supplier(None);
+    }
+
+    #[test_case]
+    fn test_try_grow_heap_capacity_guard() {
+        test_set_grow_supplier(None);
+        TEST_GROW_ALLOCATOR.reset_for_test();
+        TEST_GROW_ALLOCATOR.test_force_buddy_state_for_capacity_check(0x1000, MAX_BUDDY_REGION_SIZE);
+
+        let err = TEST_GROW_ALLOCATOR
+            .try_grow_heap(MIN_BLOCK_SIZE)
+            .expect_err("growth should fail by capacity guard");
+        match err {
+            AllocGrowError::BuddyCapacityExceeded { .. } => {}
+            _ => panic!("unexpected error: {:?}", err),
         }
     }
 }
