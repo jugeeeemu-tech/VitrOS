@@ -20,6 +20,7 @@ pub mod dma;
 pub mod frame_allocator;
 pub mod gdt;
 pub mod graphics;
+pub mod heap_window;
 pub mod hpet;
 pub mod idt;
 pub mod io;

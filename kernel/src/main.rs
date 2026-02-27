@@ -260,6 +260,8 @@ extern "C" fn kernel_main_inner(boot_info_phys_addr: u64) -> ! {
         paging::KERNEL_HEAP_WINDOW_END,
         paging::KERNEL_HEAP_WINDOW_SIZE >> 30
     );
+    allocator::init_heap_window_manager().expect("Failed to initialize heap window manager");
+    info!("Heap window manager initialized");
     info!("Kernel page tables created and loaded");
 
     // GDTを高位アドレスで再ロード（念のため）

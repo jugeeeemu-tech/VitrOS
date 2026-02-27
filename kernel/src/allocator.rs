@@ -5,6 +5,7 @@ use core::ptr::{NonNull, null_mut};
 
 use crate::info;
 use crate::io::without_interrupts;
+pub use crate::heap_window::{HeapWindowAllocation, HeapWindowError};
 
 // サイズクラス（8バイト～4096バイト）
 // 4096Bはスラブの最大サイズ。スラブが枯渇した場合はバディにフォールバック
@@ -694,6 +695,14 @@ pub unsafe fn init_heap(heap_start: usize, heap_size: usize) {
     unsafe {
         ALLOCATOR.init(heap_start, heap_size);
     }
+}
+
+pub fn init_heap_window_manager() -> Result<(), HeapWindowError> {
+    crate::heap_window::init_manager()
+}
+
+pub fn supply_heap_window_pages(min_bytes: usize) -> Result<HeapWindowAllocation, HeapWindowError> {
+    crate::heap_window::supply_pages(min_bytes)
 }
 
 // =============================================================================

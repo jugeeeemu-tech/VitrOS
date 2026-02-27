@@ -769,6 +769,13 @@ pub fn init(boot_info: &vitros_common::boot_info::BootInfo) -> Result<(), Paging
 /// RFLAGS の IF (Interrupt Flag) ビット（ビット9）
 const RFLAGS_IF: u64 = 1 << 9;
 
+#[cfg(test)]
+static MAP_KERNEL_PAGE_FAIL_AFTER_SUCCESS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(usize::MAX);
+#[cfg(test)]
+static MAP_KERNEL_PAGE_SUCCESS_COUNT: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
 /// 割り込みが無効であることを確認
 ///
 /// スレッドセーフティのため、ページテーブル操作は割り込み無効状態で
@@ -1030,6 +1037,19 @@ pub fn map_kernel_page_at(
         return Err(PagingError::InvalidAddress);
     }
 
+    #[cfg(test)]
+    {
+        use core::sync::atomic::Ordering;
+
+        let fail_after = MAP_KERNEL_PAGE_FAIL_AFTER_SUCCESS.load(Ordering::Relaxed);
+        if fail_after != usize::MAX {
+            let current_success = MAP_KERNEL_PAGE_SUCCESS_COUNT.load(Ordering::Relaxed);
+            if current_success >= fail_after {
+                return Err(PagingError::FrameAllocationFailed);
+            }
+        }
+    }
+
     let (pml4_idx, pdp_idx, pd_idx, pt_idx) = table_indices_from_virt(virt_addr)?;
     let map_flags =
         PageTableFlags::Present as u64 | PageTableFlags::Writable as u64 | additional_flags;
@@ -1045,6 +1065,12 @@ pub fn map_kernel_page_at(
         }
         entry.set(phys_addr, map_flags);
         reload_cr3();
+    }
+
+    #[cfg(test)]
+    {
+        use core::sync::atomic::Ordering;
+        MAP_KERNEL_PAGE_SUCCESS_COUNT.fetch_add(1, Ordering::Relaxed);
     }
 
     Ok(())
@@ -1104,6 +1130,31 @@ pub fn unmap_kernel_page_at(virt_addr: u64) -> Result<u64, PagingError> {
 
         Ok(mapped_phys)
     }
+}
+
+#[cfg(test)]
+pub(crate) fn test_set_map_kernel_page_fail_after(success_count: usize) {
+    use core::sync::atomic::Ordering;
+
+    MAP_KERNEL_PAGE_SUCCESS_COUNT.store(0, Ordering::Relaxed);
+    MAP_KERNEL_PAGE_FAIL_AFTER_SUCCESS.store(success_count, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn test_clear_map_kernel_page_failpoint() {
+    use core::sync::atomic::Ordering;
+
+    MAP_KERNEL_PAGE_FAIL_AFTER_SUCCESS.store(usize::MAX, Ordering::Relaxed);
+    MAP_KERNEL_PAGE_SUCCESS_COUNT.store(0, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn test_reset_page_tables_for_test() {
+    unsafe {
+        let pml4 = addr_of_mut!(KERNEL_PML4);
+        (*pml4).clear();
+    }
+    test_clear_map_kernel_page_failpoint();
 }
 
 /// MMIO領域をUC（Uncacheable）属性でマッピングする
@@ -1651,6 +1702,7 @@ mod tests {
 
     fn setup_table_allocator_for_test() {
         crate::frame_allocator::reset_for_test();
+        test_clear_map_kernel_page_failpoint();
 
         let mut boot_info = BootInfo::new();
         boot_info.memory_map[0] = MemoryRegion {
@@ -1662,11 +1714,7 @@ mod tests {
         boot_info.max_physical_address = TEST_TABLE_ALLOC_REGION_SIZE;
 
         crate::frame_allocator::init(&boot_info).expect("frame allocator init failed");
-
-        unsafe {
-            let pml4 = addr_of_mut!(KERNEL_PML4);
-            (*pml4).clear();
-        }
+        test_reset_page_tables_for_test();
     }
 
     #[test_case]
