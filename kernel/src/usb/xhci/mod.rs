@@ -1,6 +1,9 @@
 //! xHCI (USB 3.x) コントローラドライバ
 
+pub mod dma;
 pub mod registers;
+
+use core::ptr::{addr_of, read_volatile};
 
 use crate::info;
 use crate::paging;
@@ -16,6 +19,7 @@ pub enum XhciError {
     InvalidBar,
     BarNotMemory,
     MmioMappingFailed,
+    UnsupportedPageSize,
 }
 
 pub struct XhciController {
@@ -23,6 +27,7 @@ pub struct XhciController {
     pub mmio_phys_base: u64,
     pub mmio_virt_base: u64,
     pub mmio_size: u64,
+    pub dma: dma::XhciDmaProfile,
 }
 
 fn find_xhci_controller() -> Option<PciDevice> {
@@ -62,10 +67,32 @@ pub fn init() -> Result<XhciController, XhciError> {
         mmio_phys_base, mmio_virt_base
     );
 
+    let cap_regs = mmio_virt_base as *const registers::CapabilityRegisters;
+    let caplength = unsafe {
+        // SAFETY: xHCI MMIO space is mapped and CAPLENGTH is a read-only register field.
+        read_volatile(addr_of!((*cap_regs).caplength))
+    };
+    let hccparams1 = unsafe {
+        // SAFETY: xHCI MMIO space is mapped and HCCPARAMS1 is a read-only register field.
+        read_volatile(addr_of!((*cap_regs).hccparams1))
+    };
+
+    let op_regs = (mmio_virt_base + u64::from(caplength)) as *const registers::OperationalRegisters;
+    let pagesize = unsafe {
+        // SAFETY: Operational registers begin at MMIO base + CAPLENGTH and PAGESIZE is read-only here.
+        read_volatile(addr_of!((*op_regs).pagesize))
+    };
+    if !registers::pagesize::supports_4k(pagesize) {
+        return Err(XhciError::UnsupportedPageSize);
+    }
+
+    let dma = dma::XhciDmaProfile::new(registers::hccparams1::ac64(hccparams1), paging::PAGE_SIZE);
+
     Ok(XhciController {
         device,
         mmio_phys_base,
         mmio_virt_base,
         mmio_size,
+        dma,
     })
 }

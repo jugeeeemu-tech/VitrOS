@@ -195,6 +195,14 @@ pub mod hccparams1 {
     }
 }
 
+/// PAGESIZE register helpers.
+pub mod pagesize {
+    #[inline]
+    pub const fn supports_4k(v: u32) -> bool {
+        (v & 1) != 0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,7 +227,10 @@ mod tests {
         let hi = 0x15u32;
         let lo = 0x0bu32;
         let v = (hi << 21) | (lo << 27);
-        assert_eq!(hcsparams2::max_scratchpad_buffers(v), ((hi << 5) | lo) as usize);
+        assert_eq!(
+            hcsparams2::max_scratchpad_buffers(v),
+            ((hi << 5) | lo) as usize
+        );
     }
 
     #[test_case]
@@ -232,6 +243,13 @@ mod tests {
         assert!(hccparams1::ac64(v));
         assert!(hccparams1::csz(v));
         assert_eq!(hccparams1::context_size(v), 64);
+    }
+
+    #[test_case]
+    fn test_pagesize_supports_4k() {
+        assert!(!pagesize::supports_4k(0));
+        assert!(pagesize::supports_4k(1));
+        assert!(pagesize::supports_4k(0b1010_0001));
     }
 
     #[test_case]
