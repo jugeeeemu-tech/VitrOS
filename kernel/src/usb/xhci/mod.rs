@@ -1,6 +1,7 @@
 //! xHCI (USB 3.x) コントローラドライバ
 
 pub mod dma;
+pub mod memory;
 pub mod registers;
 
 use core::ptr::{addr_of, read_volatile};
