@@ -1,7 +1,5 @@
 //! xHCI event definitions and software event queue.
 
-use alloc::vec::Vec;
-
 use super::trb::{Trb, trb_type};
 
 const COMPLETION_CODE_SHIFT: u32 = 24;
@@ -94,10 +92,11 @@ impl Event {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) type PendingEventQueue = EventQueue<PENDING_EVENT_CAPACITY>;
 
 pub(crate) struct EventQueue<const N: usize> {
-    entries: Vec<Option<Event>>,
+    entries: [Option<Event>; N],
     head: usize,
     tail: usize,
     len: usize,
@@ -106,11 +105,8 @@ pub(crate) struct EventQueue<const N: usize> {
 
 impl<const N: usize> EventQueue<N> {
     pub fn new() -> Self {
-        let mut entries = Vec::with_capacity(N);
-        entries.resize(N, None);
-
         Self {
-            entries,
+            entries: [None; N],
             head: 0,
             tail: 0,
             len: 0,

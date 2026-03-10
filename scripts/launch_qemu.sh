@@ -70,7 +70,8 @@ qemu-system-x86_64 \
     -bios /usr/share/ovmf/OVMF.fd \
     -drive format=raw,file=fat:rw:mnt \
     -device isa-debug-exit,iobase=0xf4,iosize=0x01 \
-    -device qemu-xhci \
+    -device qemu-xhci,id=xhci \
+    -device usb-kbd,bus=xhci.0 \
     -chardev stdio,id=char_com1,mux=on,logfile=serial.log \
     -serial chardev:char_com1 \
     -mon chardev=char_com1 \

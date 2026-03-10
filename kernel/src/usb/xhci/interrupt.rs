@@ -33,6 +33,7 @@ extern "C" fn xhci_interrupt_handler() {
 
 extern "C" fn xhci_interrupt_handler_inner() {
     let _ = usb::with_xhci_controller_irq(|controller| controller.handle_interrupt());
+    usb::signal_xhci_worker();
     apic::send_eoi();
 }
 

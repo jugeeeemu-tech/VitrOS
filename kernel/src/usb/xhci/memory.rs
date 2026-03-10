@@ -23,6 +23,7 @@ pub enum XhciMemoryError {
     SizeOverflow,
     EmptyEventRingSegments,
     ZeroScratchpadCount,
+    InvalidSlotId(u8),
 }
 
 impl core::fmt::Display for XhciMemoryError {
@@ -37,6 +38,9 @@ impl core::fmt::Display for XhciMemoryError {
             }
             XhciMemoryError::ZeroScratchpadCount => {
                 write!(f, "scratchpad set requires at least one buffer")
+            }
+            XhciMemoryError::InvalidSlotId(slot_id) => {
+                write!(f, "invalid xHCI slot id {}", slot_id)
             }
         }
     }
@@ -76,6 +80,24 @@ impl Dcbaa {
 
     pub fn entry_count(&self) -> usize {
         self.entry_count
+    }
+
+    pub fn set_device_context(
+        &mut self,
+        slot_id: u8,
+        phys_addr: u64,
+    ) -> Result<(), XhciMemoryError> {
+        let index = usize::from(slot_id);
+        if slot_id == 0 || index >= self.entry_count {
+            return Err(XhciMemoryError::InvalidSlotId(slot_id));
+        }
+
+        self.entries_mut()[index] = phys_addr;
+        Ok(())
+    }
+
+    pub fn clear_device_context(&mut self, slot_id: u8) -> Result<(), XhciMemoryError> {
+        self.set_device_context(slot_id, 0)
     }
 
     pub fn set_scratchpad_array(&mut self, scratchpad: Option<&ScratchpadSet>) {
@@ -319,6 +341,49 @@ mod tests {
 
         dcbaa.set_scratchpad_array(None);
         assert!(dcbaa.entries().iter().all(|entry| *entry == 0));
+    }
+
+    #[test_case]
+    fn test_dcbaa_sets_and_clears_device_context_slot_entry() {
+        setup_allocator(&[MemoryRegion {
+            start: 0x210000,
+            size: 0x80000,
+            region_type: EFI_CONVENTIONAL_MEMORY,
+        }]);
+
+        let config = XhciControlMemoryConfig {
+            max_slots: 8,
+            scratchpad_buffer_count: 0,
+        };
+        let mut dcbaa = Dcbaa::new(&dma_profile(), &config).expect("dcbaa");
+
+        dcbaa
+            .set_device_context(3, 0x1234_5000)
+            .expect("set device context");
+        assert_eq!(dcbaa.entries()[3], 0x1234_5000);
+
+        dcbaa.clear_device_context(3).expect("clear device context");
+        assert_eq!(dcbaa.entries()[3], 0);
+    }
+
+    #[test_case]
+    fn test_dcbaa_rejects_out_of_range_slot_id() {
+        setup_allocator(&[MemoryRegion {
+            start: 0x220000,
+            size: 0x80000,
+            region_type: EFI_CONVENTIONAL_MEMORY,
+        }]);
+
+        let config = XhciControlMemoryConfig {
+            max_slots: 4,
+            scratchpad_buffer_count: 0,
+        };
+        let mut dcbaa = Dcbaa::new(&dma_profile(), &config).expect("dcbaa");
+
+        assert!(matches!(
+            dcbaa.set_device_context(5, 0x1000),
+            Err(XhciMemoryError::InvalidSlotId(5))
+        ));
     }
 
     #[test_case]

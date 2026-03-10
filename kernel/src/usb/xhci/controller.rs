@@ -85,14 +85,6 @@ impl XhciController {
         self.process_events();
     }
 
-    pub fn take_pending_event(&mut self) -> Option<Event> {
-        self.pending_events.pop()
-    }
-
-    pub fn take_overflow_flag(&mut self) -> bool {
-        self.pending_events.take_overflow_flag()
-    }
-
     fn stop_controller(&mut self) -> Result<(), XhciControllerInitError> {
         info!("[xHCI] Stopping controller...");
         let usbcmd = self.read_usbcmd();
@@ -229,11 +221,11 @@ impl XhciController {
                     );
                 }
 
-                let _ = self.pending_events.push(event);
+                self.record_command_completion(trb_pointer, completion_code, slot_id);
             }
             Event::PortStatusChange { port_id } => {
                 info!("[xHCI] Port {} status changed", port_id);
-                let _ = self.pending_events.push(event);
+                self.record_port_change(port_id);
             }
             Event::TransferEvent {
                 trb_pointer,
@@ -253,11 +245,16 @@ impl XhciController {
                     );
                 }
 
-                let _ = self.pending_events.push(event);
+                self.record_transfer_completion(
+                    trb_pointer,
+                    completion_code,
+                    transfer_length,
+                    slot_id,
+                    endpoint_id,
+                );
             }
             Event::Unknown { trb_type, .. } => {
                 crate::warn!("[xHCI] Unhandled event TRB type {}", trb_type);
-                let _ = self.pending_events.push(event);
             }
         }
     }
@@ -303,23 +300,23 @@ impl XhciController {
         })
     }
 
-    fn resources(&self) -> &XhciControllerResources {
+    pub(crate) fn resources(&self) -> &XhciControllerResources {
         self.resources
             .as_ref()
             .expect("xHCI controller resources must be retained after init")
     }
 
-    fn resources_mut(&mut self) -> &mut XhciControllerResources {
+    pub(crate) fn resources_mut(&mut self) -> &mut XhciControllerResources {
         self.resources
             .as_mut()
             .expect("xHCI controller resources must be retained after init")
     }
 
-    fn operational_registers(&self) -> *mut OperationalRegisters {
+    pub(crate) fn operational_registers(&self) -> *mut OperationalRegisters {
         self.op_virt_base as *mut OperationalRegisters
     }
 
-    fn runtime_registers(&self) -> *mut RuntimeRegisters {
+    pub(crate) fn runtime_registers(&self) -> *mut RuntimeRegisters {
         self.runtime_virt_base as *mut RuntimeRegisters
     }
 

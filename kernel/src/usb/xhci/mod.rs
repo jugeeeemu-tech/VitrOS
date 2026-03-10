@@ -1,7 +1,11 @@
 //! xHCI (USB 3.x) コントローラドライバ
 
+extern crate alloc;
+
 pub mod controller;
+pub mod context;
 pub mod dma;
+pub mod device;
 pub mod event;
 pub mod interrupt;
 pub mod memory;
@@ -9,12 +13,13 @@ pub mod registers;
 pub mod ring;
 pub mod trb;
 
+use alloc::collections::VecDeque;
+use alloc::vec::Vec;
 use core::ptr::{addr_of, read_volatile};
 
 use crate::pci::{self, PciDevice};
 use crate::{info, msi, paging};
 use controller::XhciControllerResources;
-use event::PendingEventQueue;
 use memory::{
     EventRingSegmentDescriptor, EventRingSegmentTable, ScratchpadSet, XhciControlMemoryConfig,
 };
@@ -94,7 +99,12 @@ pub struct XhciController {
     hccparams1: u32,
     page_size: usize,
     pub dma: dma::XhciDmaProfile,
-    pending_events: PendingEventQueue,
+    pending_port_changes: VecDeque<u8>,
+    pending_command_completions: VecDeque<device::CommandCompletionRecord>,
+    pending_transfer_events: VecDeque<device::TransferCompletionRecord>,
+    event_overflowed: bool,
+    port_states: Vec<device::PortState>,
+    slots: Vec<Option<device::SlotRuntime>>,
     resources: Option<XhciControllerResources>,
 }
 
@@ -173,6 +183,12 @@ pub fn init() -> Result<XhciController, XhciError> {
     let dma = dma::XhciDmaProfile::new(registers::hccparams1::ac64(hccparams1), page_size);
     let runtime_virt_base = mmio_virt_base + registers::offsets::runtime_offset(rtsoff);
     let doorbell_virt_base = mmio_virt_base + registers::offsets::doorbell_offset(dboff);
+    let max_ports = usize::from(registers::hcsparams1::max_ports(hcsparams1));
+    let max_slots = usize::from(registers::hcsparams1::max_slots(hcsparams1));
+    let mut port_states = Vec::new();
+    port_states.resize(max_ports.saturating_add(1), device::PortState::Disconnected);
+    let mut slots = Vec::new();
+    slots.resize_with(max_slots.saturating_add(1), || None);
 
     let mut controller = XhciController {
         device,
@@ -187,7 +203,12 @@ pub fn init() -> Result<XhciController, XhciError> {
         hccparams1,
         page_size,
         dma,
-        pending_events: PendingEventQueue::new(),
+        pending_port_changes: VecDeque::new(),
+        pending_command_completions: VecDeque::new(),
+        pending_transfer_events: VecDeque::new(),
+        event_overflowed: false,
+        port_states,
+        slots,
         resources: None,
     };
 
