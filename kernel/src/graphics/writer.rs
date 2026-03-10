@@ -3,6 +3,7 @@
 use super::buffer::{DrawCommand, SharedBuffer};
 use super::region::Region;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 /// タスクごとのWriter
@@ -94,6 +95,59 @@ impl TaskWriter {
         self.cursor_y = 0;
     }
 
+    /// 指定座標に文字列を描画
+    ///
+    /// カーソル位置は変更せず、明示座標へ直接描画コマンドを追加します。
+    pub fn draw_string_at(&mut self, x: u32, y: u32, text: &str) {
+        self.commit_pending_text();
+
+        if x >= self.region.width || y >= self.region.height || text.is_empty() {
+            return;
+        }
+
+        let max_columns = ((self.region.width - x) / 8) as usize;
+        if max_columns == 0 {
+            return;
+        }
+
+        let visible_text = prefix_to_fit(text, max_columns);
+        if visible_text.is_empty() {
+            return;
+        }
+
+        self.local_commands.push(DrawCommand::DrawString {
+            x,
+            y,
+            text: String::from(visible_text),
+            color: self.color,
+        });
+    }
+
+    /// 指定矩形を塗りつぶす
+    ///
+    /// 矩形は現在の描画領域内にクリップされます。
+    pub fn fill_rect(&mut self, x: u32, y: u32, width: u32, height: u32, color: u32) {
+        self.commit_pending_text();
+
+        if x >= self.region.width || y >= self.region.height || width == 0 || height == 0 {
+            return;
+        }
+
+        let clipped_width = width.min(self.region.width - x);
+        let clipped_height = height.min(self.region.height - y);
+        if clipped_width == 0 || clipped_height == 0 {
+            return;
+        }
+
+        self.local_commands.push(DrawCommand::FillRect {
+            x,
+            y,
+            width: clipped_width,
+            height: clipped_height,
+            color,
+        });
+    }
+
     /// ローカルバッファのコマンドを共有バッファに一括転送
     ///
     /// この呼び出しでのみ共有バッファのロックを取得します。
@@ -169,6 +223,17 @@ fn notify_flush(buffer: &SharedBuffer) {
 #[inline(always)]
 fn notify_flush(_buffer: &SharedBuffer) {}
 
+fn prefix_to_fit(text: &str, max_columns: usize) -> &str {
+    if max_columns == 0 {
+        return "";
+    }
+
+    match text.char_indices().nth(max_columns) {
+        Some((idx, _)) => &text[..idx],
+        None => text,
+    }
+}
+
 impl core::fmt::Write for TaskWriter {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         // 最適化: 連続する文字をDrawStringにバッチ化
@@ -208,5 +273,99 @@ impl core::fmt::Write for TaskWriter {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graphics::buffer::WriterBuffer;
+
+    fn test_buffer(region: Region) -> SharedBuffer {
+        Arc::new(crate::sync::BlockingMutex::new(WriterBuffer::new(region)))
+    }
+
+    #[test_case]
+    fn test_draw_string_at_commits_pending_text_before_explicit_draw() {
+        let buffer = test_buffer(Region::new(0, 0, 64, 32));
+        let mut writer = TaskWriter::new(Arc::clone(&buffer), 0x00FF_FFFF);
+
+        let _ = core::fmt::Write::write_str(&mut writer, "ab");
+        writer.draw_string_at(16, 10, "cd");
+        writer.flush();
+
+        let commands = buffer.lock().commands().to_vec();
+        assert_eq!(commands.len(), 2);
+        assert!(matches!(
+            &commands[0],
+            DrawCommand::DrawString {
+                x: 0,
+                y: 0,
+                text,
+                color: 0x00FF_FFFF,
+            } if text == "ab"
+        ));
+        assert!(matches!(
+            &commands[1],
+            DrawCommand::DrawString {
+                x: 16,
+                y: 10,
+                text,
+                color: 0x00FF_FFFF,
+            } if text == "cd"
+        ));
+    }
+
+    #[test_case]
+    fn test_draw_string_at_clips_to_region_width() {
+        let buffer = test_buffer(Region::new(0, 0, 32, 32));
+        let mut writer = TaskWriter::new(Arc::clone(&buffer), 0x00FF_FFFF);
+
+        writer.draw_string_at(16, 0, "abcd");
+        writer.flush();
+
+        let commands = buffer.lock().commands().to_vec();
+        assert_eq!(commands.len(), 1);
+        assert!(matches!(
+            &commands[0],
+            DrawCommand::DrawString {
+                x: 16,
+                y: 0,
+                text,
+                color: 0x00FF_FFFF,
+            } if text == "ab"
+        ));
+    }
+
+    #[test_case]
+    fn test_fill_rect_clips_to_region_and_commits_pending_text() {
+        let buffer = test_buffer(Region::new(0, 0, 20, 12));
+        let mut writer = TaskWriter::new(Arc::clone(&buffer), 0x00FF_FFFF);
+
+        let _ = core::fmt::Write::write_str(&mut writer, "xy");
+        writer.fill_rect(12, 8, 20, 10, 0x0012_3456);
+        writer.flush();
+
+        let commands = buffer.lock().commands().to_vec();
+        assert_eq!(commands.len(), 2);
+        assert!(matches!(
+            &commands[0],
+            DrawCommand::DrawString {
+                x: 0,
+                y: 0,
+                text,
+                color: 0x00FF_FFFF,
+            } if text == "xy"
+        ));
+        assert!(matches!(
+            &commands[1],
+            DrawCommand::FillRect {
+                x: 12,
+                y: 8,
+                width: 8,
+                height: 4,
+                color: 0x0012_3456,
+            }
+        ));
     }
 }
