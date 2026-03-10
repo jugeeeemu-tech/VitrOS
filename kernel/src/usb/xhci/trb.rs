@@ -259,7 +259,10 @@ mod tests {
 
         assert_eq!(trb.trb_type(), trb_type::SETUP_STAGE);
         assert_eq!(trb.slot_id(), 7);
-        assert_eq!(trb.setup_transfer_type(), setup_transfer_type::IN_DATA_STAGE);
+        assert_eq!(
+            trb.setup_transfer_type(),
+            setup_transfer_type::IN_DATA_STAGE
+        );
         assert_eq!(trb.transfer_length(), 8);
     }
 }

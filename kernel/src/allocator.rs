@@ -3,9 +3,9 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
 use core::ptr::{NonNull, null_mut};
 
+pub use crate::heap_window::{HeapWindowAllocation, HeapWindowError};
 use crate::info;
 use crate::io::without_interrupts;
-pub use crate::heap_window::{HeapWindowAllocation, HeapWindowError};
 
 // サイズクラス（8バイト～4096バイト）
 // 4096Bはスラブの最大サイズ。スラブが枯渇した場合はバディにフォールバック
@@ -780,7 +780,8 @@ impl KernelAllocator {
             return Err(AllocGrowError::InvalidRequest);
         }
 
-        let aligned_min = checked_align_up(min_bytes, MIN_BLOCK_SIZE).ok_or(AllocGrowError::InvalidRequest)?;
+        let aligned_min =
+            checked_align_up(min_bytes, MIN_BLOCK_SIZE).ok_or(AllocGrowError::InvalidRequest)?;
         let heap_total = self.heap_total_bytes();
         let dynamic_target = heap_total / 8;
         let grow = aligned_min
@@ -834,7 +835,10 @@ impl KernelAllocator {
             }
         };
 
-        let added = match self.buddy.extend_contiguous(grow_start, allocation.size_bytes) {
+        let added = match self
+            .buddy
+            .extend_contiguous(grow_start, allocation.size_bytes)
+        {
             Ok(added) => added,
             Err(err) => {
                 self.set_last_grow_error(err);
@@ -855,7 +859,10 @@ impl KernelAllocator {
         Ok(())
     }
 
-    fn request_grow_pages(&self, grow_bytes: usize) -> Result<HeapWindowAllocation, AllocGrowError> {
+    fn request_grow_pages(
+        &self,
+        grow_bytes: usize,
+    ) -> Result<HeapWindowAllocation, AllocGrowError> {
         #[cfg(test)]
         {
             if let Some(supplier) = *TEST_GROW_SUPPLIER.lock() {
@@ -971,7 +978,8 @@ fn align_up(addr: usize, align: usize) -> usize {
 }
 
 fn checked_align_up(addr: usize, align: usize) -> Option<usize> {
-    addr.checked_add(align - 1).map(|value| value & !(align - 1))
+    addr.checked_add(align - 1)
+        .map(|value| value & !(align - 1))
 }
 
 // アドレスをアラインメントに合わせて切り下げ
@@ -1255,20 +1263,26 @@ mod growth_tests {
             checked_align_up(min_bytes, MIN_BLOCK_SIZE).ok_or(AllocGrowError::InvalidRequest)?;
         let requested_pages = alloc_bytes / MIN_BLOCK_SIZE;
         if FORCE_OOM.load(Ordering::Acquire) {
-            return Err(AllocGrowError::HeapWindow(HeapWindowError::FrameOutOfMemory {
-                requested_pages,
-                mapped_pages: 0,
-            }));
+            return Err(AllocGrowError::HeapWindow(
+                HeapWindowError::FrameOutOfMemory {
+                    requested_pages,
+                    mapped_pages: 0,
+                },
+            ));
         }
 
         let alloc_offset = loop {
             let current = NEXT_OFFSET.load(Ordering::Acquire);
-            let next = current.checked_add(alloc_bytes).ok_or(AllocGrowError::InvalidRequest)?;
+            let next = current
+                .checked_add(alloc_bytes)
+                .ok_or(AllocGrowError::InvalidRequest)?;
             if next > MAX_OFFSET.load(Ordering::Acquire) {
-                return Err(AllocGrowError::HeapWindow(HeapWindowError::FrameOutOfMemory {
-                    requested_pages,
-                    mapped_pages: 0,
-                }));
+                return Err(AllocGrowError::HeapWindow(
+                    HeapWindowError::FrameOutOfMemory {
+                        requested_pages,
+                        mapped_pages: 0,
+                    },
+                ));
             }
             if NEXT_OFFSET
                 .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
@@ -1306,16 +1320,23 @@ mod growth_tests {
         let mut growth_triggered = false;
 
         for _ in 0..1024 {
-            let ptr = unsafe { <KernelAllocator as GlobalAlloc>::alloc(&TEST_GROW_ALLOCATOR, layout) };
+            let ptr =
+                unsafe { <KernelAllocator as GlobalAlloc>::alloc(&TEST_GROW_ALLOCATOR, layout) };
             if TEST_GROW_ALLOCATOR.test_grow_attempts() > 0 {
                 growth_triggered = true;
                 assert!(!ptr.is_null(), "allocation should succeed after grow retry");
                 break;
             }
-            assert!(!ptr.is_null(), "allocation should succeed before growth is needed");
+            assert!(
+                !ptr.is_null(),
+                "allocation should succeed before growth is needed"
+            );
         }
 
-        assert!(growth_triggered, "grow path should be triggered at least once");
+        assert!(
+            growth_triggered,
+            "grow path should be triggered at least once"
+        );
         assert_eq!(TEST_GROW_ALLOCATOR.last_grow_error(), None);
         test_set_grow_supplier(None);
     }
@@ -1328,14 +1349,18 @@ mod growth_tests {
         let mut saw_null = false;
 
         for _ in 0..256 {
-            let ptr = unsafe { <KernelAllocator as GlobalAlloc>::alloc(&TEST_GROW_ALLOCATOR, layout) };
+            let ptr =
+                unsafe { <KernelAllocator as GlobalAlloc>::alloc(&TEST_GROW_ALLOCATOR, layout) };
             if ptr.is_null() {
                 saw_null = true;
                 break;
             }
         }
 
-        assert!(saw_null, "allocator should eventually fail with null under OOM");
+        assert!(
+            saw_null,
+            "allocator should eventually fail with null under OOM"
+        );
         assert!(TEST_GROW_ALLOCATOR.test_grow_attempts() >= 1);
         match TEST_GROW_ALLOCATOR.last_grow_error() {
             Some(AllocGrowError::HeapWindow(HeapWindowError::FrameOutOfMemory { .. })) => {}
@@ -1351,7 +1376,8 @@ mod growth_tests {
         let layout = Layout::from_size_align(4096, 4096).unwrap();
 
         loop {
-            let ptr = unsafe { <KernelAllocator as GlobalAlloc>::alloc(&TEST_GROW_ALLOCATOR, layout) };
+            let ptr =
+                unsafe { <KernelAllocator as GlobalAlloc>::alloc(&TEST_GROW_ALLOCATOR, layout) };
             if ptr.is_null() {
                 break;
             }
@@ -1361,8 +1387,15 @@ mod growth_tests {
         let ptr = unsafe { <KernelAllocator as GlobalAlloc>::alloc(&TEST_GROW_ALLOCATOR, layout) };
         let after = TEST_GROW_ALLOCATOR.test_grow_attempts();
 
-        assert!(ptr.is_null(), "allocation should still fail under persistent OOM");
-        assert_eq!(after, before + 1, "exactly one grow retry should run per alloc call");
+        assert!(
+            ptr.is_null(),
+            "allocation should still fail under persistent OOM"
+        );
+        assert_eq!(
+            after,
+            before + 1,
+            "exactly one grow retry should run per alloc call"
+        );
         test_set_grow_supplier(None);
     }
 
@@ -1370,7 +1403,8 @@ mod growth_tests {
     fn test_try_grow_heap_capacity_guard() {
         test_set_grow_supplier(None);
         TEST_GROW_ALLOCATOR.reset_for_test();
-        TEST_GROW_ALLOCATOR.test_force_buddy_state_for_capacity_check(0x1000, MAX_BUDDY_REGION_SIZE);
+        TEST_GROW_ALLOCATOR
+            .test_force_buddy_state_for_capacity_check(0x1000, MAX_BUDDY_REGION_SIZE);
 
         let err = TEST_GROW_ALLOCATOR
             .try_grow_heap(MIN_BLOCK_SIZE)

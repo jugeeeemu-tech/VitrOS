@@ -61,7 +61,11 @@ impl core::fmt::Display for EnumerationError {
         match self {
             Self::ControllerUnavailable => write!(f, "xHCI controller unavailable"),
             Self::SlotRuntimeUnavailable(handle) => {
-                write!(f, "USB slot runtime unavailable for handle {}", handle.as_u64())
+                write!(
+                    f,
+                    "USB slot runtime unavailable for handle {}",
+                    handle.as_u64()
+                )
             }
             Self::InvalidPort => write!(f, "invalid xHCI port"),
             Self::InvalidPortSpeed(speed_id) => write!(f, "invalid USB port speed id {}", speed_id),
@@ -187,7 +191,8 @@ extern "C" fn usb_worker_task() -> ! {
 
 fn drain_port_notifications(pending_ports: &mut VecDeque<u8>, rescan_all_ports: &mut bool) {
     loop {
-        let next_port = with_xhci_controller(|controller| controller.take_next_port_change()).flatten();
+        let next_port =
+            with_xhci_controller(|controller| controller.take_next_port_change()).flatten();
         let Some(port_id) = next_port else {
             break;
         };
@@ -211,11 +216,14 @@ fn enqueue_all_ports(pending_ports: &mut VecDeque<u8>) {
 
 fn process_port(port_id: u8) {
     let Some((state, status)) = with_xhci_controller(|controller| {
-        let state = controller.port_state(port_id).unwrap_or(PortState::Disconnected);
-        controller.port_status(port_id).map(|status| (state, status))
+        let state = controller
+            .port_state(port_id)
+            .unwrap_or(PortState::Disconnected);
+        controller
+            .port_status(port_id)
+            .map(|status| (state, status))
     })
-    .flatten()
-    else {
+    .flatten() else {
         return;
     };
 
@@ -246,7 +254,10 @@ fn process_port(port_id: u8) {
                 controller.set_port_state(port_id, PortState::Disconnected)
             });
             if let Err(err) = enumerate_port(port_id, status) {
-                warn!("[USB] Enumeration retry failed on port {}: {}", port_id, err);
+                warn!(
+                    "[USB] Enumeration retry failed on port {}: {}",
+                    port_id, err
+                );
             }
         }
         PortState::Addressed { .. } => {
@@ -276,7 +287,8 @@ fn detach_port(port_id: u8) {
         }
     }
 
-    let _ = with_xhci_controller(|controller| controller.clear_device_context(slot_runtime.slot_id));
+    let _ =
+        with_xhci_controller(|controller| controller.clear_device_context(slot_runtime.slot_id));
 }
 
 fn enumerate_port(
@@ -287,7 +299,9 @@ fn enumerate_port(
     let result = (|| {
         let speed = initial_status
             .speed()
-            .ok_or(EnumerationError::InvalidPortSpeed(initial_status.speed_id()))?;
+            .ok_or(EnumerationError::InvalidPortSpeed(
+                initial_status.speed_id(),
+            ))?;
 
         info!("[xHCI] Device connected on port {}", port_id);
         info!(
@@ -340,7 +354,10 @@ fn enumerate_port(
         ensure_command_success(address_completion.completion_code)?;
 
         let address = device_context.usb_device_address();
-        info!("[xHCI] Device addressed: slot={}, address={}", slot_id, address);
+        info!(
+            "[xHCI] Device addressed: slot={}, address={}",
+            slot_id, address
+        );
 
         let descriptor_prefix = read_descriptor_bytes(
             slot_id,
@@ -349,7 +366,9 @@ fn enumerate_port(
             SetupPacket::get_descriptor(descriptor_type::DEVICE, 0, 8),
             8,
         )?;
-        let reported_mps0 = u16::from(DeviceDescriptor::parse_max_packet_size0(&descriptor_prefix)?);
+        let reported_mps0 = u16::from(DeviceDescriptor::parse_max_packet_size0(
+            &descriptor_prefix,
+        )?);
         if reported_mps0 != ep0_max_packet_size {
             ep0_max_packet_size = reported_mps0;
             let mut evaluate_context = InputContextBuffer::new(&dma, layout)?;
@@ -458,7 +477,8 @@ fn submit_control_transfer(
     let completion_trb_pointer = td.enqueue(ep0_ring)?;
     with_controller(|controller| controller.ring_device_doorbell(slot_id, CONTROL_ENDPOINT_ID))?;
 
-    let transfer = wait_for_transfer_completion(completion_trb_pointer, slot_id, CONTROL_ENDPOINT_ID)?;
+    let transfer =
+        wait_for_transfer_completion(completion_trb_pointer, slot_id, CONTROL_ENDPOINT_ID)?;
     ep0_ring.complete_through(transfer.trb_pointer)?;
     ensure_transfer_success(transfer.completion_code)?;
 
@@ -485,7 +505,8 @@ fn submit_control_transfer_for_handle(
         Ok::<_, EnumerationError>((completion_trb_pointer, slot_id))
     })??;
 
-    let transfer = wait_for_transfer_completion(completion_trb_pointer, slot_id, CONTROL_ENDPOINT_ID)?;
+    let transfer =
+        wait_for_transfer_completion(completion_trb_pointer, slot_id, CONTROL_ENDPOINT_ID)?;
 
     with_controller(|controller| {
         let slot = controller
@@ -525,7 +546,9 @@ fn submit_enable_slot() -> Result<CommandCompletionRecord, EnumerationError> {
 }
 
 fn cleanup_failed_enumeration(port_id: u8, slot_id: Option<u8>) {
-    let _ = with_xhci_controller(|controller| controller.set_port_state(port_id, PortState::Disconnected));
+    let _ = with_xhci_controller(|controller| {
+        controller.set_port_state(port_id, PortState::Disconnected)
+    });
     let Some(slot_id) = slot_id else {
         return;
     };
@@ -550,15 +573,19 @@ fn cleanup_failed_enumeration(port_id: u8, slot_id: Option<u8>) {
 }
 
 fn submit_disable_slot(slot_id: u8) -> Result<CommandCompletionRecord, EnumerationError> {
-    let trb_pointer = with_controller(|controller| controller.submit_disable_slot_command(slot_id))??;
+    let trb_pointer =
+        with_controller(|controller| controller.submit_disable_slot_command(slot_id))??;
     wait_for_command_completion(trb_pointer)
 }
 
-fn wait_for_command_completion(trb_pointer: u64) -> Result<CommandCompletionRecord, EnumerationError> {
+fn wait_for_command_completion(
+    trb_pointer: u64,
+) -> Result<CommandCompletionRecord, EnumerationError> {
     for _ in 0..USB_ENUMERATION_TIMEOUT_MS {
-        if let Some(record) =
-            with_xhci_controller(|controller| controller.take_matching_command_completion(trb_pointer))
-                .flatten()
+        if let Some(record) = with_xhci_controller(|controller| {
+            controller.take_matching_command_completion(trb_pointer)
+        })
+        .flatten()
         {
             return Ok(record);
         }
@@ -629,13 +656,19 @@ fn publish_device(info: UsbDeviceInfo) {
         .find(|entry| entry.handle == handle)
         .expect("published device must be present in registry");
     if let Err(err) = hid::attach_device(&device) {
-        warn!("[HID] Failed to attach device {}: {}", device.handle.as_u64(), err);
+        warn!(
+            "[HID] Failed to attach device {}: {}",
+            device.handle.as_u64(),
+            err
+        );
     }
 }
 
 fn remove_device(handle: UsbDeviceHandle) {
     without_interrupts(|| {
-        DEVICE_REGISTRY.lock().retain(|entry| entry.handle != handle);
+        DEVICE_REGISTRY
+            .lock()
+            .retain(|entry| entry.handle != handle);
     });
 
     hid::detach_device(handle);

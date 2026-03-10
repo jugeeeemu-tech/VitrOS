@@ -373,7 +373,10 @@ fn next_direct_map_progress_threshold(current: u64, total: u64) -> u64 {
     if current < DIRECT_MAP_PROGRESS_CHUNK_BYTES {
         core::cmp::min(DIRECT_MAP_PROGRESS_CHUNK_BYTES, total)
     } else {
-        core::cmp::min(current.saturating_add(DIRECT_MAP_PROGRESS_CHUNK_BYTES), total)
+        core::cmp::min(
+            current.saturating_add(DIRECT_MAP_PROGRESS_CHUNK_BYTES),
+            total,
+        )
     }
 }
 
@@ -395,8 +398,8 @@ fn extract_direct_map_ranges(
     ),
     PagingError,
 > {
-    let mut ranges = [DirectMapRange { start: 0, end: 0 };
-        vitros_common::boot_info::MAX_MEMORY_REGIONS];
+    let mut ranges =
+        [DirectMapRange { start: 0, end: 0 }; vitros_common::boot_info::MAX_MEMORY_REGIONS];
     let mut count = 0;
 
     // direct-map対象のSystem RAMを抽出し、4KB境界へ丸める
@@ -622,7 +625,9 @@ pub fn init(boot_info: &vitros_common::boot_info::BootInfo) -> Result<(), Paging
                                 current_pt = ensure_pt(pd, pd_idx)?;
                                 current_path = Some(key);
                             }
-                            (*current_pt).entry(pt_idx).set(physical_addr, direct_4kb_flags);
+                            (*current_pt)
+                                .entry(pt_idx)
+                                .set(physical_addr, direct_4kb_flags);
                             mapped_pages += 1;
                             mapped_4kb_leaves += 1;
                         }
@@ -650,7 +655,8 @@ pub fn init(boot_info: &vitros_common::boot_info::BootInfo) -> Result<(), Paging
                         skipped_kernel_pages
                     );
                     last_logged_progress_bytes = next_progress_bytes;
-                    next_progress_bytes = next_direct_map_progress_threshold(next_progress_bytes, total_bytes);
+                    next_progress_bytes =
+                        next_direct_map_progress_threshold(next_progress_bytes, total_bytes);
                 }
 
                 if scanned_pages == total_pages && scanned_bytes > last_logged_progress_bytes {
@@ -857,8 +863,8 @@ unsafe fn walk_table_if_present(
 }
 
 unsafe fn alloc_page_table_frame() -> Result<*mut PageTable, PagingError> {
-    let frame_phys = crate::frame_allocator::alloc_frame()
-        .map_err(|_| PagingError::FrameAllocationFailed)?;
+    let frame_phys =
+        crate::frame_allocator::alloc_frame().map_err(|_| PagingError::FrameAllocationFailed)?;
     let frame_virt = match phys_to_virt(frame_phys) {
         Ok(addr) => addr,
         Err(_) => {
@@ -1693,9 +1699,8 @@ mod tests {
     use super::*;
     use vitros_common::boot_info::{BootInfo, MemoryRegion};
     use vitros_common::uefi::{
-        EFI_ACPI_RECLAIM_MEMORY, EFI_BOOT_SERVICES_DATA, EFI_CONVENTIONAL_MEMORY,
-        EFI_LOADER_CODE, EFI_MEMORY_MAPPED_IO, EFI_MEMORY_MAPPED_IO_PORT_SPACE,
-        EFI_RUNTIME_SERVICES_DATA,
+        EFI_ACPI_RECLAIM_MEMORY, EFI_BOOT_SERVICES_DATA, EFI_CONVENTIONAL_MEMORY, EFI_LOADER_CODE,
+        EFI_MEMORY_MAPPED_IO, EFI_MEMORY_MAPPED_IO_PORT_SPACE, EFI_RUNTIME_SERVICES_DATA,
     };
 
     const TEST_TABLE_ALLOC_REGION_SIZE: u64 = 0x80_0000; // 8 MiB
@@ -1846,13 +1851,7 @@ mod tests {
             DirectMapLeafSize::Huge1Gb
         );
         assert_eq!(
-            select_direct_map_leaf_size(
-                one_gb_aligned,
-                range_end,
-                kernel_start,
-                kernel_end,
-                false
-            ),
+            select_direct_map_leaf_size(one_gb_aligned, range_end, kernel_start, kernel_end, false),
             DirectMapLeafSize::Huge2Mb
         );
 
@@ -1877,7 +1876,13 @@ mod tests {
 
         // カーネルを含む2MBチャンクは4KBへフォールバックする
         assert_eq!(
-            select_direct_map_leaf_size(kernel_start & !((HUGE_PAGE_SIZE_2MB as u64) - 1), range_end, kernel_start, kernel_end, true),
+            select_direct_map_leaf_size(
+                kernel_start & !((HUGE_PAGE_SIZE_2MB as u64) - 1),
+                range_end,
+                kernel_start,
+                kernel_end,
+                true
+            ),
             DirectMapLeafSize::Page4Kb
         );
     }
@@ -2077,7 +2082,10 @@ mod tests {
 
     #[test_case]
     fn test_heap_window_constants() {
-        assert_eq!(KERNEL_HEAP_WINDOW_END - KERNEL_HEAP_WINDOW_START, KERNEL_HEAP_WINDOW_SIZE);
+        assert_eq!(
+            KERNEL_HEAP_WINDOW_END - KERNEL_HEAP_WINDOW_START,
+            KERNEL_HEAP_WINDOW_SIZE
+        );
         assert_eq!(KERNEL_HEAP_WINDOW_SIZE, 1u64 << 40);
         assert_eq!(KERNEL_HEAP_WINDOW_START & PAGE_OFFSET_MASK, 0);
         assert_eq!(KERNEL_HEAP_WINDOW_END & PAGE_OFFSET_MASK, 0);
@@ -2091,8 +2099,12 @@ mod tests {
     #[test_case]
     fn test_heap_window_range_check() {
         assert!(is_heap_window_virt_addr(KERNEL_HEAP_WINDOW_START));
-        assert!(is_heap_window_virt_addr(KERNEL_HEAP_WINDOW_END - PAGE_SIZE as u64));
-        assert!(!is_heap_window_virt_addr(KERNEL_HEAP_WINDOW_START - PAGE_SIZE as u64));
+        assert!(is_heap_window_virt_addr(
+            KERNEL_HEAP_WINDOW_END - PAGE_SIZE as u64
+        ));
+        assert!(!is_heap_window_virt_addr(
+            KERNEL_HEAP_WINDOW_START - PAGE_SIZE as u64
+        ));
         assert!(!is_heap_window_virt_addr(KERNEL_HEAP_WINDOW_END));
     }
 

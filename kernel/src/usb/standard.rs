@@ -9,13 +9,7 @@ pub struct SetupPacket {
 }
 
 impl SetupPacket {
-    pub const fn new(
-        request_type: u8,
-        request: u8,
-        value: u16,
-        index: u16,
-        length: u16,
-    ) -> Self {
+    pub const fn new(request_type: u8, request: u8, value: u16, index: u16, length: u16) -> Self {
         Self {
             request_type,
             request,

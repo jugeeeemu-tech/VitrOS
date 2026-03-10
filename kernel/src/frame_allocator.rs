@@ -915,8 +915,8 @@ mod tests {
             max_address: 0x17_FFFF,
         };
 
-        let (f, allocated_len) =
-            alloc_contiguous(PAGE_SIZE as usize, constraints).expect("alloc_contiguous below failed");
+        let (f, allocated_len) = alloc_contiguous(PAGE_SIZE as usize, constraints)
+            .expect("alloc_contiguous below failed");
         assert!(f <= constraints.max_address);
         assert!(f + allocated_len as u64 - 1 <= constraints.max_address);
 

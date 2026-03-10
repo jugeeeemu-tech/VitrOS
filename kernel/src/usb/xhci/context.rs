@@ -144,7 +144,11 @@ impl InputContextBuffer {
     ) {
         self.set_add_context_flags(ADD_CONTEXT_FLAG_SLOT | ADD_CONTEXT_FLAG_EP0);
         self.write_slot_context(port_id, speed, 1);
-        self.write_ep0_context(ep0_max_packet_size, ep0_tr_dequeue_pointer, dequeue_cycle_state);
+        self.write_ep0_context(
+            ep0_max_packet_size,
+            ep0_tr_dequeue_pointer,
+            dequeue_cycle_state,
+        );
     }
 
     pub fn set_evaluate_context_for_ep0(
@@ -154,7 +158,11 @@ impl InputContextBuffer {
         dequeue_cycle_state: bool,
     ) {
         self.set_add_context_flags(ADD_CONTEXT_FLAG_EP0);
-        self.write_ep0_context(ep0_max_packet_size, ep0_tr_dequeue_pointer, dequeue_cycle_state);
+        self.write_ep0_context(
+            ep0_max_packet_size,
+            ep0_tr_dequeue_pointer,
+            dequeue_cycle_state,
+        );
     }
 
     pub fn set_configure_interrupt_endpoint(
@@ -192,8 +200,13 @@ impl InputContextBuffer {
     }
 
     pub fn set_add_context_flag_for_dci(&mut self, dci: u8) {
-        let flags_offset = self.layout.input_control_context_offset() + INPUT_CONTROL_CONTEXT_ADD_FLAGS_OFFSET;
-        let flags = read_dword(self.buffer.as_slice(), self.layout.input_control_context_offset(), 1);
+        let flags_offset =
+            self.layout.input_control_context_offset() + INPUT_CONTROL_CONTEXT_ADD_FLAGS_OFFSET;
+        let flags = read_dword(
+            self.buffer.as_slice(),
+            self.layout.input_control_context_offset(),
+            1,
+        );
         write_u32(
             self.buffer.as_mut_slice(),
             flags_offset,
@@ -253,7 +266,8 @@ impl InputContextBuffer {
             .expect("valid xHCI endpoint DCI");
         self.write_endpoint_context(
             offset,
-            u32::from(encode_interrupt_interval(speed, interval)) << ENDPOINT_CONTEXT_INTERVAL_SHIFT,
+            u32::from(encode_interrupt_interval(speed, interval))
+                << ENDPOINT_CONTEXT_INTERVAL_SHIFT,
             ENDPOINT_CONTEXT_INTERRUPT_IN_EP_TYPE,
             max_packet_size,
             tr_dequeue_pointer,
@@ -306,11 +320,7 @@ impl InputContextBuffer {
 }
 
 pub(crate) const fn add_context_flag_for_dci(dci: u8) -> u32 {
-    if dci == 0 || dci > 31 {
-        0
-    } else {
-        1u32 << dci
-    }
+    if dci == 0 || dci > 31 { 0 } else { 1u32 << dci }
 }
 
 pub(crate) fn encode_interrupt_interval(speed: UsbSpeed, interval: u8) -> u8 {
@@ -404,7 +414,10 @@ mod tests {
         buffer.set_address_device_context(3, UsbSpeed::High, 64, 0x1234_5000, true);
 
         let bytes = buffer.buffer.as_slice();
-        assert_eq!(read_dword(bytes, layout.input_control_context_offset(), 1), 0b11);
+        assert_eq!(
+            read_dword(bytes, layout.input_control_context_offset(), 1),
+            0b11
+        );
         assert_eq!(
             read_dword(bytes, layout.input_slot_context_offset(), 0),
             (3u32 << 20) | (1u32 << 27)

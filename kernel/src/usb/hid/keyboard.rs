@@ -325,9 +325,13 @@ mod tests {
         let mut last_report = [0; 8];
         let mut events = Vec::new();
 
-        dispatch_report(&mut last_report, &[0b0000_0010, 0, 0x04, 0, 0, 0, 0, 0], |event| {
-            events.push(event);
-        })
+        dispatch_report(
+            &mut last_report,
+            &[0b0000_0010, 0, 0x04, 0, 0, 0, 0, 0],
+            |event| {
+                events.push(event);
+            },
+        )
         .expect("report decode");
 
         assert_eq!(events.len(), 2);

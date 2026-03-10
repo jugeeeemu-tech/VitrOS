@@ -2,10 +2,10 @@
 
 extern crate alloc;
 
-pub mod controller;
 pub mod context;
-pub mod dma;
+pub mod controller;
 pub mod device;
+pub mod dma;
 pub mod event;
 pub mod interrupt;
 pub mod memory;

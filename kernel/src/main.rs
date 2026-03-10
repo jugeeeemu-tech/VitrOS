@@ -286,7 +286,10 @@ extern "C" fn kernel_main_inner(boot_info_phys_addr: u64) -> ! {
     #[cfg(not(feature = "visualize-allocator"))]
     let initial_heap_target = {
         let total_ram_usize = usize::try_from(total_allocator_ram).unwrap_or(usize::MAX);
-        (total_ram_usize / 128).clamp(INITIAL_HEAP_POOL_BASELINE_BYTES, INITIAL_HEAP_POOL_MAX_BYTES)
+        (total_ram_usize / 128).clamp(
+            INITIAL_HEAP_POOL_BASELINE_BYTES,
+            INITIAL_HEAP_POOL_MAX_BYTES,
+        )
     };
     info!(
         "Initial heap target: {} KB (allocator-eligible RAM: {} MB)",
@@ -491,8 +494,7 @@ extern "C" fn kernel_main_inner(boot_info_phys_addr: u64) -> ! {
 
     // ワーカータスク1（やや高い優先度）
     let t1 = Box::new(
-        task::Task::new("Task1", task::nice::DEFAULT - 5, task1)
-            .expect("Failed to create Task1"),
+        task::Task::new("Task1", task::nice::DEFAULT - 5, task1).expect("Failed to create Task1"),
     );
     task::add_task(*t1);
 
@@ -503,9 +505,8 @@ extern "C" fn kernel_main_inner(boot_info_phys_addr: u64) -> ! {
     task::add_task(*t2);
 
     // ワーカータスク3（最低優先度）
-    let t3 = Box::new(
-        task::Task::new("Task3", task::nice::MAX, task3).expect("Failed to create Task3"),
-    );
+    let t3 =
+        Box::new(task::Task::new("Task3", task::nice::MAX, task3).expect("Failed to create Task3"));
     task::add_task(*t3);
 
     // デバッグオーバーレイタスク（Normalクラス、標準優先度）
@@ -567,9 +568,7 @@ extern "C" fn kernel_main_inner(boot_info_phys_addr: u64) -> ! {
         let _ = writeln!(
             writer,
             "Framebuffer: 0x{:X}, {}x{}",
-            boot_info.framebuffer.base,
-            boot_info.framebuffer.width,
-            boot_info.framebuffer.height
+            boot_info.framebuffer.base, boot_info.framebuffer.width, boot_info.framebuffer.height
         );
         let _ = writeln!(writer, "Memory regions: {}", boot_info.memory_map_count);
         if let Some(largest_start_virt) = largest_start_virt {

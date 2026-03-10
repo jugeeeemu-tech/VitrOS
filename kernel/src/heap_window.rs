@@ -203,7 +203,9 @@ impl HeapWindowManager {
             return Err(HeapWindowError::InvalidRequest);
         }
 
-        let end = start.checked_add(size).ok_or(HeapWindowError::InvalidRequest)?;
+        let end = start
+            .checked_add(size)
+            .ok_or(HeapWindowError::InvalidRequest)?;
         if start < KERNEL_HEAP_WINDOW_START || end > KERNEL_HEAP_WINDOW_END {
             return Err(HeapWindowError::InvalidRequest);
         }
@@ -354,8 +356,9 @@ pub fn supply_pages(min_bytes: usize) -> Result<HeapWindowAllocation, HeapWindow
                         requested_pages, mapped_pages
                     );
                     let rollback = rollback_mapped_pages(virt_start, mapped_pages);
-                    let range_reclaim_failed =
-                        manager.reclaim_range(virt_start, requested_size_u64).is_err();
+                    let range_reclaim_failed = manager
+                        .reclaim_range(virt_start, requested_size_u64)
+                        .is_err();
 
                     if rollback.has_failure() || range_reclaim_failed {
                         return Err(HeapWindowError::RollbackFailed {
@@ -389,7 +392,9 @@ pub fn supply_pages(min_bytes: usize) -> Result<HeapWindowAllocation, HeapWindow
                     rollback.first_free_error = Some(free_err);
                 }
 
-                let range_reclaim_failed = manager.reclaim_range(virt_start, requested_size_u64).is_err();
+                let range_reclaim_failed = manager
+                    .reclaim_range(virt_start, requested_size_u64)
+                    .is_err();
                 if rollback.has_failure() || range_reclaim_failed {
                     return Err(HeapWindowError::RollbackFailed {
                         original: RollbackOrigin::MappingFailure,
@@ -551,7 +556,10 @@ mod tests {
         setup_test_env(0x80_0000);
 
         assert_eq!(supply_pages(0), Err(HeapWindowError::InvalidRequest));
-        assert_eq!(supply_pages(PAGE_SIZE), Err(HeapWindowError::NotInitialized));
+        assert_eq!(
+            supply_pages(PAGE_SIZE),
+            Err(HeapWindowError::NotInitialized)
+        );
 
         init_manager().expect("manager init failed");
         assert_eq!(init_manager(), Err(HeapWindowError::AlreadyInitialized));

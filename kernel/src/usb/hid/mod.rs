@@ -73,7 +73,11 @@ pub(super) fn attach_device(info: &UsbDeviceInfo) -> Result<(), HidError> {
         return Ok(());
     };
 
-    if KEYBOARDS.lock().iter().any(|keyboard| keyboard.handle == info.handle) {
+    if KEYBOARDS
+        .lock()
+        .iter()
+        .any(|keyboard| keyboard.handle == info.handle)
+    {
         return Ok(());
     }
 
@@ -151,7 +155,9 @@ pub(super) fn attach_device(info: &UsbDeviceInfo) -> Result<(), HidError> {
 }
 
 pub(super) fn detach_device(handle: UsbDeviceHandle) {
-    KEYBOARDS.lock().retain(|keyboard| keyboard.handle != handle);
+    KEYBOARDS
+        .lock()
+        .retain(|keyboard| keyboard.handle != handle);
 }
 
 pub(super) fn service_keyboards() -> bool {
@@ -184,13 +190,14 @@ fn service_keyboard(keyboard_state: HidKeyboard) -> Result<bool, HidError> {
     }
 
     let Some(pending_trb_pointer) = with_xhci_controller(|controller| {
-        controller.slot_runtime_by_handle(keyboard_state.handle).and_then(|slot| {
-            let runtime = slot.interrupt_in.as_ref()?;
-            runtime.pending_trb_pointer
-        })
+        controller
+            .slot_runtime_by_handle(keyboard_state.handle)
+            .and_then(|slot| {
+                let runtime = slot.interrupt_in.as_ref()?;
+                runtime.pending_trb_pointer
+            })
     })
-    .flatten()
-    else {
+    .flatten() else {
         return Ok(false);
     };
 
@@ -201,19 +208,22 @@ fn service_keyboard(keyboard_state: HidKeyboard) -> Result<bool, HidError> {
             keyboard_state.endpoint_id,
         )
     })
-    .flatten()
-    else {
+    .flatten() else {
         return Ok(false);
     };
 
     let (report, report_len) = with_controller(|controller| {
         let slot = controller
             .slot_runtime_mut_by_handle(keyboard_state.handle)
-            .ok_or(EnumerationError::SlotRuntimeUnavailable(keyboard_state.handle))?;
-        let runtime = slot
-            .interrupt_in
-            .as_mut()
-            .ok_or(EnumerationError::SlotRuntimeUnavailable(keyboard_state.handle))?;
+            .ok_or(EnumerationError::SlotRuntimeUnavailable(
+                keyboard_state.handle,
+            ))?;
+        let runtime =
+            slot.interrupt_in
+                .as_mut()
+                .ok_or(EnumerationError::SlotRuntimeUnavailable(
+                    keyboard_state.handle,
+                ))?;
         runtime.pending_trb_pointer = None;
         runtime.ring.complete_through(completion.trb_pointer)?;
 
@@ -253,7 +263,10 @@ fn service_keyboard(keyboard_state: HidKeyboard) -> Result<bool, HidError> {
 
 fn process_report(handle: UsbDeviceHandle, report: [u8; 8]) -> Result<(), HidError> {
     let mut keyboards = KEYBOARDS.lock();
-    let Some(keyboard) = keyboards.iter_mut().find(|keyboard| keyboard.handle == handle) else {
+    let Some(keyboard) = keyboards
+        .iter_mut()
+        .find(|keyboard| keyboard.handle == handle)
+    else {
         return Ok(());
     };
 

@@ -1,25 +1,20 @@
 use alloc::collections::VecDeque;
 
 use crate::dma::DmaBuffer;
-use crate::usb::standard::SetupPacket;
 use crate::usb::device::{UsbDeviceHandle, UsbDeviceInfo, UsbSpeed};
+use crate::usb::standard::SetupPacket;
 
+use super::XhciController;
 use super::context::{ContextLayout, DeviceContextBuffer};
 use super::event::{CompletionCode, PENDING_EVENT_CAPACITY};
 use super::memory::XhciMemoryError;
 use super::registers::{self, portsc};
 use super::ring::{ProducerRing, RingError};
 use super::trb::{Trb, setup_transfer_type, trb_type};
-use super::XhciController;
 
 const DOORBELL_TARGET_MASK: u32 = 0xff;
-const PORTSC_CHANGE_BITS: u32 = portsc::CSC
-    | portsc::PEC
-    | portsc::WRC
-    | portsc::OCC
-    | portsc::PRC
-    | portsc::PLC
-    | portsc::CEC;
+const PORTSC_CHANGE_BITS: u32 =
+    portsc::CSC | portsc::PEC | portsc::WRC | portsc::OCC | portsc::PRC | portsc::PLC | portsc::CEC;
 const PORTSC_PRESERVE_BITS: u32 = portsc::PP;
 
 pub(crate) const CONTROL_ENDPOINT_ID: u8 = 1;
@@ -128,7 +123,10 @@ pub(crate) struct InterruptEndpointRuntime {
 pub enum PortState {
     Disconnected,
     Enumerating,
-    Addressed { handle: UsbDeviceHandle, slot_id: u8 },
+    Addressed {
+        handle: UsbDeviceHandle,
+        slot_id: u8,
+    },
 }
 
 #[allow(dead_code)]
@@ -232,10 +230,9 @@ impl XhciController {
         &mut self,
         trb_pointer: u64,
     ) -> Option<CommandCompletionRecord> {
-        take_matching(
-            &mut self.pending_command_completions,
-            |record| record.trb_pointer == trb_pointer,
-        )
+        take_matching(&mut self.pending_command_completions, |record| {
+            record.trb_pointer == trb_pointer
+        })
     }
 
     pub(crate) fn take_matching_transfer_completion(
@@ -285,14 +282,20 @@ impl XhciController {
     }
 
     pub(crate) fn slot_runtime_by_handle(&self, handle: UsbDeviceHandle) -> Option<&SlotRuntime> {
-        self.slots.iter().flatten().find(|slot| slot.handle == handle)
+        self.slots
+            .iter()
+            .flatten()
+            .find(|slot| slot.handle == handle)
     }
 
     pub(crate) fn slot_runtime_mut_by_handle(
         &mut self,
         handle: UsbDeviceHandle,
     ) -> Option<&mut SlotRuntime> {
-        self.slots.iter_mut().flatten().find(|slot| slot.handle == handle)
+        self.slots
+            .iter_mut()
+            .flatten()
+            .find(|slot| slot.handle == handle)
     }
 
     pub(crate) fn submit_enable_slot_command(&mut self) -> Result<u64, RingError> {
@@ -453,9 +456,8 @@ impl XhciController {
             return;
         };
 
-        let value = (current & PORTSC_PRESERVE_BITS)
-            | set_bits
-            | (clear_change_bits & PORTSC_CHANGE_BITS);
+        let value =
+            (current & PORTSC_PRESERVE_BITS) | set_bits | (clear_change_bits & PORTSC_CHANGE_BITS);
         let regs = self.operational_registers();
         let port_index = (port_id - 1) as usize;
 
@@ -529,10 +531,7 @@ fn push_bounded<T>(queue: &mut VecDeque<T>, value: T, overflowed: &mut bool) {
     queue.push_back(value);
 }
 
-fn take_matching<T>(
-    queue: &mut VecDeque<T>,
-    predicate: impl Fn(&T) -> bool,
-) -> Option<T> {
+fn take_matching<T>(queue: &mut VecDeque<T>, predicate: impl Fn(&T) -> bool) -> Option<T> {
     let index = queue.iter().position(predicate)?;
     queue.remove(index)
 }
