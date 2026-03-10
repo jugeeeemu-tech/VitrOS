@@ -148,6 +148,16 @@ pub mod erdp {
     pub const EHB: u64 = 1 << 3;
 }
 
+/// CRCR bit definitions.
+pub mod crcr {
+    pub const RCS: u64 = 1 << 0;
+}
+
+/// CONFIG bit definitions.
+pub mod config {
+    pub const MAX_SLOTS_EN_MASK: u32 = 0xff;
+}
+
 /// HCSPARAMS1 field helpers.
 pub mod hcsparams1 {
     #[inline]
@@ -201,6 +211,15 @@ pub mod pagesize {
     pub const fn supports_4k(v: u32) -> bool {
         (v & 1) != 0
     }
+
+    #[inline]
+    pub fn smallest_supported_page_size(v: u32) -> Option<usize> {
+        if v == 0 {
+            return None;
+        }
+
+        4096usize.checked_shl(v.trailing_zeros())
+    }
 }
 
 #[cfg(test)]
@@ -250,6 +269,14 @@ mod tests {
         assert!(!pagesize::supports_4k(0));
         assert!(pagesize::supports_4k(1));
         assert!(pagesize::supports_4k(0b1010_0001));
+    }
+
+    #[test_case]
+    fn test_pagesize_smallest_supported_page_size() {
+        assert_eq!(pagesize::smallest_supported_page_size(0), None);
+        assert_eq!(pagesize::smallest_supported_page_size(0b1), Some(4096));
+        assert_eq!(pagesize::smallest_supported_page_size(0b1000), Some(32768));
+        assert_eq!(pagesize::smallest_supported_page_size(0b1010), Some(8192));
     }
 
     #[test_case]
