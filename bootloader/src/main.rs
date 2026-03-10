@@ -128,6 +128,12 @@ const DIRECT_MAP_WINDOW_BYTES: u64 = 1u64 << 47; // 48bit paging前提での高�
 const EXIT_BOOT_SERVICES_RETRY_LIMIT: usize = 8;
 const PAGE_TABLE_ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 const MAX_ACPI_TABLE_LENGTH: u32 = 100 * 1024 * 1024;
+const EFI_FILE_INFO_GUID: EfiGuid = EfiGuid {
+    data1: 0x09576e92,
+    data2: 0x6d3f,
+    data3: 0x11d2,
+    data4: [0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b],
+};
 
 // カーネル仮想アドレスベース
 const KERNEL_VMA: u64 = 0xFFFF800000000000;
@@ -171,6 +177,13 @@ struct KernelLoadInfo {
     entry_phys: u64,
     image_phys_start: u64,
     image_size: u64,
+}
+
+#[repr(C)]
+struct EfiFileInfoHeader {
+    size: u64,
+    file_size: u64,
+    physical_size: u64,
 }
 
 #[inline]
@@ -1209,14 +1222,68 @@ fn load_kernel_elf(
         return None;
     }
 
-    // ファイルを一時バッファに読み込む (最大2MB - staticを使用)
-    static mut FILE_BUFFER: [u8; 2 * 1024 * 1024] = [0; 2 * 1024 * 1024];
-    let file_buffer = unsafe { &mut *core::ptr::addr_of_mut!(FILE_BUFFER) };
-    let mut file_size = file_buffer.len();
+    let file_size = match query_file_size(kernel_file, boot_services) {
+        Ok(size) => size,
+        Err(status) => {
+            println_uefi!("[ERROR] Failed to query kernel.elf size: 0x{:X}", status);
+            unsafe {
+                ((*kernel_file).close)(kernel_file);
+                ((*root).close)(root);
+            }
+            return None;
+        }
+    };
+    if file_size == 0 {
+        println_uefi!("[ERROR] kernel.elf is empty");
+        unsafe {
+            ((*kernel_file).close)(kernel_file);
+            ((*root).close)(root);
+        }
+        return None;
+    }
+
+    let file_buffer_pages = match file_size
+        .checked_add(PAGE_SIZE_4KB_USIZE - 1)
+        .map(|value| value / PAGE_SIZE_4KB_USIZE)
+    {
+        Some(pages) if pages != 0 => pages,
+        _ => {
+            println_uefi!("[ERROR] Invalid kernel.elf size");
+            unsafe {
+                ((*kernel_file).close)(kernel_file);
+                ((*root).close)(root);
+            }
+            return None;
+        }
+    };
+    let mut file_buffer_phys = 0u64;
+    let status = unsafe {
+        ((*boot_services).allocate_pages)(
+            EFI_ALLOCATE_ANY_PAGES,
+            EFI_LOADER_DATA,
+            file_buffer_pages,
+            &mut file_buffer_phys,
+        )
+    };
+    if status != EFI_SUCCESS {
+        println_uefi!(
+            "[ERROR] Failed to allocate kernel file buffer: 0x{:X}",
+            status
+        );
+        unsafe {
+            ((*kernel_file).close)(kernel_file);
+            ((*root).close)(root);
+        }
+        return None;
+    }
+
+    let file_buffer =
+        unsafe { core::slice::from_raw_parts_mut(file_buffer_phys as *mut u8, file_size) };
+    let mut bytes_read = file_size;
     let status = unsafe {
         ((*kernel_file).read)(
             kernel_file,
-            &mut file_size,
+            &mut bytes_read,
             file_buffer.as_mut_ptr() as *mut core::ffi::c_void,
         )
     };
@@ -1227,120 +1294,199 @@ fn load_kernel_elf(
 
     if status != EFI_SUCCESS {
         println_uefi!("[ERROR] Failed to read kernel file");
+        unsafe {
+            ((*boot_services).free_pages)(file_buffer_phys, file_buffer_pages);
+        }
         return None;
     }
 
-    println_uefi!("[INFO] Kernel loaded: {} bytes", file_size);
-    if file_size < core::mem::size_of::<Elf64Header>() {
-        println_uefi!("[ERROR] Kernel file too small");
-        return None;
-    }
-
-    // ELFヘッダーを検証
-    let elf_header = unsafe { &*(file_buffer.as_ptr() as *const Elf64Header) };
-    if !elf_header.is_valid() {
-        println_uefi!("[ERROR] Invalid ELF header");
-        return None;
-    }
-
-    // プログラムヘッダーを処理してLOADセグメントをメモリにコピー
-    // 最初のLOADセグメントから仮想/物理アドレスのオフセットを計算
-    let mut kernel_virt_offset: Option<u64> = None;
-    let mut image_phys_start = u64::MAX;
-    let mut image_phys_end = 0u64;
-    let mut saw_load_segment = false;
-
-    for i in 0..elf_header.e_phnum {
-        let ph_offset =
-            elf_header.e_phoff as usize + (i as usize * core::mem::size_of::<Elf64ProgramHeader>());
-        let ph_end = ph_offset + core::mem::size_of::<Elf64ProgramHeader>();
-        if ph_end > file_size {
-            println_uefi!("[ERROR] Program header out of file bounds");
+    println_uefi!("[INFO] Kernel loaded: {} bytes", bytes_read);
+    let result = (|| {
+        if bytes_read < core::mem::size_of::<Elf64Header>() {
+            println_uefi!("[ERROR] Kernel file too small");
             return None;
         }
-        let ph = unsafe { &*(file_buffer.as_ptr().add(ph_offset) as *const Elf64ProgramHeader) };
 
-        if ph.p_type == PT_LOAD {
-            if ph.p_memsz == 0 {
-                continue;
-            }
-            if ph.p_filesz > ph.p_memsz {
-                println_uefi!("[ERROR] Invalid PT_LOAD sizes");
+        // ELFヘッダーを検証
+        let elf_header = unsafe { &*(file_buffer.as_ptr() as *const Elf64Header) };
+        if !elf_header.is_valid() {
+            println_uefi!("[ERROR] Invalid ELF header");
+            return None;
+        }
+
+        // プログラムヘッダーを処理してLOADセグメントをメモリにコピー
+        // 最初のLOADセグメントから仮想/物理アドレスのオフセットを計算
+        let mut kernel_virt_offset: Option<u64> = None;
+        let mut image_phys_start = u64::MAX;
+        let mut image_phys_end = 0u64;
+        let mut saw_load_segment = false;
+
+        for i in 0..elf_header.e_phnum {
+            let ph_offset = elf_header.e_phoff as usize
+                + (i as usize * core::mem::size_of::<Elf64ProgramHeader>());
+            let ph_end = ph_offset + core::mem::size_of::<Elf64ProgramHeader>();
+            if ph_end > bytes_read {
+                println_uefi!("[ERROR] Program header out of file bounds");
                 return None;
             }
+            let ph =
+                unsafe { &*(file_buffer.as_ptr().add(ph_offset) as *const Elf64ProgramHeader) };
 
-            let segment_file_end = match (ph.p_offset as usize).checked_add(ph.p_filesz as usize) {
-                Some(v) => v,
-                None => {
-                    println_uefi!("[ERROR] PT_LOAD file range overflow");
+            if ph.p_type == PT_LOAD {
+                if ph.p_memsz == 0 {
+                    continue;
+                }
+                if ph.p_filesz > ph.p_memsz {
+                    println_uefi!("[ERROR] Invalid PT_LOAD sizes");
                     return None;
                 }
-            };
-            if segment_file_end > file_size {
-                println_uefi!("[ERROR] PT_LOAD file range exceeds input");
-                return None;
-            }
 
-            let segment_start = ph.p_paddr;
-            let segment_end = match ph.p_paddr.checked_add(ph.p_memsz) {
-                Some(v) => v,
-                None => {
-                    println_uefi!("[ERROR] PT_LOAD physical range overflow");
+                let segment_file_end =
+                    match (ph.p_offset as usize).checked_add(ph.p_filesz as usize) {
+                        Some(v) => v,
+                        None => {
+                            println_uefi!("[ERROR] PT_LOAD file range overflow");
+                            return None;
+                        }
+                    };
+                if segment_file_end > bytes_read {
+                    println_uefi!("[ERROR] PT_LOAD file range exceeds input");
                     return None;
                 }
-            };
-            image_phys_start = image_phys_start.min(segment_start);
-            image_phys_end = image_phys_end.max(segment_end);
-            saw_load_segment = true;
 
-            // 最初のLOADセグメントから仮想/物理アドレスのオフセットを記録
-            if kernel_virt_offset.is_none() && ph.p_vaddr != ph.p_paddr {
-                kernel_virt_offset = Some(ph.p_vaddr - ph.p_paddr);
-            }
+                let segment_start = ph.p_paddr;
+                let segment_end = match ph.p_paddr.checked_add(ph.p_memsz) {
+                    Some(v) => v,
+                    None => {
+                        println_uefi!("[ERROR] PT_LOAD physical range overflow");
+                        return None;
+                    }
+                };
+                image_phys_start = image_phys_start.min(segment_start);
+                image_phys_end = image_phys_end.max(segment_end);
+                saw_load_segment = true;
 
-            // ファイルからメモリにコピー
-            unsafe {
-                let dst = ph.p_paddr as *mut u8;
-                if ph.p_filesz != 0 {
-                    let src = file_buffer.as_ptr().add(ph.p_offset as usize);
-                    core::ptr::copy_nonoverlapping(src, dst, ph.p_filesz as usize);
+                // 最初のLOADセグメントから仮想/物理アドレスのオフセットを記録
+                if kernel_virt_offset.is_none() && ph.p_vaddr != ph.p_paddr {
+                    kernel_virt_offset = Some(ph.p_vaddr - ph.p_paddr);
                 }
 
-                // 残りをゼロクリア (BSS領域)
-                if ph.p_memsz > ph.p_filesz {
-                    core::ptr::write_bytes(
-                        dst.add(ph.p_filesz as usize),
-                        0,
-                        (ph.p_memsz - ph.p_filesz) as usize,
-                    );
+                // ファイルからメモリにコピー
+                unsafe {
+                    let dst = ph.p_paddr as *mut u8;
+                    if ph.p_filesz != 0 {
+                        let src = file_buffer.as_ptr().add(ph.p_offset as usize);
+                        core::ptr::copy_nonoverlapping(src, dst, ph.p_filesz as usize);
+                    }
+
+                    // 残りをゼロクリア (BSS領域)
+                    if ph.p_memsz > ph.p_filesz {
+                        core::ptr::write_bytes(
+                            dst.add(ph.p_filesz as usize),
+                            0,
+                            (ph.p_memsz - ph.p_filesz) as usize,
+                        );
+                    }
                 }
             }
         }
-    }
-    if !saw_load_segment {
-        println_uefi!("[ERROR] ELF has no PT_LOAD segments");
-        return None;
+        if !saw_load_segment {
+            println_uefi!("[ERROR] ELF has no PT_LOAD segments");
+            return None;
+        }
+
+        // エントリポイントを物理アドレスに変換
+        // カーネルが高位アドレスでリンクされている場合、仮想アドレスを物理アドレスに変換
+        let entry_phys = if let Some(offset) = kernel_virt_offset {
+            match elf_header.e_entry.checked_sub(offset) {
+                Some(v) => v,
+                None => {
+                    println_uefi!("[ERROR] Kernel entry conversion overflow");
+                    return None;
+                }
+            }
+        } else {
+            elf_header.e_entry
+        };
+
+        Some(KernelLoadInfo {
+            entry_phys,
+            image_phys_start,
+            image_size: image_phys_end - image_phys_start,
+        })
+    })();
+
+    unsafe {
+        ((*boot_services).free_pages)(file_buffer_phys, file_buffer_pages);
     }
 
-    // エントリポイントを物理アドレスに変換
-    // カーネルが高位アドレスでリンクされている場合、仮想アドレスを物理アドレスに変換
-    let entry_phys = if let Some(offset) = kernel_virt_offset {
-        match elf_header.e_entry.checked_sub(offset) {
-            Some(v) => v,
-            None => {
-                println_uefi!("[ERROR] Kernel entry conversion overflow");
-                return None;
-            }
-        }
-    } else {
-        elf_header.e_entry
+    result
+}
+
+fn query_file_size(
+    file: *mut EfiFileProtocol,
+    boot_services: *mut EfiBootServices,
+) -> Result<usize, EfiStatus> {
+    type FileGetInfo = extern "efiapi" fn(
+        *mut EfiFileProtocol,
+        *const EfiGuid,
+        *mut usize,
+        *mut core::ffi::c_void,
+    ) -> EfiStatus;
+
+    let get_info: FileGetInfo = unsafe { core::mem::transmute((*file).get_info) };
+
+    let mut info_size = 0usize;
+    let status = get_info(
+        file,
+        &EFI_FILE_INFO_GUID,
+        &mut info_size,
+        core::ptr::null_mut(),
+    );
+    if status != EFI_BUFFER_TOO_SMALL && status != EFI_SUCCESS {
+        return Err(status);
+    }
+    if info_size < core::mem::size_of::<EfiFileInfoHeader>() {
+        return Err(EFI_INVALID_PARAMETER);
+    }
+
+    let info_pages = info_size
+        .checked_add(PAGE_SIZE_4KB_USIZE - 1)
+        .map(|value| value / PAGE_SIZE_4KB_USIZE)
+        .ok_or(EFI_INVALID_PARAMETER)?;
+    let mut info_buffer_phys = 0u64;
+    let status = unsafe {
+        ((*boot_services).allocate_pages)(
+            EFI_ALLOCATE_ANY_PAGES,
+            EFI_LOADER_DATA,
+            info_pages,
+            &mut info_buffer_phys,
+        )
     };
+    if status != EFI_SUCCESS {
+        return Err(status);
+    }
 
-    Some(KernelLoadInfo {
-        entry_phys,
-        image_phys_start,
-        image_size: image_phys_end - image_phys_start,
-    })
+    let result = (|| {
+        let status = get_info(
+            file,
+            &EFI_FILE_INFO_GUID,
+            &mut info_size,
+            info_buffer_phys as *mut core::ffi::c_void,
+        );
+        if status != EFI_SUCCESS {
+            return Err(status);
+        }
+
+        let file_info = unsafe { &*(info_buffer_phys as *const EfiFileInfoHeader) };
+        usize::try_from(file_info.file_size).map_err(|_| EFI_INVALID_PARAMETER)
+    })();
+
+    unsafe {
+        ((*boot_services).free_pages)(info_buffer_phys, info_pages);
+    }
+
+    result
 }
 
 /// 文字列をUTF-16に変換

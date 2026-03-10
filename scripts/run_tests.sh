@@ -16,6 +16,11 @@ NC='\033[0m' # No Color
 
 # タイムアウト秒数
 TIMEOUT_SECONDS=60
+QEMU_MACHINE="q35,accel=kvm:tcg"
+
+if [ "${DISABLE_KVM:-0}" = "1" ]; then
+    QEMU_MACHINE="q35,accel=tcg"
+fi
 
 # スクリプトのディレクトリを取得
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -74,7 +79,7 @@ echo "----------------------------------------"
 # 終了コード: 33 (0x21) = 成功, 35 (0x23) = 失敗
 set +e
 timeout ${TIMEOUT_SECONDS}s qemu-system-x86_64 \
-    -machine q35,accel=kvm:tcg \
+    -machine "${QEMU_MACHINE}" \
     -m 4G \
     -bios /usr/share/ovmf/OVMF.fd \
     -drive format=raw,file=fat:rw:mnt \
