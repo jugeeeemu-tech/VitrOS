@@ -150,6 +150,17 @@ pub fn getchar() -> char {
     }
 }
 
+pub fn key_event_to_ascii(event: KeyEvent) -> Option<char> {
+    if event.kind != KeyEventKind::Press {
+        return None;
+    }
+
+    match key_event_to_char(event) {
+        Some(ch @ ' '..='~') => Some(ch),
+        _ => None,
+    }
+}
+
 pub(crate) fn push_key_event(event: KeyEvent) {
     push_queue(
         &KEY_EVENT_QUEUE,
@@ -293,14 +304,15 @@ fn reset_for_test() {
 #[cfg(test)]
 mod tests {
     use super::{
-        KEY_EVENT_QUEUE_CAPACITY, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, key_event_to_char,
-        poll_key_event, poll_char, push_key_event, reset_for_test,
+        KEY_EVENT_QUEUE_CAPACITY, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+        key_event_to_ascii, key_event_to_char, poll_char, poll_key_event, push_key_event,
+        reset_for_test,
     };
 
-    fn key_event(code: KeyCode, shift: bool) -> KeyEvent {
+    fn key_event_with_kind(code: KeyCode, shift: bool, kind: KeyEventKind) -> KeyEvent {
         KeyEvent {
             code,
-            kind: KeyEventKind::Press,
+            kind,
             modifiers: KeyModifiers {
                 shift,
                 ..KeyModifiers::default()
@@ -308,13 +320,61 @@ mod tests {
         }
     }
 
+    fn key_event(code: KeyCode, shift: bool) -> KeyEvent {
+        key_event_with_kind(code, shift, KeyEventKind::Press)
+    }
+
     #[test_case]
     fn test_key_event_to_char_maps_shifted_letters_and_symbols() {
         assert_eq!(key_event_to_char(key_event(KeyCode::A, false)), Some('a'));
         assert_eq!(key_event_to_char(key_event(KeyCode::A, true)), Some('A'));
-        assert_eq!(key_event_to_char(key_event(KeyCode::Digit1, true)), Some('!'));
-        assert_eq!(key_event_to_char(key_event(KeyCode::Slash, true)), Some('?'));
-        assert_eq!(key_event_to_char(key_event(KeyCode::Enter, false)), Some('\n'));
+        assert_eq!(
+            key_event_to_char(key_event(KeyCode::Digit1, true)),
+            Some('!')
+        );
+        assert_eq!(
+            key_event_to_char(key_event(KeyCode::Slash, true)),
+            Some('?')
+        );
+        assert_eq!(
+            key_event_to_char(key_event(KeyCode::Enter, false)),
+            Some('\n')
+        );
+    }
+
+    #[test_case]
+    fn test_key_event_to_ascii_accepts_printable_press_events_only() {
+        assert_eq!(key_event_to_ascii(key_event(KeyCode::A, false)), Some('a'));
+        assert_eq!(
+            key_event_to_ascii(key_event(KeyCode::Digit1, true)),
+            Some('!')
+        );
+        assert_eq!(
+            key_event_to_ascii(key_event(KeyCode::Space, false)),
+            Some(' ')
+        );
+        assert_eq!(
+            key_event_to_ascii(key_event_with_kind(
+                KeyCode::A,
+                false,
+                KeyEventKind::Release
+            )),
+            None
+        );
+    }
+
+    #[test_case]
+    fn test_key_event_to_ascii_ignores_control_and_navigation_keys() {
+        assert_eq!(key_event_to_ascii(key_event(KeyCode::Enter, false)), None);
+        assert_eq!(
+            key_event_to_ascii(key_event(KeyCode::Backspace, false)),
+            None
+        );
+        assert_eq!(key_event_to_ascii(key_event(KeyCode::Tab, false)), None);
+        assert_eq!(
+            key_event_to_ascii(key_event(KeyCode::ArrowLeft, false)),
+            None
+        );
     }
 
     #[test_case]
