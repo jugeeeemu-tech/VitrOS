@@ -3,6 +3,8 @@
 pub mod dma;
 pub mod memory;
 pub mod registers;
+pub mod ring;
+pub mod trb;
 
 use core::ptr::{addr_of, read_volatile};
 
