@@ -6,6 +6,7 @@ use crate::{hpet, info, pit};
 
 use super::{
     XhciController,
+    event::{CompletionCode, Event},
     memory::{Dcbaa, EventRingSegmentTable, ScratchpadSet},
     registers::{self, InterrupterRegisterSet, OperationalRegisters, RuntimeRegisters},
     ring::{ConsumerRing, ProducerRing},
@@ -29,6 +30,12 @@ pub enum XhciControllerInitError {
     Timeout { step: &'static str, timeout_ms: u64 },
     ZeroMaxSlots,
     NoInterrupters,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InterruptAck {
+    UsbStatus(u32),
+    Iman(u32),
 }
 
 impl XhciController {
@@ -61,6 +68,29 @@ impl XhciController {
         }
 
         result
+    }
+
+    pub fn handle_interrupt(&mut self) {
+        let usbsts = self.read_usbsts();
+        let iman = self.read_iman(INTERRUPTER_INDEX);
+
+        for action in interrupt_ack_actions(usbsts, iman) {
+            match action {
+                Some(InterruptAck::UsbStatus(value)) => self.write_usbsts(value),
+                Some(InterruptAck::Iman(value)) => self.write_iman(INTERRUPTER_INDEX, value),
+                None => {}
+            }
+        }
+
+        self.process_events();
+    }
+
+    pub fn take_pending_event(&mut self) -> Option<Event> {
+        self.pending_events.pop()
+    }
+
+    pub fn take_overflow_flag(&mut self) -> bool {
+        self.pending_events.take_overflow_flag()
     }
 
     fn stop_controller(&mut self) -> Result<(), XhciControllerInitError> {
@@ -135,7 +165,7 @@ impl XhciController {
         }
 
         let iman = self.read_iman(INTERRUPTER_INDEX);
-        self.write_iman(INTERRUPTER_INDEX, iman | registers::iman::IE);
+        self.write_iman(INTERRUPTER_INDEX, iman_interrupt_enable_value(iman));
 
         let usbcmd = self.read_usbcmd();
         self.write_usbcmd(usbcmd | registers::usbcmd::INTE);
@@ -155,11 +185,81 @@ impl XhciController {
     fn best_effort_quiesce(&mut self) {
         if registers::hcsparams1::max_intrs(self.hcsparams1) > 0 {
             let iman = self.read_iman(INTERRUPTER_INDEX);
-            self.write_iman(INTERRUPTER_INDEX, iman & !registers::iman::IE);
+            self.write_iman(INTERRUPTER_INDEX, iman_interrupt_disable_value(iman));
         }
 
         let usbcmd = self.read_usbcmd();
         self.write_usbcmd(usbcmd & !(registers::usbcmd::INTE | registers::usbcmd::RUN_STOP));
+    }
+
+    fn process_events(&mut self) {
+        while let Some(trb) = { self.resources_mut().event_ring.dequeue() } {
+            self.handle_event(Event::from_trb(trb));
+        }
+
+        let erdp = erdp_dequeue_pointer_value(self.resources().event_ring.dequeue_pointer());
+        self.write_erdp(INTERRUPTER_INDEX, erdp);
+    }
+
+    fn handle_event(&mut self, event: Event) {
+        match event {
+            Event::CommandCompletion {
+                trb_pointer,
+                completion_code,
+                slot_id,
+            } => {
+                if let Err(err) = self
+                    .resources_mut()
+                    .command_ring
+                    .complete_through(trb_pointer)
+                {
+                    crate::warn!(
+                        "[xHCI] Failed to reclaim command TRB 0x{:X}: {}",
+                        trb_pointer,
+                        err
+                    );
+                }
+
+                if !completion_is_nonfatal(completion_code) {
+                    crate::warn!(
+                        "[xHCI] Command completion failed: slot={}, trb=0x{:X}, code={:?}",
+                        slot_id,
+                        trb_pointer,
+                        completion_code
+                    );
+                }
+
+                let _ = self.pending_events.push(event);
+            }
+            Event::PortStatusChange { port_id } => {
+                info!("[xHCI] Port {} status changed", port_id);
+                let _ = self.pending_events.push(event);
+            }
+            Event::TransferEvent {
+                trb_pointer,
+                completion_code,
+                transfer_length,
+                slot_id,
+                endpoint_id,
+            } => {
+                if !completion_is_nonfatal(completion_code) {
+                    crate::warn!(
+                        "[xHCI] Transfer event failed: slot={}, ep={}, trb=0x{:X}, remaining={}, code={:?}",
+                        slot_id,
+                        endpoint_id,
+                        trb_pointer,
+                        transfer_length,
+                        completion_code
+                    );
+                }
+
+                let _ = self.pending_events.push(event);
+            }
+            Event::Unknown { trb_type, .. } => {
+                crate::warn!("[xHCI] Unhandled event TRB type {}", trb_type);
+                let _ = self.pending_events.push(event);
+            }
+        }
     }
 
     fn poll_until<F>(
@@ -209,6 +309,12 @@ impl XhciController {
             .expect("xHCI controller resources must be retained after init")
     }
 
+    fn resources_mut(&mut self) -> &mut XhciControllerResources {
+        self.resources
+            .as_mut()
+            .expect("xHCI controller resources must be retained after init")
+    }
+
     fn operational_registers(&self) -> *mut OperationalRegisters {
         self.op_virt_base as *mut OperationalRegisters
     }
@@ -240,6 +346,12 @@ impl XhciController {
         let regs = self.operational_registers();
         // SAFETY: operational registers are MMIO mapped for the lifetime of the controller.
         unsafe { read_volatile(addr_of!((*regs).usbsts)) }
+    }
+
+    fn write_usbsts(&mut self, value: u32) {
+        let regs = self.operational_registers();
+        // SAFETY: operational registers are MMIO mapped and USBSTS is acknowledged with W1C bits.
+        unsafe { write_volatile(addr_of_mut!((*regs).usbsts), value) };
     }
 
     fn read_config(&self) -> u32 {
@@ -297,6 +409,46 @@ impl XhciController {
     }
 }
 
+fn completion_is_nonfatal(code: CompletionCode) -> bool {
+    matches!(code, CompletionCode::Success | CompletionCode::ShortPacket)
+}
+
+fn interrupt_ack_actions(usbsts: u32, iman: u32) -> [Option<InterruptAck>; 2] {
+    [usbsts_eint_clear_action(usbsts), iman_ip_clear_action(iman)]
+}
+
+fn usbsts_eint_clear_action(usbsts: u32) -> Option<InterruptAck> {
+    if (usbsts & registers::usbsts::EINT) != 0 {
+        Some(InterruptAck::UsbStatus(registers::usbsts::EINT))
+    } else {
+        None
+    }
+}
+
+fn iman_ip_clear_action(iman: u32) -> Option<InterruptAck> {
+    if (iman & registers::iman::IP) != 0 {
+        Some(InterruptAck::Iman(iman_interrupt_pending_clear_value(iman)))
+    } else {
+        None
+    }
+}
+
+const fn iman_interrupt_enable_value(current: u32) -> u32 {
+    registers::iman::IE | (current & registers::iman::IP)
+}
+
+const fn iman_interrupt_disable_value(current: u32) -> u32 {
+    current & registers::iman::IP
+}
+
+const fn iman_interrupt_pending_clear_value(current: u32) -> u32 {
+    (current & registers::iman::IE) | registers::iman::IP
+}
+
+const fn erdp_dequeue_pointer_value(dequeue_pointer: u64) -> u64 {
+    dequeue_pointer | registers::erdp::EHB
+}
+
 pub(super) const fn config_with_max_slots(current: u32, max_slots: u8) -> u32 {
     (current & !registers::config::MAX_SLOTS_EN_MASK)
         | (max_slots as u32 & registers::config::MAX_SLOTS_EN_MASK)
@@ -308,7 +460,11 @@ pub(super) const fn command_ring_control_value(ring_phys_addr: u64, cycle_state:
 
 #[cfg(test)]
 mod tests {
-    use super::{command_ring_control_value, config_with_max_slots};
+    use super::{
+        InterruptAck, command_ring_control_value, config_with_max_slots,
+        erdp_dequeue_pointer_value, iman_interrupt_disable_value, iman_interrupt_enable_value,
+        iman_interrupt_pending_clear_value, interrupt_ack_actions,
+    };
     use crate::usb::xhci::registers;
 
     #[test_case]
@@ -324,5 +480,54 @@ mod tests {
             0x1234_5000 | registers::crcr::RCS
         );
         assert_eq!(command_ring_control_value(0x1234_5000, false), 0x1234_5000);
+    }
+
+    #[test_case]
+    fn test_interrupt_ack_actions_clear_usbsts_before_iman() {
+        let actions = interrupt_ack_actions(
+            registers::usbsts::EINT,
+            registers::iman::IE | registers::iman::IP,
+        );
+
+        assert_eq!(
+            actions[0],
+            Some(InterruptAck::UsbStatus(registers::usbsts::EINT))
+        );
+        assert_eq!(
+            actions[1],
+            Some(InterruptAck::Iman(
+                registers::iman::IE | registers::iman::IP
+            ))
+        );
+    }
+
+    #[test_case]
+    fn test_iman_interrupt_pending_clear_value_preserves_ie_only() {
+        assert_eq!(
+            iman_interrupt_pending_clear_value(
+                registers::iman::IE | registers::iman::IP | 0x8000_0000
+            ),
+            registers::iman::IE | registers::iman::IP
+        );
+    }
+
+    #[test_case]
+    fn test_iman_interrupt_enable_and_disable_values_do_not_echo_reserved_bits() {
+        assert_eq!(
+            iman_interrupt_enable_value(registers::iman::IP | 0x8000_0000),
+            registers::iman::IE | registers::iman::IP
+        );
+        assert_eq!(
+            iman_interrupt_disable_value(registers::iman::IE | registers::iman::IP | 0x8000_0000),
+            registers::iman::IP
+        );
+    }
+
+    #[test_case]
+    fn test_erdp_dequeue_pointer_value_sets_ehb() {
+        assert_eq!(
+            erdp_dequeue_pointer_value(0x1234_5000),
+            0x1234_5000 | registers::erdp::EHB
+        );
     }
 }

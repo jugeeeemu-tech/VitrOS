@@ -2,6 +2,8 @@
 
 pub mod controller;
 pub mod dma;
+pub mod event;
+pub mod interrupt;
 pub mod memory;
 pub mod registers;
 pub mod ring;
@@ -9,13 +11,14 @@ pub mod trb;
 
 use core::ptr::{addr_of, read_volatile};
 
-use crate::info;
-use crate::paging;
 use crate::pci::{self, PciDevice};
+use crate::{info, msi, paging};
 use controller::XhciControllerResources;
+use event::PendingEventQueue;
 use memory::{
     EventRingSegmentDescriptor, EventRingSegmentTable, ScratchpadSet, XhciControlMemoryConfig,
 };
+use msi::MsiError;
 use ring::{ConsumerRing, ProducerRing};
 
 const XHCI_CLASS_CODE: u8 = 0x0C; // Serial Bus Controller
@@ -32,6 +35,7 @@ pub enum XhciError {
     InvalidBar,
     BarNotMemory,
     MmioMappingFailed,
+    Interrupt(MsiError),
     UnsupportedPageSize { raw: u32 },
     Memory(memory::XhciMemoryError),
     Ring(ring::RingError),
@@ -50,9 +54,30 @@ impl From<ring::RingError> for XhciError {
     }
 }
 
+impl From<MsiError> for XhciError {
+    fn from(err: MsiError) -> Self {
+        Self::Interrupt(err)
+    }
+}
+
 impl From<controller::XhciControllerInitError> for XhciError {
     fn from(err: controller::XhciControllerInitError) -> Self {
         Self::Init(err)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InterruptMode {
+    Msi,
+    Msix,
+}
+
+impl InterruptMode {
+    fn disable(self, device: &PciDevice) {
+        let _ = match self {
+            Self::Msi => msi::disable_msi(device),
+            Self::Msix => msi::disable_msix(device),
+        };
     }
 }
 
@@ -69,6 +94,7 @@ pub struct XhciController {
     hccparams1: u32,
     page_size: usize,
     pub dma: dma::XhciDmaProfile,
+    pending_events: PendingEventQueue,
     resources: Option<XhciControllerResources>,
 }
 
@@ -161,13 +187,31 @@ pub fn init() -> Result<XhciController, XhciError> {
         hccparams1,
         page_size,
         dma,
+        pending_events: PendingEventQueue::new(),
         resources: None,
     };
 
     let resources = build_resources(&controller)?;
-    controller.init(resources).map_err(XhciError::Init)?;
+    interrupt::register_interrupt();
+    let interrupt_mode = configure_interrupt_mode(&controller.device)?;
+
+    if let Err(err) = controller.init(resources) {
+        interrupt_mode.disable(&controller.device);
+        return Err(XhciError::Init(err));
+    }
 
     Ok(controller)
+}
+
+fn configure_interrupt_mode(device: &PciDevice) -> Result<InterruptMode, XhciError> {
+    match msi::configure_msi(device, interrupt::XHCI_INTERRUPT_VECTOR) {
+        Ok(_) => Ok(InterruptMode::Msi),
+        Err(MsiError::NotSupported) => {
+            msi::configure_msix(device, &[interrupt::XHCI_INTERRUPT_VECTOR])?;
+            Ok(InterruptMode::Msix)
+        }
+        Err(err) => Err(XhciError::Interrupt(err)),
+    }
 }
 
 fn build_resources(controller: &XhciController) -> Result<XhciControllerResources, XhciError> {

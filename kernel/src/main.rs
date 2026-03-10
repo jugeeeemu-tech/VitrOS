@@ -356,9 +356,6 @@ extern "C" fn kernel_main_inner(boot_info_phys_addr: u64) -> ! {
     // PCIバスをスキャン
     pci::scan_pci_bus();
 
-    // USBサブシステムを初期化
-    usb::init();
-
     // Local APICを初期化
     // APICは必須なので失敗時はpanic
     // MADTから取得したAPICアドレスを使用（取得できなければデフォルト値を使用）
@@ -370,6 +367,9 @@ extern "C" fn kernel_main_inner(boot_info_phys_addr: u64) -> ! {
     // APIC Timerをキャリブレーション（割り込み無効状態で実行）
     info!("Calibrating APIC Timer...");
     apic::calibrate_timer().expect("Failed to calibrate APIC Timer");
+
+    // USBサブシステムを初期化
+    usb::init();
 
     // MTRR/PAT設定をダンプ（デバッグ用）
     mtrr::dump();
