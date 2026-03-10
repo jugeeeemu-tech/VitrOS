@@ -23,6 +23,7 @@ pub mod graphics;
 pub mod heap_window;
 pub mod hpet;
 pub mod idt;
+pub mod input;
 pub mod io;
 pub mod msi;
 pub mod msr;

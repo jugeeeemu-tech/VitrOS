@@ -1,5 +1,6 @@
 use alloc::collections::VecDeque;
 
+use crate::dma::DmaBuffer;
 use crate::usb::standard::SetupPacket;
 use crate::usb::device::{UsbDeviceHandle, UsbDeviceInfo, UsbSpeed};
 
@@ -22,6 +23,27 @@ const PORTSC_CHANGE_BITS: u32 = portsc::CSC
 const PORTSC_PRESERVE_BITS: u32 = portsc::PP;
 
 pub(crate) const CONTROL_ENDPOINT_ID: u8 = 1;
+
+pub(crate) struct InterruptTransferTd {
+    trb: Trb,
+}
+
+impl InterruptTransferTd {
+    pub fn new(data_buffer_phys_addr: u64, transfer_length: u32) -> Self {
+        Self {
+            trb: interrupt_transfer_trb(data_buffer_phys_addr, transfer_length),
+        }
+    }
+
+    pub fn enqueue(self, ring: &mut ProducerRing) -> Result<u64, RingError> {
+        ring.enqueue(self.trb)
+    }
+
+    #[cfg(test)]
+    pub const fn trb(&self) -> &Trb {
+        &self.trb
+    }
+}
 
 pub(crate) struct ControlTransferTd {
     trbs: [Trb; 3],
@@ -89,6 +111,19 @@ impl ControlTransferTd {
     }
 }
 
+#[allow(dead_code)]
+pub(crate) struct InterruptEndpointRuntime {
+    pub endpoint_address: u8,
+    pub endpoint_id: u8,
+    pub interface_number: u8,
+    pub max_packet_size: u16,
+    pub interval: u8,
+    pub report_len: usize,
+    pub ring: ProducerRing,
+    pub report_buffer: DmaBuffer,
+    pub pending_trb_pointer: Option<u64>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PortState {
     Disconnected,
@@ -106,6 +141,8 @@ pub(crate) struct SlotRuntime {
     pub info: UsbDeviceInfo,
     pub device_context: DeviceContextBuffer,
     pub ep0_ring: ProducerRing,
+    pub active_configuration: Option<u8>,
+    pub interrupt_in: Option<InterruptEndpointRuntime>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -240,6 +277,24 @@ impl XhciController {
         self.slots.get_mut(slot_id as usize)?.take()
     }
 
+    pub(crate) fn slot_id_for_handle(&self, handle: UsbDeviceHandle) -> Option<u8> {
+        self.slots.iter().enumerate().find_map(|(slot_id, slot)| {
+            let slot = slot.as_ref()?;
+            (slot.handle == handle).then_some(slot_id as u8)
+        })
+    }
+
+    pub(crate) fn slot_runtime_by_handle(&self, handle: UsbDeviceHandle) -> Option<&SlotRuntime> {
+        self.slots.iter().flatten().find(|slot| slot.handle == handle)
+    }
+
+    pub(crate) fn slot_runtime_mut_by_handle(
+        &mut self,
+        handle: UsbDeviceHandle,
+    ) -> Option<&mut SlotRuntime> {
+        self.slots.iter_mut().flatten().find(|slot| slot.handle == handle)
+    }
+
     pub(crate) fn submit_enable_slot_command(&mut self) -> Result<u64, RingError> {
         let mut trb = Trb::default();
         trb.set_trb_type(trb_type::ENABLE_SLOT);
@@ -280,10 +335,19 @@ impl XhciController {
         slot_id: u8,
         input_context_phys_addr: u64,
     ) -> Result<u64, RingError> {
-        let mut trb = Trb::default();
-        trb.set_parameter(input_context_phys_addr);
-        trb.set_trb_type(trb_type::EVALUATE_CONTEXT);
-        trb.set_slot_id(slot_id);
+        let trb = evaluate_context_command_trb(slot_id, input_context_phys_addr);
+
+        let trb_pointer = self.resources_mut().command_ring.enqueue(trb)?;
+        self.ring_command_doorbell();
+        Ok(trb_pointer)
+    }
+
+    pub(crate) fn submit_configure_endpoint_command(
+        &mut self,
+        slot_id: u8,
+        input_context_phys_addr: u64,
+    ) -> Result<u64, RingError> {
+        let trb = configure_endpoint_command_trb(slot_id, input_context_phys_addr);
 
         let trb_pointer = self.resources_mut().command_ring.enqueue(trb)?;
         self.ring_command_doorbell();
@@ -422,6 +486,40 @@ impl XhciController {
     }
 }
 
+pub(crate) fn endpoint_address_to_dci(address: u8) -> u8 {
+    let endpoint_number = address & 0x0f;
+    if endpoint_number == 0 {
+        return CONTROL_ENDPOINT_ID;
+    }
+
+    endpoint_number.saturating_mul(2) + u8::from((address & 0x80) != 0)
+}
+
+fn evaluate_context_command_trb(slot_id: u8, input_context_phys_addr: u64) -> Trb {
+    let mut trb = Trb::default();
+    trb.set_parameter(input_context_phys_addr);
+    trb.set_trb_type(trb_type::EVALUATE_CONTEXT);
+    trb.set_slot_id(slot_id);
+    trb
+}
+
+fn configure_endpoint_command_trb(slot_id: u8, input_context_phys_addr: u64) -> Trb {
+    let mut trb = Trb::default();
+    trb.set_parameter(input_context_phys_addr);
+    trb.set_trb_type(trb_type::CONFIGURE_ENDPOINT);
+    trb.set_slot_id(slot_id);
+    trb
+}
+
+fn interrupt_transfer_trb(data_buffer_phys_addr: u64, transfer_length: u32) -> Trb {
+    let mut trb = Trb::default();
+    trb.set_parameter(data_buffer_phys_addr);
+    trb.set_transfer_length(transfer_length);
+    trb.set_trb_type(trb_type::NORMAL);
+    trb.set_ioc(true);
+    trb
+}
+
 fn push_bounded<T>(queue: &mut VecDeque<T>, value: T, overflowed: &mut bool) {
     if queue.len() >= PENDING_EVENT_CAPACITY {
         *overflowed = true;
@@ -444,8 +542,8 @@ mod tests {
     use alloc::collections::VecDeque;
 
     use super::{
-        CommandCompletionRecord, ControlTransferTd, PortState, PortStatus,
-        TransferCompletionRecord,
+        CommandCompletionRecord, ControlTransferTd, InterruptTransferTd, PortState, PortStatus,
+        TransferCompletionRecord, configure_endpoint_command_trb, endpoint_address_to_dci,
     };
     use crate::usb::device::{UsbDeviceHandle, UsbSpeed};
     use crate::usb::standard::{SetupPacket, descriptor_type};
@@ -525,5 +623,30 @@ mod tests {
         assert_eq!(td.trbs()[2].trb_type(), trb_type::STATUS_STAGE);
         assert!(td.trbs()[2].ioc());
         assert!(!td.trbs()[2].direction_in());
+    }
+
+    #[test_case]
+    fn test_endpoint_address_to_dci_mapping() {
+        assert_eq!(endpoint_address_to_dci(0x00), 1);
+        assert_eq!(endpoint_address_to_dci(0x81), 3);
+        assert_eq!(endpoint_address_to_dci(0x02), 4);
+        assert_eq!(endpoint_address_to_dci(0x83), 7);
+    }
+
+    #[test_case]
+    fn test_configure_endpoint_command_trb_sets_slot_and_type() {
+        let trb = configure_endpoint_command_trb(4, 0xCAFE_BABE);
+        assert_eq!(trb.parameter(), 0xCAFE_BABE);
+        assert_eq!(trb.trb_type(), trb_type::CONFIGURE_ENDPOINT);
+        assert_eq!(trb.slot_id(), 4);
+    }
+
+    #[test_case]
+    fn test_interrupt_transfer_td_builds_normal_trb() {
+        let td = InterruptTransferTd::new(0x1234_5000, 8);
+        assert_eq!(td.trb().parameter(), 0x1234_5000);
+        assert_eq!(td.trb().transfer_length(), 8);
+        assert_eq!(td.trb().trb_type(), trb_type::NORMAL);
+        assert!(td.trb().ioc());
     }
 }

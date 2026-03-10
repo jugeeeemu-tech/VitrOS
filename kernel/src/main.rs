@@ -15,6 +15,7 @@ use vitros_kernel::frame_allocator;
 use vitros_kernel::gdt;
 use vitros_kernel::graphics;
 use vitros_kernel::idt;
+use vitros_kernel::input;
 use vitros_kernel::mtrr;
 use vitros_kernel::paging;
 use vitros_kernel::pci;
@@ -172,6 +173,15 @@ extern "C" fn task3() -> ! {
         task::sleep_ms(16);
 
         counter += 1;
+    }
+}
+
+extern "C" fn input_echo_task() -> ! {
+    info!("[Input] Echo task started");
+
+    loop {
+        let ch = input::getchar();
+        info!("[Input] getchar: {:?}", ch);
     }
 }
 
@@ -508,6 +518,12 @@ extern "C" fn kernel_main_inner(boot_info_phys_addr: u64) -> ! {
         .expect("Failed to create DebugOverlay task"),
     );
     task::add_task(*debug);
+
+    let input_echo = Box::new(
+        task::Task::new("InputEcho", task::nice::MAX, input_echo_task)
+            .expect("Failed to create InputEcho task"),
+    );
+    task::add_task(*input_echo);
 
     info!("All tasks created. Setting up kernel main task...");
 

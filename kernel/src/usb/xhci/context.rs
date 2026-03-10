@@ -4,6 +4,7 @@ use crate::usb::device::UsbSpeed;
 use super::dma::XhciDmaProfile;
 
 const INPUT_CONTROL_CONTEXT_ADD_FLAGS_OFFSET: usize = 0x04;
+const ENDPOINT_CONTEXT_DWORD0_OFFSET: usize = 0x00;
 const SLOT_CONTEXT_DWORD0_OFFSET: usize = 0x00;
 const SLOT_CONTEXT_DWORD1_OFFSET: usize = 0x04;
 const ENDPOINT_CONTEXT_DWORD1_OFFSET: usize = 0x04;
@@ -18,9 +19,11 @@ const SLOT_CONTEXT_USB_DEVICE_ADDRESS_MASK: u32 = 0xff;
 
 const ENDPOINT_CONTEXT_CERR_SHIFT: u32 = 1;
 const ENDPOINT_CONTEXT_EP_TYPE_SHIFT: u32 = 3;
+const ENDPOINT_CONTEXT_INTERVAL_SHIFT: u32 = 16;
 const ENDPOINT_CONTEXT_MAX_PACKET_SIZE_SHIFT: u32 = 16;
 const ENDPOINT_CONTEXT_AVERAGE_TRB_LENGTH_MASK: u32 = 0xffff;
 const ENDPOINT_CONTEXT_CONTROL_EP_TYPE: u32 = 4;
+const ENDPOINT_CONTEXT_INTERRUPT_IN_EP_TYPE: u32 = 7;
 
 const ADD_CONTEXT_FLAG_SLOT: u32 = 1 << 0;
 const ADD_CONTEXT_FLAG_EP0: u32 = 1 << 1;
@@ -62,12 +65,28 @@ impl ContextLayout {
         self.context_size * 2
     }
 
+    pub const fn input_endpoint_context_offset(self, dci: u8) -> Option<usize> {
+        if dci == 0 || dci > 31 {
+            return None;
+        }
+
+        Some(((dci as usize) + 1) * self.context_size)
+    }
+
     pub const fn device_slot_context_offset(self) -> usize {
         0
     }
 
     pub const fn device_ep0_context_offset(self) -> usize {
         self.context_size
+    }
+
+    pub const fn device_endpoint_context_offset(self, dci: u8) -> Option<usize> {
+        if dci == 0 || dci > 31 {
+            return None;
+        }
+
+        Some((dci as usize) * self.context_size)
     }
 }
 
@@ -138,11 +157,47 @@ impl InputContextBuffer {
         self.write_ep0_context(ep0_max_packet_size, ep0_tr_dequeue_pointer, dequeue_cycle_state);
     }
 
+    pub fn set_configure_interrupt_endpoint(
+        &mut self,
+        port_id: u8,
+        speed: UsbSpeed,
+        context_entries: u8,
+        dci: u8,
+        max_packet_size: u16,
+        interval: u8,
+        tr_dequeue_pointer: u64,
+        dequeue_cycle_state: bool,
+        average_trb_length: u16,
+    ) {
+        self.set_add_context_flags(ADD_CONTEXT_FLAG_SLOT);
+        self.set_add_context_flag_for_dci(dci);
+        self.write_slot_context(port_id, speed, context_entries);
+        self.write_interrupt_endpoint_context(
+            dci,
+            speed,
+            max_packet_size,
+            interval,
+            tr_dequeue_pointer,
+            dequeue_cycle_state,
+            average_trb_length,
+        );
+    }
+
     fn set_add_context_flags(&mut self, flags: u32) {
         write_u32(
             self.buffer.as_mut_slice(),
             self.layout.input_control_context_offset() + INPUT_CONTROL_CONTEXT_ADD_FLAGS_OFFSET,
             flags,
+        );
+    }
+
+    pub fn set_add_context_flag_for_dci(&mut self, dci: u8) {
+        let flags_offset = self.layout.input_control_context_offset() + INPUT_CONTROL_CONTEXT_ADD_FLAGS_OFFSET;
+        let flags = read_dword(self.buffer.as_slice(), self.layout.input_control_context_offset(), 1);
+        write_u32(
+            self.buffer.as_mut_slice(),
+            flags_offset,
+            flags | add_context_flag_for_dci(dci),
         );
     }
 
@@ -171,11 +226,62 @@ impl InputContextBuffer {
         dequeue_cycle_state: bool,
     ) {
         let offset = self.layout.input_ep0_context_offset();
+        self.write_endpoint_context(
+            offset,
+            0,
+            ENDPOINT_CONTEXT_CONTROL_EP_TYPE,
+            max_packet_size,
+            tr_dequeue_pointer,
+            dequeue_cycle_state,
+            8,
+        );
+    }
+
+    fn write_interrupt_endpoint_context(
+        &mut self,
+        dci: u8,
+        speed: UsbSpeed,
+        max_packet_size: u16,
+        interval: u8,
+        tr_dequeue_pointer: u64,
+        dequeue_cycle_state: bool,
+        average_trb_length: u16,
+    ) {
+        let offset = self
+            .layout
+            .input_endpoint_context_offset(dci)
+            .expect("valid xHCI endpoint DCI");
+        self.write_endpoint_context(
+            offset,
+            u32::from(encode_interrupt_interval(speed, interval)) << ENDPOINT_CONTEXT_INTERVAL_SHIFT,
+            ENDPOINT_CONTEXT_INTERRUPT_IN_EP_TYPE,
+            max_packet_size,
+            tr_dequeue_pointer,
+            dequeue_cycle_state,
+            average_trb_length,
+        );
+    }
+
+    fn write_endpoint_context(
+        &mut self,
+        offset: usize,
+        dword0: u32,
+        endpoint_type: u32,
+        max_packet_size: u16,
+        tr_dequeue_pointer: u64,
+        dequeue_cycle_state: bool,
+        average_trb_length: u16,
+    ) {
         let dword1 = (3u32 << ENDPOINT_CONTEXT_CERR_SHIFT)
-            | (ENDPOINT_CONTEXT_CONTROL_EP_TYPE << ENDPOINT_CONTEXT_EP_TYPE_SHIFT)
+            | (endpoint_type << ENDPOINT_CONTEXT_EP_TYPE_SHIFT)
             | ((max_packet_size as u32) << ENDPOINT_CONTEXT_MAX_PACKET_SIZE_SHIFT);
         let dequeue_pointer = (tr_dequeue_pointer & !0x0f) | u64::from(dequeue_cycle_state);
 
+        write_u32(
+            self.buffer.as_mut_slice(),
+            offset + ENDPOINT_CONTEXT_DWORD0_OFFSET,
+            dword0,
+        );
         write_u32(
             self.buffer.as_mut_slice(),
             offset + ENDPOINT_CONTEXT_DWORD1_OFFSET,
@@ -194,9 +300,35 @@ impl InputContextBuffer {
         write_u32(
             self.buffer.as_mut_slice(),
             offset + ENDPOINT_CONTEXT_DWORD4_OFFSET,
-            8 & ENDPOINT_CONTEXT_AVERAGE_TRB_LENGTH_MASK,
+            u32::from(average_trb_length) & ENDPOINT_CONTEXT_AVERAGE_TRB_LENGTH_MASK,
         );
     }
+}
+
+pub(crate) const fn add_context_flag_for_dci(dci: u8) -> u32 {
+    if dci == 0 || dci > 31 {
+        0
+    } else {
+        1u32 << dci
+    }
+}
+
+pub(crate) fn encode_interrupt_interval(speed: UsbSpeed, interval: u8) -> u8 {
+    match speed {
+        UsbSpeed::High | UsbSpeed::Super | UsbSpeed::SuperPlus => interval.clamp(1, 16) - 1,
+        UsbSpeed::Low | UsbSpeed::Full => {
+            let microframes = u32::from(interval.max(1)).saturating_mul(8);
+            ceil_log2(microframes).clamp(3, 10) as u8
+        }
+    }
+}
+
+fn ceil_log2(value: u32) -> u32 {
+    if value <= 1 {
+        return 0;
+    }
+
+    u32::BITS - (value - 1).leading_zeros()
 }
 
 fn read_dword(bytes: &[u8], base_offset: usize, dword_index: usize) -> u32 {
@@ -211,7 +343,10 @@ fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ContextLayout, DeviceContextBuffer, InputContextBuffer, read_dword};
+    use super::{
+        ContextLayout, DeviceContextBuffer, InputContextBuffer, add_context_flag_for_dci,
+        encode_interrupt_interval, read_dword,
+    };
     use crate::frame_allocator;
     use crate::paging;
     use crate::usb::device::UsbSpeed;
@@ -249,12 +384,16 @@ mod tests {
         assert_eq!(small.device_context_size(), 1024);
         assert_eq!(small.input_slot_context_offset(), 32);
         assert_eq!(small.input_ep0_context_offset(), 64);
+        assert_eq!(small.input_endpoint_context_offset(3), Some(128));
+        assert_eq!(small.device_endpoint_context_offset(3), Some(96));
 
         let large = ContextLayout::new(64).expect("layout");
         assert_eq!(large.input_context_size(), 2112);
         assert_eq!(large.device_context_size(), 2048);
         assert_eq!(large.input_slot_context_offset(), 64);
         assert_eq!(large.input_ep0_context_offset(), 128);
+        assert_eq!(large.input_endpoint_context_offset(3), Some(256));
+        assert_eq!(large.device_endpoint_context_offset(3), Some(192));
     }
 
     #[test_case]
@@ -281,6 +420,32 @@ mod tests {
     }
 
     #[test_case]
+    fn test_interrupt_endpoint_context_writes_dci_slot_flags_and_interval() {
+        setup_allocator();
+        let layout = ContextLayout::new(32).expect("layout");
+        let mut buffer = InputContextBuffer::new(&dma_profile(), layout).expect("input context");
+        buffer.set_configure_interrupt_endpoint(1, UsbSpeed::Full, 3, 3, 8, 10, 0x2000, true, 8);
+
+        let bytes = buffer.buffer.as_slice();
+        assert_eq!(
+            read_dword(bytes, layout.input_control_context_offset(), 1),
+            0b1 | add_context_flag_for_dci(3)
+        );
+        assert_eq!(
+            read_dword(bytes, layout.input_slot_context_offset(), 0),
+            (1u32 << 20) | (3u32 << 27)
+        );
+        assert_eq!(
+            read_dword(bytes, layout.input_endpoint_context_offset(3).unwrap(), 0),
+            7u32 << 16
+        );
+        assert_eq!(
+            read_dword(bytes, layout.input_endpoint_context_offset(3).unwrap(), 1),
+            (3u32 << 1) | (7u32 << 3) | (8u32 << 16)
+        );
+    }
+
+    #[test_case]
     fn test_device_context_reads_usb_device_address() {
         setup_allocator();
         let layout = ContextLayout::new(32).expect("layout");
@@ -290,5 +455,14 @@ mod tests {
             .copy_from_slice(&0x0000_0042u32.to_le_bytes());
 
         assert_eq!(buffer.usb_device_address(), 0x42);
+    }
+
+    #[test_case]
+    fn test_encode_interrupt_interval_by_speed() {
+        assert_eq!(encode_interrupt_interval(UsbSpeed::High, 1), 0);
+        assert_eq!(encode_interrupt_interval(UsbSpeed::High, 4), 3);
+        assert_eq!(encode_interrupt_interval(UsbSpeed::Full, 1), 3);
+        assert_eq!(encode_interrupt_interval(UsbSpeed::Full, 10), 7);
+        assert_eq!(encode_interrupt_interval(UsbSpeed::Low, 255), 10);
     }
 }

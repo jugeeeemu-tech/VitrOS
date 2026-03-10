@@ -6,6 +6,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 pub mod descriptor;
 pub mod device;
+pub mod hid;
 pub mod standard;
 pub mod xhci;
 
@@ -37,10 +38,12 @@ static USB_WORKER_SIGNAL: AtomicBool = AtomicBool::new(false);
 const USB_WORKER_NICE: i8 = sched::nice::DEFAULT - 5;
 const USB_ENUMERATION_TIMEOUT_MS: u64 = 100;
 const USB_EP0_RING_TRB_COUNT: usize = 32;
+const USB_INTERRUPT_RING_TRB_COUNT: usize = 32;
 
 #[derive(Debug)]
 enum EnumerationError {
     ControllerUnavailable,
+    SlotRuntimeUnavailable(UsbDeviceHandle),
     InvalidPort,
     InvalidPortSpeed(u8),
     PortDisconnected,
@@ -57,6 +60,9 @@ impl core::fmt::Display for EnumerationError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::ControllerUnavailable => write!(f, "xHCI controller unavailable"),
+            Self::SlotRuntimeUnavailable(handle) => {
+                write!(f, "USB slot runtime unavailable for handle {}", handle.as_u64())
+            }
             Self::InvalidPort => write!(f, "invalid xHCI port"),
             Self::InvalidPortSpeed(speed_id) => write!(f, "invalid USB port speed id {}", speed_id),
             Self::PortDisconnected => write!(f, "USB port disconnected"),
@@ -167,6 +173,10 @@ extern "C" fn usb_worker_task() -> ! {
             process_port(port_id);
             did_work = true;
             drain_port_notifications(&mut pending_ports, &mut rescan_all_ports);
+        }
+
+        if hid::service_keyboards() {
+            did_work = true;
         }
 
         if !did_work && !rescan_all_ports {
@@ -404,6 +414,8 @@ fn enumerate_port(
             info: info.clone(),
             device_context,
             ep0_ring,
+            active_configuration: None,
+            interrupt_in: None,
         };
 
         with_controller(|controller| controller.publish_slot_runtime(slot_runtime))?;
@@ -450,6 +462,40 @@ fn submit_control_transfer(
     ep0_ring.complete_through(transfer.trb_pointer)?;
     ensure_transfer_success(transfer.completion_code)?;
 
+    Ok((setup.length as usize).saturating_sub(transfer.transfer_length as usize))
+}
+
+fn submit_control_transfer_for_handle(
+    handle: UsbDeviceHandle,
+    setup: SetupPacket,
+    data_buffer: Option<&mut crate::dma::DmaBuffer>,
+) -> Result<usize, EnumerationError> {
+    let data_buffer_phys_addr = data_buffer.as_ref().map(|buffer| buffer.phys_addr());
+    let (completion_trb_pointer, slot_id) = with_controller(|controller| {
+        let (completion_trb_pointer, slot_id) = {
+            let slot = controller
+                .slot_runtime_mut_by_handle(handle)
+                .ok_or(EnumerationError::SlotRuntimeUnavailable(handle))?;
+            let slot_id = slot.slot_id;
+            let td = ControlTransferTd::new(setup, data_buffer_phys_addr);
+            let completion_trb_pointer = td.enqueue(&mut slot.ep0_ring)?;
+            (completion_trb_pointer, slot_id)
+        };
+        controller.ring_device_doorbell(slot_id, CONTROL_ENDPOINT_ID);
+        Ok::<_, EnumerationError>((completion_trb_pointer, slot_id))
+    })??;
+
+    let transfer = wait_for_transfer_completion(completion_trb_pointer, slot_id, CONTROL_ENDPOINT_ID)?;
+
+    with_controller(|controller| {
+        let slot = controller
+            .slot_runtime_mut_by_handle(handle)
+            .ok_or(EnumerationError::SlotRuntimeUnavailable(handle))?;
+        slot.ep0_ring.complete_through(transfer.trb_pointer)?;
+        Ok::<_, EnumerationError>(())
+    })??;
+
+    ensure_transfer_success(transfer.completion_code)?;
     Ok((setup.length as usize).saturating_sub(transfer.transfer_length as usize))
 }
 
@@ -571,17 +617,28 @@ fn ensure_transfer_success(completion_code: CompletionCode) -> Result<(), Enumer
 }
 
 fn publish_device(info: UsbDeviceInfo) {
+    let handle = info.handle;
     without_interrupts(|| {
         let mut registry = DEVICE_REGISTRY.lock();
-        registry.retain(|entry| entry.handle != info.handle);
+        registry.retain(|entry| entry.handle != handle);
         registry.push(info);
     });
+
+    let device = snapshot_devices()
+        .into_iter()
+        .find(|entry| entry.handle == handle)
+        .expect("published device must be present in registry");
+    if let Err(err) = hid::attach_device(&device) {
+        warn!("[HID] Failed to attach device {}: {}", device.handle.as_u64(), err);
+    }
 }
 
 fn remove_device(handle: UsbDeviceHandle) {
     without_interrupts(|| {
         DEVICE_REGISTRY.lock().retain(|entry| entry.handle != handle);
     });
+
+    hid::detach_device(handle);
 }
 
 fn with_controller<R>(
