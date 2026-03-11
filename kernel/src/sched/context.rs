@@ -4,6 +4,23 @@
 
 use super::task::TaskError;
 
+const STACK_SLOT_SIZE: u64 = 8;
+
+#[inline(never)]
+extern "C" fn task_entry_returned() -> ! {
+    panic!("task entry returned unexpectedly");
+}
+
+fn push_stack_u64(rsp: &mut u64, value: u64) -> Result<(), TaskError> {
+    *rsp = rsp
+        .checked_sub(STACK_SLOT_SIZE)
+        .ok_or(TaskError::InvalidStackAddress)?;
+    unsafe {
+        core::ptr::write(*rsp as *mut u64, value);
+    }
+    Ok(())
+}
+
 /// CPUコンテキスト（レジスタ状態）
 ///
 /// Linux方式: すべてのレジスタとFPU/SSE状態をスタックに保存
@@ -20,10 +37,14 @@ impl Context {
     /// 新しいコンテキストを作成（Linux方式）
     ///
     /// スタックに以下の順序でレジスタを配置（switch_context()のpush順序に合わせる）:
-    /// 1. 戻りアドレス（entry_point） - 最上位
-    /// 2. rbp, rbx, r12, r13, r14, r15（callee-savedレジスタ）
-    /// 3. rflags
-    /// 4. fxsave領域（512バイト、16バイトアライメント） - 最下位、rspがここを指す
+    /// 1. entry_pointが戻った時の戻り先（task_entry_returned） - 最上位
+    /// 2. 戻りアドレス（entry_point） - switch_context()のret用
+    /// 3. rbp, rbx, r12, r13, r14, r15（callee-savedレジスタ）
+    /// 4. rflags
+    /// 5. fxsave領域（512バイト、16バイトアライメント） - 最下位、rspがここを指す
+    ///
+    /// この2段の戻り先を積むことで、新規タスクの関数入口でも通常のcallと同じ
+    /// `%rsp % 16 == 8` を満たし、x86_64 SysV ABIに従う。
     ///
     /// # Arguments
     /// * `entry_point` - タスクのエントリポイント
@@ -47,6 +68,11 @@ impl Context {
             return Err(TaskError::ContextInitFailed);
         }
 
+        // バリデーション: スタックトップが16バイトアラインされているか
+        if stack_top % FXSAVE_ALIGN != 0 {
+            return Err(TaskError::InvalidStackAddress);
+        }
+
         // バリデーション: スタックが最低限の容量を持っているか
         if stack_top < MIN_REQUIRED_STACK {
             return Err(TaskError::InvalidStackAddress);
@@ -59,54 +85,30 @@ impl Context {
         // 初期コンテキストを書き込む。呼び出し元がstack_topが有効なスタック領域の
         // 最上位アドレスであることを保証する。
 
-        // 1. 戻りアドレス（entry_point）- switch_context()のret用
-        rsp -= 8;
-        if rsp == 0 {
-            return Err(TaskError::InvalidStackAddress);
-        }
-        unsafe {
-            *(rsp as *mut u64) = entry_point;
-        }
+        // 1. entry_pointが戻った時の戻り先
+        push_stack_u64(&mut rsp, task_entry_returned as *const () as usize as u64)?;
 
-        // 2. callee-savedレジスタ（switch_context()のpush順序に合わせる）
+        // 2. 戻りアドレス（entry_point）- switch_context()のret用
+        push_stack_u64(&mut rsp, entry_point)?;
+
+        // 3. callee-savedレジスタ（switch_context()のpush順序に合わせる）
         // rbp（push rbpで積まれる）
-        rsp -= 8;
-        unsafe {
-            *(rsp as *mut u64) = 0;
-        }
+        push_stack_u64(&mut rsp, 0)?;
         // rbx（push rbxで積まれる）
-        rsp -= 8;
-        unsafe {
-            *(rsp as *mut u64) = 0;
-        }
+        push_stack_u64(&mut rsp, 0)?;
         // r12（push r12で積まれる）
-        rsp -= 8;
-        unsafe {
-            *(rsp as *mut u64) = 0;
-        }
+        push_stack_u64(&mut rsp, 0)?;
         // r13（push r13で積まれる）
-        rsp -= 8;
-        unsafe {
-            *(rsp as *mut u64) = 0;
-        }
+        push_stack_u64(&mut rsp, 0)?;
         // r14（push r14で積まれる）
-        rsp -= 8;
-        unsafe {
-            *(rsp as *mut u64) = 0;
-        }
+        push_stack_u64(&mut rsp, 0)?;
         // r15（push r15で積まれる）
-        rsp -= 8;
-        unsafe {
-            *(rsp as *mut u64) = 0;
-        }
+        push_stack_u64(&mut rsp, 0)?;
 
-        // 3. rflags（pushfqで積まれる）- 割り込み有効
-        rsp -= 8;
-        unsafe {
-            *(rsp as *mut u64) = 0x202; // IF (Interrupt Flag) を有効化
-        }
+        // 4. rflags（pushfqで積まれる）- 割り込み有効
+        push_stack_u64(&mut rsp, 0x202)?; // IF (Interrupt Flag) を有効化
 
-        // 4. fxsave領域を確保（512バイト）
+        // 5. fxsave領域を確保（512バイト）
         // switch_contextと同じアラインメント処理を適用
         let rsp_before_fxsave = rsp; // アラインメント前のRSPを保存
         rsp -= FXSAVE_SIZE;
@@ -193,4 +195,58 @@ pub unsafe extern "C" fn switch_context(old_context: *mut Context, new_context: 
         // リターン（スタックトップの戻りアドレスに戻る）
         "ret",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TEST_STACK_SIZE: usize = 2048;
+
+    #[repr(align(16))]
+    struct TestStack([u8; TEST_STACK_SIZE]);
+
+    extern "C" fn sample_task_entry() -> ! {
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+
+    #[test_case]
+    fn test_new_context_starts_task_with_sysv_stack_alignment() {
+        let mut stack = TestStack([0; TEST_STACK_SIZE]);
+        let stack_top = stack.0.as_mut_ptr() as u64 + TEST_STACK_SIZE as u64;
+
+        let context =
+            Context::new(sample_task_entry as *const () as usize as u64, stack_top).unwrap();
+
+        let rsp_before_fxsave = unsafe { *((context.rsp + 504) as *const u64) };
+        let entry_slot = rsp_before_fxsave + 7 * STACK_SLOT_SIZE;
+        let return_slot = entry_slot + STACK_SLOT_SIZE;
+        let function_entry_rsp = entry_slot + STACK_SLOT_SIZE;
+
+        assert_eq!(context.rsp % 16, 0);
+        assert_eq!(rsp_before_fxsave % 16, 8);
+        assert_eq!(unsafe { *(rsp_before_fxsave as *const u64) }, 0x202);
+        assert_eq!(
+            unsafe { *(entry_slot as *const u64) },
+            sample_task_entry as *const () as usize as u64
+        );
+        assert_eq!(
+            unsafe { *(return_slot as *const u64) },
+            task_entry_returned as *const () as usize as u64
+        );
+        assert_eq!(function_entry_rsp % 16, 8);
+    }
+
+    #[test_case]
+    fn test_new_context_rejects_unaligned_stack_top() {
+        let mut stack = TestStack([0; TEST_STACK_SIZE]);
+        let stack_top = stack.0.as_mut_ptr() as u64 + TEST_STACK_SIZE as u64 - STACK_SLOT_SIZE;
+
+        let err =
+            Context::new(sample_task_entry as *const () as usize as u64, stack_top).unwrap_err();
+
+        assert_eq!(err, TaskError::InvalidStackAddress);
+    }
 }
