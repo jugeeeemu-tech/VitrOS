@@ -10,16 +10,15 @@ extern crate alloc;
 use vitros_kernel::acpi;
 use vitros_kernel::allocator;
 use vitros_kernel::apic;
-use vitros_kernel::debug_overlay;
 use vitros_kernel::frame_allocator;
 use vitros_kernel::gdt;
 use vitros_kernel::graphics;
 use vitros_kernel::idt;
-use vitros_kernel::input;
 use vitros_kernel::mtrr;
 use vitros_kernel::paging;
 use vitros_kernel::pci;
 use vitros_kernel::sched;
+use vitros_kernel::shell;
 use vitros_kernel::timer;
 use vitros_kernel::usb;
 
@@ -38,7 +37,6 @@ use vitros_kernel::pipeline_visualization;
 use crate::graphics::FramebufferWriter;
 use alloc::boxed::Box;
 use core::arch::asm;
-use core::fmt::Write;
 use core::panic::PanicInfo;
 use vitros_common::boot_info::{BOOT_INFO_ABI_VERSION, BootInfo};
 use vitros_common::uefi;
@@ -108,80 +106,6 @@ extern "C" fn idle_task() -> ! {
         unsafe {
             asm!("hlt");
         }
-    }
-}
-
-/// タスク1：カウンタを表示し続ける（優先度：高）
-extern "C" fn task1() -> ! {
-    info!("[Task1] Started (High Priority)");
-
-    // 新Writer方式：固有の描画領域を取得
-    let region = graphics::Region::new(400, 500, 350, 20);
-    let buffer = graphics::compositor::register_writer(region).expect("Failed to register writer");
-    let mut writer = graphics::TaskWriter::new(buffer, 0xFFFFFFFF);
-
-    let mut counter = 0u64;
-    loop {
-        writer.clear(0x00000000);
-        // tick数を表示してタイマー割り込みが発生しているか確認
-        let tick = timer::current_tick();
-        let _ = write!(writer, "[Task1] Count:{} Tick:{}", counter, tick);
-
-        writer.flush();
-        task::sleep_ms(16);
-
-        counter += 1;
-    }
-}
-
-/// タスク2：カウンタを表示し続ける（優先度：中）
-extern "C" fn task2() -> ! {
-    info!("[Task2] Started (Medium Priority)");
-
-    // 新Writer方式：固有の描画領域を取得
-    let region = graphics::Region::new(400, 520, 300, 20);
-    let buffer = graphics::compositor::register_writer(region).expect("Failed to register writer");
-    let mut writer = graphics::TaskWriter::new(buffer, 0xFFFFFFFF);
-
-    let mut counter = 0u64;
-    loop {
-        writer.clear(0x00000000);
-        let _ = write!(writer, "[Task2 Med ] Count: {}", counter);
-
-        writer.flush();
-        task::sleep_ms(16);
-
-        counter += 1;
-    }
-}
-
-/// タスク3：カウンタを表示し続ける（優先度：低）
-extern "C" fn task3() -> ! {
-    info!("[Task3] Started (Low Priority)");
-
-    // 新Writer方式：固有の描画領域を取得
-    let region = graphics::Region::new(400, 540, 300, 20);
-    let buffer = graphics::compositor::register_writer(region).expect("Failed to register writer");
-    let mut writer = graphics::TaskWriter::new(buffer, 0xFFFFFFFF);
-
-    let mut counter = 0u64;
-    loop {
-        writer.clear(0x00000000);
-        let _ = write!(writer, "[Task3 Low ] Count: {}", counter);
-
-        writer.flush();
-        task::sleep_ms(16);
-
-        counter += 1;
-    }
-}
-
-extern "C" fn input_echo_task() -> ! {
-    info!("[Input] Echo task started");
-
-    loop {
-        let ch = input::getchar();
-        info!("[Input] getchar: {:?}", ch);
     }
 }
 
@@ -489,42 +413,13 @@ extern "C" fn kernel_main_inner(boot_info_phys_addr: u64) -> ! {
     pipeline_visualization::start_visualization();
 
     // =================================================================
-    // 通常モード: ワーカータスク・デバッグオーバーレイを登録
+    // 通常モード: 全画面 shell を主 UI として登録
     // =================================================================
-
-    // ワーカータスク1（やや高い優先度）
-    let t1 = Box::new(
-        task::Task::new("Task1", task::nice::DEFAULT - 5, task1).expect("Failed to create Task1"),
+    let shell_task = Box::new(
+        task::Task::new("Shell", task::nice::DEFAULT - 5, shell::shell_task)
+            .expect("Failed to create Shell task"),
     );
-    task::add_task(*t1);
-
-    // ワーカータスク2（標準優先度）
-    let t2 = Box::new(
-        task::Task::new("Task2", task::nice::DEFAULT, task2).expect("Failed to create Task2"),
-    );
-    task::add_task(*t2);
-
-    // ワーカータスク3（最低優先度）
-    let t3 =
-        Box::new(task::Task::new("Task3", task::nice::MAX, task3).expect("Failed to create Task3"));
-    task::add_task(*t3);
-
-    // デバッグオーバーレイタスク（Normalクラス、標準優先度）
-    let debug = Box::new(
-        task::Task::new(
-            "DebugOverlay",
-            task::nice::DEFAULT,
-            debug_overlay::debug_overlay_task,
-        )
-        .expect("Failed to create DebugOverlay task"),
-    );
-    task::add_task(*debug);
-
-    let input_echo = Box::new(
-        task::Task::new("InputEcho", task::nice::MAX, input_echo_task)
-            .expect("Failed to create InputEcho task"),
-    );
-    task::add_task(*input_echo);
+    task::add_task(*shell_task);
 
     info!("All tasks created. Setting up kernel main task...");
 
@@ -555,74 +450,6 @@ extern "C" fn kernel_main_inner(boot_info_phys_addr: u64) -> ! {
     }
 
     info!("Returned from scheduler! KernelMain task rescheduled, entering idle loop...");
-
-    // 通常モード: システム情報表示とテストタイマー登録
-    #[cfg(not(feature = "visualize-pipeline"))]
-    {
-        // TaskWriterで情報を表示（Compositor経由）
-        let region = graphics::Region::new(10, 350, 700, 80);
-        let buffer =
-            graphics::compositor::register_writer(region).expect("Failed to register writer");
-        let mut writer = graphics::TaskWriter::new(buffer, 0xFFFFFFFF);
-
-        let _ = writeln!(
-            writer,
-            "Framebuffer: 0x{:X}, {}x{}",
-            boot_info.framebuffer.base, boot_info.framebuffer.width, boot_info.framebuffer.height
-        );
-        let _ = writeln!(writer, "Memory regions: {}", boot_info.memory_map_count);
-        if let Some(largest_start_virt) = largest_start_virt {
-            let _ = writeln!(
-                writer,
-                "Largest usable memory: phys=0x{:X} virt=0x{:X} - 0x{:X} ({} MB)",
-                largest_start_phys,
-                largest_start_virt,
-                largest_start_virt + largest_size as u64,
-                largest_size / 1024 / 1024
-            );
-        } else {
-            let _ = writeln!(writer, "Largest usable memory: unavailable");
-        }
-        let _ = writeln!(writer, "Heap initialized: {} KB", heap_size / 1024);
-
-        #[cfg(not(feature = "visualize-allocator"))]
-        {
-            let _ = writeln!(writer, "");
-            let _ = writeln!(writer, "Kernel running...");
-            let _ = writeln!(writer, "System ready.");
-        }
-        // ローカルバッファを共有バッファに一括転送
-        writer.flush();
-
-        // ヒープが初期化されたので、タイマーを登録できる
-        info!("Registering test timers...");
-
-        // 1秒後に実行されるタイマー
-        timer::register_timer(
-            timer::seconds_to_ticks(1),
-            Box::new(|| {
-                info!("Timer 1: 1 second elapsed!");
-            }),
-        );
-
-        // 2秒後に実行されるタイマー
-        timer::register_timer(
-            timer::seconds_to_ticks(2),
-            Box::new(|| {
-                info!("Timer 2: 2 seconds elapsed!");
-            }),
-        );
-
-        // 3秒後に実行されるタイマー
-        timer::register_timer(
-            timer::seconds_to_ticks(3),
-            Box::new(|| {
-                info!("Timer 3: 3 seconds elapsed!");
-            }),
-        );
-
-        info!("Test timers registered");
-    }
 
     info!("Entering main loop");
     boot_complete();
