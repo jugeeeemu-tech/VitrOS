@@ -69,6 +69,7 @@ pub trait DirtyTrackingTarget: DrawTarget {
 
     /// ダーティ領域を取得し、クリアする
     ///
-    /// ダーティ領域がない場合は`None`を返します。
-    fn take_dirty_rect(&mut self) -> Option<Region>;
+    /// 呼び出し元が与えたscratch領域へ現在のダーティ領域を移し、
+    /// ターゲット側の追跡状態を空にします。
+    fn drain_dirty_regions(&mut self, out: &mut alloc::vec::Vec<Region>);
 }

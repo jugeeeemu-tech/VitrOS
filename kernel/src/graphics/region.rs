@@ -1,7 +1,7 @@
 //! 描画領域定義
 
 /// 描画領域を定義する構造体
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Region {
     /// 領域の左上X座標
     pub x: u32,

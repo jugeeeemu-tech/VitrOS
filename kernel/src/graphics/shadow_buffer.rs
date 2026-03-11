@@ -8,6 +8,8 @@ use alloc::vec::Vec;
 
 use super::region::Region;
 
+const MAX_DIRTY_REGIONS: usize = 32;
+
 /// シャドウフレームバッファ
 pub struct ShadowBuffer {
     /// ピクセルデータ（ARGB 32bit）
@@ -16,8 +18,8 @@ pub struct ShadowBuffer {
     width: u32,
     /// バッファの高さ（ピクセル）
     height: u32,
-    /// 変更された領域（None = 変更なし）
-    dirty_rect: Option<Region>,
+    /// 変更された領域
+    dirty_regions: Vec<Region>,
 }
 
 impl ShadowBuffer {
@@ -38,7 +40,7 @@ impl ShadowBuffer {
             buffer,
             width,
             height,
-            dirty_rect: None,
+            dirty_regions: Vec::with_capacity(MAX_DIRTY_REGIONS),
         }
     }
 
@@ -69,47 +71,46 @@ impl ShadowBuffer {
         self.mark_all_dirty();
     }
 
-    /// 変更された領域をマーク
-    ///
-    /// 既存のdirty rectと新しい領域をマージし、
-    /// 両方を含む最小のバウンディングボックスを作成します。
-    ///
-    /// # Arguments
-    /// * `region` - 変更された領域
     pub fn mark_dirty(&mut self, region: &Region) {
-        // 画面境界でクリップ
-        let x = region.x.min(self.width);
-        let y = region.y.min(self.height);
-        let right = (region.x + region.width).min(self.width);
-        let bottom = (region.y + region.height).min(self.height);
+        let Some(mut clipped) = self.clip_region(region) else {
+            return;
+        };
 
-        // 幅または高さが0の場合は無視
-        if right <= x || bottom <= y {
+        let mut index = 0;
+        while index < self.dirty_regions.len() {
+            if regions_overlap_or_touch(self.dirty_regions[index], clipped) {
+                clipped = union_regions(self.dirty_regions[index], clipped);
+                self.dirty_regions.swap_remove(index);
+            } else {
+                index += 1;
+            }
+        }
+
+        if self.dirty_regions.len() < MAX_DIRTY_REGIONS {
+            self.dirty_regions.push(clipped);
             return;
         }
 
-        let clipped = Region::new(x, y, right - x, bottom - y);
-
-        self.dirty_rect = Some(match self.dirty_rect {
-            Some(existing) => {
-                // 既存のdirty rectとマージ（バウンディングボックス）
-                let min_x = existing.x.min(clipped.x);
-                let min_y = existing.y.min(clipped.y);
-                let max_x = existing.right().max(clipped.right());
-                let max_y = existing.bottom().max(clipped.bottom());
-                Region::new(min_x, min_y, max_x - min_x, max_y - min_y)
-            }
-            None => clipped,
-        });
+        let merged = self
+            .dirty_regions
+            .iter()
+            .copied()
+            .fold(clipped, union_regions);
+        self.dirty_regions.clear();
+        self.dirty_regions.push(merged);
     }
 
-    /// dirty rectをクリアして現在の値を返す
-    ///
-    /// # Returns
-    /// 変更された領域。変更がなければNone
-    #[inline]
-    pub fn take_dirty_rect(&mut self) -> Option<Region> {
-        self.dirty_rect.take()
+    fn clip_region(&self, region: &Region) -> Option<Region> {
+        let x = region.x.min(self.width);
+        let y = region.y.min(self.height);
+        let right = region.right().min(self.width);
+        let bottom = region.bottom().min(self.height);
+
+        if right <= x || bottom <= y {
+            return None;
+        }
+
+        Some(Region::new(x, y, right - x, bottom - y))
     }
 
     /// 全画面をdirtyとしてマーク
@@ -118,13 +119,21 @@ impl ShadowBuffer {
     #[allow(dead_code)]
     #[inline]
     pub fn mark_all_dirty(&mut self) {
-        self.dirty_rect = Some(Region::new(0, 0, self.width, self.height));
+        self.dirty_regions.clear();
+        self.dirty_regions
+            .push(Region::new(0, 0, self.width, self.height));
+    }
+
+    #[inline]
+    pub fn drain_dirty_regions(&mut self, out: &mut Vec<Region>) {
+        out.clear();
+        core::mem::swap(out, &mut self.dirty_regions);
     }
 
     /// ハードウェアフレームバッファに転送（blit）
     ///
-    /// dirty rectがある場合はその領域のみ転送し、
-    /// なければ何も転送しません。転送後、dirty rectはクリアされます。
+    /// dirty領域がある場合はその領域のみ転送し、
+    /// なければ何も転送しません。転送後、dirty領域はクリアされます。
     ///
     /// # Returns
     /// 転送が行われた場合は`true`、dirty rectがなく転送されなかった場合は`false`
@@ -135,30 +144,41 @@ impl ShadowBuffer {
     /// - 転送先には`self.buffer.len() * 4`バイト以上の書き込み可能な領域があること
     /// - 呼び出し元は転送先メモリへの排他的アクセス権を持つこと
     pub unsafe fn blit_to(&mut self, hw_fb_base: u64) -> bool {
-        let dirty = match self.dirty_rect.take() {
-            Some(r) => r,
-            None => return false, // 変更なし、転送不要
-        };
+        if self.dirty_regions.is_empty() {
+            return false;
+        }
 
         let dst_base = hw_fb_base as *mut u32;
         let src_base = self.buffer.as_ptr();
         let stride = self.width as usize;
 
-        // dirty rect内の各行をコピー
-        for y in dirty.y..(dirty.y + dirty.height) {
-            let row_offset = (y as usize) * stride + (dirty.x as usize);
-            // SAFETY: row_offset < width * height が保証されている
-            // （dirty rectは画面境界でクリップ済み）
-            unsafe {
-                let src = src_base.add(row_offset);
-                let dst = dst_base.add(row_offset);
-                let count = dirty.width as usize;
-                core::ptr::copy_nonoverlapping(src, dst, count);
+        for dirty in &self.dirty_regions {
+            for y in dirty.y..dirty.bottom() {
+                let row_offset = (y as usize) * stride + (dirty.x as usize);
+                unsafe {
+                    let src = src_base.add(row_offset);
+                    let dst = dst_base.add(row_offset);
+                    let count = dirty.width as usize;
+                    core::ptr::copy_nonoverlapping(src, dst, count);
+                }
             }
         }
 
-        true // 転送が行われた
+        self.dirty_regions.clear();
+        true
     }
+}
+
+fn regions_overlap_or_touch(lhs: Region, rhs: Region) -> bool {
+    lhs.x <= rhs.right() && rhs.x <= lhs.right() && lhs.y <= rhs.bottom() && rhs.y <= lhs.bottom()
+}
+
+fn union_regions(lhs: Region, rhs: Region) -> Region {
+    let min_x = lhs.x.min(rhs.x);
+    let min_y = lhs.y.min(rhs.y);
+    let max_x = lhs.right().max(rhs.right());
+    let max_y = lhs.bottom().max(rhs.bottom());
+    Region::new(min_x, min_y, max_x - min_x, max_y - min_y)
 }
 
 // ============================================================================
@@ -234,10 +254,106 @@ impl DirtyTrackingTarget for ShadowBuffer {
     }
 
     fn mark_all_dirty(&mut self) {
-        self.dirty_rect = Some(Region::new(0, 0, self.width, self.height));
+        ShadowBuffer::mark_all_dirty(self);
     }
 
-    fn take_dirty_rect(&mut self) -> Option<Region> {
-        self.dirty_rect.take()
+    fn drain_dirty_regions(&mut self, out: &mut Vec<Region>) {
+        ShadowBuffer::drain_dirty_regions(self, out);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec;
+
+    use super::*;
+
+    #[test_case]
+    fn test_mark_dirty_merges_overlapping_regions() {
+        let mut buffer = ShadowBuffer::new(32, 32);
+
+        buffer.mark_dirty(&Region::new(0, 0, 8, 8));
+        buffer.mark_dirty(&Region::new(4, 4, 8, 8));
+
+        assert_eq!(buffer.dirty_regions, vec![Region::new(0, 0, 12, 12)]);
+    }
+
+    #[test_case]
+    fn test_mark_dirty_merges_touching_regions() {
+        let mut buffer = ShadowBuffer::new(32, 32);
+
+        buffer.mark_dirty(&Region::new(0, 0, 8, 8));
+        buffer.mark_dirty(&Region::new(8, 0, 8, 8));
+
+        assert_eq!(buffer.dirty_regions, vec![Region::new(0, 0, 16, 8)]);
+    }
+
+    #[test_case]
+    fn test_mark_dirty_keeps_disjoint_regions_separate() {
+        let mut buffer = ShadowBuffer::new(32, 32);
+
+        buffer.mark_dirty(&Region::new(0, 0, 8, 8));
+        buffer.mark_dirty(&Region::new(16, 16, 8, 8));
+
+        assert_eq!(buffer.dirty_regions.len(), 2);
+        assert!(buffer.dirty_regions.contains(&Region::new(0, 0, 8, 8)));
+        assert!(buffer.dirty_regions.contains(&Region::new(16, 16, 8, 8)));
+    }
+
+    #[test_case]
+    fn test_mark_dirty_collapses_when_region_limit_is_exceeded() {
+        let mut buffer = ShadowBuffer::new(520, 1);
+
+        for index in 0..=MAX_DIRTY_REGIONS {
+            buffer.mark_dirty(&Region::new((index as u32) * 16, 0, 8, 1));
+        }
+
+        assert!(buffer.dirty_regions.len() == 1);
+        let merged = buffer.dirty_regions[0];
+        assert!(merged.x == 0);
+        assert!(merged.y == 0);
+        assert!(merged.width == 520);
+        assert!(merged.height == 1);
+    }
+
+    #[test_case]
+    fn test_mark_all_dirty_replaces_existing_regions() {
+        let mut buffer = ShadowBuffer::new(64, 48);
+        buffer.mark_dirty(&Region::new(8, 8, 8, 8));
+
+        buffer.mark_all_dirty();
+
+        assert_eq!(buffer.dirty_regions, vec![Region::new(0, 0, 64, 48)]);
+    }
+
+    #[test_case]
+    fn test_drain_dirty_regions_moves_regions_out() {
+        let mut buffer = ShadowBuffer::new(32, 32);
+        buffer.mark_dirty(&Region::new(0, 0, 8, 8));
+        let mut drained = vec![Region::new(9, 9, 1, 1)];
+
+        buffer.drain_dirty_regions(&mut drained);
+
+        assert_eq!(drained, vec![Region::new(0, 0, 8, 8)]);
+        assert!(buffer.dirty_regions.is_empty());
+    }
+
+    #[test_case]
+    fn test_blit_to_copies_only_dirty_regions() {
+        let mut buffer = ShadowBuffer::new(4, 4);
+        buffer.buffer[0] = 0x11;
+        buffer.buffer[15] = 0x22;
+        buffer.mark_dirty(&Region::new(0, 0, 1, 1));
+        buffer.mark_dirty(&Region::new(3, 3, 1, 1));
+
+        let mut hw = vec![0xFFFF_FFFFu32; 16];
+        let changed = unsafe { buffer.blit_to(hw.as_mut_ptr() as u64) };
+
+        assert!(changed);
+        assert_eq!(hw[0], 0x11);
+        assert_eq!(hw[15], 0x22);
+        assert_eq!(hw[1], 0xFFFF_FFFFu32);
+        assert_eq!(hw[14], 0xFFFF_FFFFu32);
+        assert!(buffer.dirty_regions.is_empty());
     }
 }

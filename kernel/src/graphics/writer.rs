@@ -148,6 +148,24 @@ impl TaskWriter {
         });
     }
 
+    /// 指定座標に1文字を描画
+    ///
+    /// ピクセル座標で直接指定し、カーソル位置は変更しません。
+    pub fn draw_char_at(&mut self, x: u32, y: u32, ch: char) {
+        self.commit_pending_text();
+
+        if !ch.is_ascii() || x + 8 > self.region.width || y + 8 > self.region.height {
+            return;
+        }
+
+        self.local_commands.push(DrawCommand::DrawChar {
+            x,
+            y,
+            ch: ch as u8,
+            color: self.color,
+        });
+    }
+
     /// ローカルバッファのコマンドを共有バッファに一括転送
     ///
     /// この呼び出しでのみ共有バッファのロックを取得します。
@@ -367,5 +385,59 @@ mod tests {
                 color: 0x0012_3456,
             }
         ));
+    }
+
+    #[test_case]
+    fn test_draw_char_at_emits_draw_char_and_commits_pending_text() {
+        let buffer = test_buffer(Region::new(0, 0, 32, 16));
+        let mut writer = TaskWriter::new(Arc::clone(&buffer), 0x00FF_FFFF);
+
+        let _ = core::fmt::Write::write_str(&mut writer, "ab");
+        writer.draw_char_at(16, 0, 'c');
+        writer.flush();
+
+        let commands = buffer.lock().commands().to_vec();
+        assert_eq!(commands.len(), 2);
+        assert!(matches!(
+            &commands[0],
+            DrawCommand::DrawString {
+                x: 0,
+                y: 0,
+                text,
+                color: 0x00FF_FFFF,
+            } if text == "ab"
+        ));
+        assert!(matches!(
+            &commands[1],
+            DrawCommand::DrawChar {
+                x: 16,
+                y: 0,
+                ch: b'c',
+                color: 0x00FF_FFFF,
+            }
+        ));
+    }
+
+    #[test_case]
+    fn test_draw_char_at_ignores_non_ascii() {
+        let buffer = test_buffer(Region::new(0, 0, 32, 16));
+        let mut writer = TaskWriter::new(Arc::clone(&buffer), 0x00FF_FFFF);
+
+        writer.draw_char_at(0, 0, 'é');
+        writer.flush();
+
+        assert!(buffer.lock().commands().is_empty());
+    }
+
+    #[test_case]
+    fn test_draw_char_at_ignores_out_of_bounds() {
+        let buffer = test_buffer(Region::new(0, 0, 16, 16));
+        let mut writer = TaskWriter::new(Arc::clone(&buffer), 0x00FF_FFFF);
+
+        writer.draw_char_at(9, 0, 'a');
+        writer.draw_char_at(0, 9, 'a');
+        writer.flush();
+
+        assert!(buffer.lock().commands().is_empty());
     }
 }
