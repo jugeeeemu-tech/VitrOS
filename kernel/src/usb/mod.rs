@@ -200,6 +200,8 @@ fn drain_port_notifications(pending_ports: &mut VecDeque<u8>, rescan_all_ports: 
     }
 
     if with_xhci_controller(|controller| controller.take_overflow_flag()).unwrap_or(false) {
+        #[cfg(feature = "visualize-input")]
+        crate::input_trace::record_controller_event_overflow();
         *rescan_all_ports = true;
     }
 }

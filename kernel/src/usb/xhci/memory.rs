@@ -181,6 +181,14 @@ pub struct EventRingSegmentDescriptor {
     pub trb_count: NonZeroU16,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventRingSegmentTableSnapshot {
+    pub phys_addr: u64,
+    pub segment_count: usize,
+    pub first_segment_base_addr: u64,
+    pub first_segment_trb_count: u16,
+}
+
 pub struct EventRingSegmentTable {
     buffer: DmaBuffer,
     segment_count: usize,
@@ -222,6 +230,16 @@ impl EventRingSegmentTable {
 
     pub fn segment_count(&self) -> usize {
         self.segment_count
+    }
+
+    pub fn snapshot(&self) -> EventRingSegmentTableSnapshot {
+        let first = self.entries()[0];
+        EventRingSegmentTableSnapshot {
+            phys_addr: self.phys_addr(),
+            segment_count: self.segment_count(),
+            first_segment_base_addr: first.ring_segment_base_address,
+            first_segment_trb_count: first.ring_segment_size,
+        }
     }
 
     fn entries(&self) -> &[EventRingSegmentTableEntry] {
@@ -462,6 +480,12 @@ mod tests {
         assert_eq!(erst.entries()[0].ring_segment_size, 64);
         assert_eq!(erst.entries()[1].ring_segment_base_address, 0x5678_0000);
         assert_eq!(erst.entries()[1].ring_segment_size, 128);
+
+        let snapshot = erst.snapshot();
+        assert_eq!(snapshot.phys_addr, erst.phys_addr());
+        assert_eq!(snapshot.segment_count, 2);
+        assert_eq!(snapshot.first_segment_base_addr, 0x1234_0000);
+        assert_eq!(snapshot.first_segment_trb_count, 64);
     }
 
     #[test_case]

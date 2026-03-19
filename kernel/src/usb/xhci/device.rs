@@ -226,6 +226,11 @@ impl XhciController {
         overflowed
     }
 
+    #[cfg(feature = "visualize-input")]
+    pub(crate) fn event_overflowed(&self) -> bool {
+        self.event_overflowed
+    }
+
     pub(crate) fn take_matching_command_completion(
         &mut self,
         trb_pointer: u64,

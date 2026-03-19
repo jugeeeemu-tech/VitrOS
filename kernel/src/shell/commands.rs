@@ -4,6 +4,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::hpet;
+#[cfg(feature = "visualize-input")]
+use crate::input_trace::TraceStatusSnapshot;
 use crate::timer;
 use crate::usb;
 use crate::usb::device::UsbDeviceInfo;
@@ -12,6 +14,29 @@ use crate::usb::device::UsbDeviceInfo;
 pub enum CommandEffect {
     AppendLines(Vec<String>),
     ClearOutput,
+    #[cfg(feature = "visualize-input")]
+    Visualization(VisualizationCommand),
+}
+
+#[cfg(feature = "visualize-input")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisualizationTarget {
+    Input,
+}
+
+#[cfg(feature = "visualize-input")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisualizationAction {
+    On,
+    Off,
+    Clear,
+}
+
+#[cfg(feature = "visualize-input")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VisualizationCommand {
+    pub target: VisualizationTarget,
+    pub action: VisualizationAction,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,6 +113,8 @@ trait BuiltinContext {
     fn current_tick(&self) -> u64;
     fn timer_frequency_hz(&self) -> u64;
     fn snapshot_devices(&self) -> Vec<UsbDeviceInfo>;
+    #[cfg(feature = "visualize-input")]
+    fn input_trace_status(&self) -> TraceStatusSnapshot;
 }
 
 struct LiveBuiltinContext;
@@ -112,9 +139,14 @@ impl BuiltinContext for LiveBuiltinContext {
     fn snapshot_devices(&self) -> Vec<UsbDeviceInfo> {
         usb::snapshot_devices()
     }
+
+    #[cfg(feature = "visualize-input")]
+    fn input_trace_status(&self) -> TraceStatusSnapshot {
+        crate::input_trace::status_snapshot()
+    }
 }
 
-const BUILTIN_COMMANDS: [BuiltinCommandSpec; 6] = [
+const BUILTIN_COMMANDS: &[BuiltinCommandSpec] = &[
     BuiltinCommandSpec {
         name: "help",
         usage: "help",
@@ -157,6 +189,14 @@ const BUILTIN_COMMANDS: [BuiltinCommandSpec; 6] = [
         arg_policy: ArgPolicy::NoArgs,
         handler: devices_command,
     },
+    #[cfg(feature = "visualize-input")]
+    BuiltinCommandSpec {
+        name: "visualize",
+        usage: "visualize [input] [on|off|status|clear]",
+        summary: "control visualization features",
+        arg_policy: ArgPolicy::Variadic,
+        handler: visualize_command,
+    },
 ];
 
 fn parse_command(line: &str) -> Option<ParsedCommand<'_>> {
@@ -177,6 +217,116 @@ fn help_command(_context: &dyn BuiltinContext, _args: &[&str]) -> CommandOutcome
         lines.push(format!("{} - {}", spec.usage, spec.summary));
     }
     append_lines(lines)
+}
+
+#[cfg(feature = "visualize-input")]
+fn visualize_command(context: &dyn BuiltinContext, args: &[&str]) -> CommandOutcome {
+    if args.is_empty() {
+        let mut lines = Vec::with_capacity(3);
+        lines.push(String::from("visualization targets:"));
+        lines.push(format_status_line("input", context.input_trace_status()));
+        lines.push(String::from("usage: visualize input <on|off|status|clear>"));
+        return append_lines(lines);
+    }
+
+    match args[0] {
+        "input" => visualize_input_command(context, &args[1..]),
+        target => {
+            let mut lines = Vec::with_capacity(2);
+            lines.push(format!("unknown visualization target: {}", target));
+            lines.push(String::from("available targets: input"));
+            append_lines(lines)
+        }
+    }
+}
+
+#[cfg(feature = "visualize-input")]
+fn visualize_input_command(context: &dyn BuiltinContext, args: &[&str]) -> CommandOutcome {
+    let status = context.input_trace_status();
+    match args {
+        [] | ["status"] => append_lines(status_lines(status)),
+        ["on"] => visualization_outcome(
+            TraceStatusSnapshot {
+                enabled: true,
+                ..status
+            },
+            VisualizationAction::On,
+        ),
+        ["off"] => visualization_outcome(
+            TraceStatusSnapshot {
+                enabled: false,
+                ..status
+            },
+            VisualizationAction::Off,
+        ),
+        ["clear"] => visualization_outcome(
+            TraceStatusSnapshot {
+                stored_records: 0,
+                dropped_records: 0,
+                ..status
+            },
+            VisualizationAction::Clear,
+        ),
+        _ => append_lines(vec![String::from(
+            "usage: visualize input <on|off|status|clear>",
+        )]),
+    }
+}
+
+#[cfg(feature = "visualize-input")]
+fn status_lines(status: TraceStatusSnapshot) -> Vec<String> {
+    let mut lines = Vec::with_capacity(8);
+    lines.push(format!(
+        "input visualization: {}",
+        if status.enabled { "on" } else { "off" }
+    ));
+    lines.push(String::from("mode: controller diagram"));
+    lines.push(String::from("keyboard path: controller-centric"));
+    lines.push(String::from("modules: os,xhci,keyboard,transfer,dma,event"));
+    lines.push(format!(
+        "active keyboard: {}",
+        if status.active_keyboard_present {
+            "present"
+        } else {
+            "absent"
+        }
+    ));
+    lines.push(format!(
+        "controller snapshot: {}",
+        if status.controller_snapshot_available {
+            "available"
+        } else {
+            "unavailable"
+        }
+    ));
+    lines.push(format!("stored traces: {}", status.stored_records));
+    lines.push(format!("dropped traces: {}", status.dropped_records));
+    lines
+}
+
+#[cfg(feature = "visualize-input")]
+fn format_status_line(target: &str, status: TraceStatusSnapshot) -> String {
+    format!(
+        "{} - {} (stored={}, dropped={})",
+        target,
+        if status.enabled { "on" } else { "off" },
+        status.stored_records,
+        status.dropped_records
+    )
+}
+
+#[cfg(feature = "visualize-input")]
+fn visualization_outcome(
+    status: TraceStatusSnapshot,
+    action: VisualizationAction,
+) -> CommandOutcome {
+    let mut effects = Vec::with_capacity(2);
+    effects.push(CommandEffect::AppendLines(status_lines(status)));
+    effects.push(CommandEffect::Visualization(VisualizationCommand {
+        target: VisualizationTarget::Input,
+        action,
+    }));
+    CommandOutcome { effects }
 }
 
 fn clear_command(_context: &dyn BuiltinContext, _args: &[&str]) -> CommandOutcome {
@@ -326,6 +476,10 @@ mod tests {
     use alloc::vec::Vec;
 
     use super::{CommandEffect, CommandExecutor, CommandOutcome, ParsedCommand, parse_command};
+    #[cfg(feature = "visualize-input")]
+    use super::{VisualizationAction, VisualizationCommand, VisualizationTarget};
+    #[cfg(feature = "visualize-input")]
+    use crate::input_trace::TraceStatusSnapshot;
     use crate::usb::device::{
         UsbConfigurationInfo, UsbDeviceHandle, UsbDeviceInfo, UsbEndpointInfo, UsbInterfaceInfo,
         UsbSpeed,
@@ -337,6 +491,8 @@ mod tests {
         tick_count: u64,
         timer_frequency_hz: u64,
         devices: Vec<UsbDeviceInfo>,
+        #[cfg(feature = "visualize-input")]
+        input_trace_status: TraceStatusSnapshot,
     }
 
     impl super::BuiltinContext for FakeContext {
@@ -355,6 +511,11 @@ mod tests {
         fn snapshot_devices(&self) -> Vec<UsbDeviceInfo> {
             self.devices.clone()
         }
+
+        #[cfg(feature = "visualize-input")]
+        fn input_trace_status(&self) -> TraceStatusSnapshot {
+            self.input_trace_status
+        }
     }
 
     fn parse(line: &str) -> ParsedCommand<'_> {
@@ -366,10 +527,16 @@ mod tests {
     }
 
     fn appended_lines(outcome: CommandOutcome) -> Vec<String> {
-        assert_eq!(outcome.effects.len(), 1);
-        match outcome.effects.into_iter().next().expect("one effect") {
+        match outcome
+            .effects
+            .into_iter()
+            .next()
+            .expect("at least one effect")
+        {
             CommandEffect::AppendLines(lines) => lines,
             CommandEffect::ClearOutput => panic!("expected appended lines"),
+            #[cfg(feature = "visualize-input")]
+            CommandEffect::Visualization(_) => panic!("expected appended lines"),
         }
     }
 
@@ -448,6 +615,7 @@ mod tests {
     #[test_case]
     fn test_help_lists_all_builtins_in_registration_order() {
         let lines = appended_lines(execute_with_context("help", &FakeContext::default()));
+        #[cfg(not(feature = "visualize-input"))]
         assert_eq!(
             lines,
             vec![
@@ -458,6 +626,22 @@ mod tests {
                 String::from("uptime - show HPET-based uptime"),
                 String::from("ticks - show timer tick diagnostics"),
                 String::from("devices - list enumerated USB devices"),
+            ]
+        );
+        #[cfg(feature = "visualize-input")]
+        assert_eq!(
+            lines,
+            vec![
+                String::from("built-in commands:"),
+                String::from("help - list available built-in commands"),
+                String::from("clear - clear shell output history"),
+                String::from("echo [args...] - print arguments as a single line"),
+                String::from("uptime - show HPET-based uptime"),
+                String::from("ticks - show timer tick diagnostics"),
+                String::from("devices - list enumerated USB devices"),
+                String::from(
+                    "visualize [input] [on|off|status|clear] - control visualization features"
+                ),
             ]
         );
     }
@@ -478,6 +662,113 @@ mod tests {
     fn test_clear_rejects_extra_arguments() {
         let lines = appended_lines(execute_with_context("clear now", &FakeContext::default()));
         assert_eq!(lines, vec![String::from("usage: clear")]);
+    }
+
+    #[cfg(feature = "visualize-input")]
+    #[test_case]
+    fn test_visualize_lists_available_target() {
+        let context = FakeContext {
+            input_trace_status: TraceStatusSnapshot {
+                enabled: false,
+                stored_records: 2,
+                dropped_records: 1,
+                generation: 7,
+                ..TraceStatusSnapshot::default()
+            },
+            ..FakeContext::default()
+        };
+        let lines = appended_lines(execute_with_context("visualize", &context));
+        assert_eq!(
+            lines,
+            vec![
+                String::from("visualization targets:"),
+                String::from("input - off (stored=2, dropped=1)"),
+                String::from("usage: visualize input <on|off|status|clear>"),
+            ]
+        );
+    }
+
+    #[cfg(feature = "visualize-input")]
+    #[test_case]
+    fn test_visualize_input_on_returns_status_and_effect() {
+        let context = FakeContext {
+            input_trace_status: TraceStatusSnapshot {
+                enabled: false,
+                stored_records: 0,
+                dropped_records: 0,
+                generation: 0,
+                ..TraceStatusSnapshot::default()
+            },
+            ..FakeContext::default()
+        };
+        let outcome = execute_with_context("visualize input on", &context);
+        assert_eq!(
+            outcome.effects,
+            vec![
+                CommandEffect::AppendLines(vec![
+                    String::from("input visualization: on"),
+                    String::from("mode: diagram line-light"),
+                    String::from("keyboard path: ring-focused"),
+                    String::from("rings: transfer,event"),
+                    String::from("active keyboard: absent"),
+                    String::from("controller snapshot: unavailable"),
+                    String::from("stored traces: 0"),
+                    String::from("dropped traces: 0"),
+                ]),
+                CommandEffect::Visualization(VisualizationCommand {
+                    target: VisualizationTarget::Input,
+                    action: VisualizationAction::On,
+                }),
+            ]
+        );
+    }
+
+    #[cfg(feature = "visualize-input")]
+    #[test_case]
+    fn test_visualize_input_clear_resets_displayed_counts() {
+        let context = FakeContext {
+            input_trace_status: TraceStatusSnapshot {
+                enabled: true,
+                stored_records: 8,
+                dropped_records: 3,
+                generation: 12,
+                ..TraceStatusSnapshot::default()
+            },
+            ..FakeContext::default()
+        };
+        let outcome = execute_with_context("visualize input clear", &context);
+        assert_eq!(
+            outcome.effects,
+            vec![
+                CommandEffect::AppendLines(vec![
+                    String::from("input visualization: on"),
+                    String::from("mode: diagram line-light"),
+                    String::from("keyboard path: ring-focused"),
+                    String::from("rings: transfer,event"),
+                    String::from("active keyboard: absent"),
+                    String::from("controller snapshot: unavailable"),
+                    String::from("stored traces: 0"),
+                    String::from("dropped traces: 0"),
+                ]),
+                CommandEffect::Visualization(VisualizationCommand {
+                    target: VisualizationTarget::Input,
+                    action: VisualizationAction::Clear,
+                }),
+            ]
+        );
+    }
+
+    #[cfg(feature = "visualize-input")]
+    #[test_case]
+    fn test_visualize_input_rejects_unknown_action() {
+        let lines = appended_lines(execute_with_context(
+            "visualize input toggle",
+            &FakeContext::default(),
+        ));
+        assert_eq!(
+            lines,
+            vec![String::from("usage: visualize input <on|off|status|clear>")]
+        );
     }
 
     #[test_case]

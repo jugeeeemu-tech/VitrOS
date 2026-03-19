@@ -10,5 +10,6 @@ test = false
 [features]
 visualize-allocator = []
 visualize-pipeline = []
+visualize-input = []
 
 [dependencies]

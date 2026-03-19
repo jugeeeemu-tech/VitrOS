@@ -11,6 +11,8 @@ use super::dma::XhciDmaProfile;
 use super::trb::{Trb, trb_type};
 
 const TRB_SIZE: usize = size_of::<Trb>();
+const PRODUCER_RING_SNAPSHOT_SLOTS: usize = 32;
+const CONSUMER_RING_SNAPSHOT_SLOTS: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RingError {
@@ -100,6 +102,49 @@ pub struct ProducerRing {
     usable_capacity: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProducerRingSnapshot {
+    pub phys_addr: u64,
+    pub capacity: usize,
+    pub enqueue_index: usize,
+    pub reclaim_index: usize,
+    pub outstanding: usize,
+    pub producer_cycle_state: bool,
+    pub slot_count: usize,
+    pub slots: [RingSlotSnapshot; PRODUCER_RING_SNAPSHOT_SLOTS],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RingSlotSnapshot {
+    pub index: u16,
+    pub occupied: bool,
+    pub trb_type: u8,
+    pub cycle_bit: bool,
+    pub is_enqueue: bool,
+    pub is_reclaim: bool,
+    pub is_dequeue: bool,
+    pub is_recent: bool,
+    pub is_error: bool,
+    pub is_link: bool,
+}
+
+impl RingSlotSnapshot {
+    pub const fn empty(index: u16) -> Self {
+        Self {
+            index,
+            occupied: false,
+            trb_type: 0,
+            cycle_bit: false,
+            is_enqueue: false,
+            is_reclaim: false,
+            is_dequeue: false,
+            is_recent: false,
+            is_error: false,
+            is_link: false,
+        }
+    }
+}
+
 impl ProducerRing {
     pub fn new(capacity: usize, dma: &XhciDmaProfile) -> Result<Self, RingError> {
         if capacity < 2 {
@@ -175,6 +220,19 @@ impl ProducerRing {
         self.usable_capacity
     }
 
+    pub fn snapshot(&self) -> ProducerRingSnapshot {
+        ProducerRingSnapshot {
+            phys_addr: self.phys_addr(),
+            capacity: self.capacity(),
+            enqueue_index: self.enqueue_index,
+            reclaim_index: self.reclaim_index,
+            outstanding: self.outstanding,
+            producer_cycle_state: self.producer_cycle_state,
+            slot_count: self.storage.len().min(PRODUCER_RING_SNAPSHOT_SLOTS),
+            slots: producer_slots(self),
+        }
+    }
+
     fn link_index(&self) -> usize {
         self.usable_capacity
     }
@@ -202,6 +260,21 @@ impl ProducerRing {
         trb.set_cycle_bit(cycle_state);
         self.storage.write(self.link_index(), trb);
     }
+
+    fn is_outstanding_index(&self, index: usize) -> bool {
+        if index >= self.usable_capacity {
+            return false;
+        }
+
+        let mut cursor = self.reclaim_index;
+        for _ in 0..self.outstanding {
+            if cursor == index {
+                return true;
+            }
+            cursor = (cursor + 1) % self.usable_capacity;
+        }
+        false
+    }
 }
 
 pub struct ConsumerRing {
@@ -209,6 +282,17 @@ pub struct ConsumerRing {
     dequeue_index: usize,
     consumer_cycle_state: bool,
     trb_count: NonZeroU16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsumerRingSnapshot {
+    pub phys_addr: u64,
+    pub trb_count: u16,
+    pub dequeue_index: usize,
+    pub dequeue_pointer: u64,
+    pub consumer_cycle_state: bool,
+    pub slot_count: usize,
+    pub slots: [RingSlotSnapshot; CONSUMER_RING_SNAPSHOT_SLOTS],
 }
 
 impl ConsumerRing {
@@ -251,6 +335,66 @@ impl ConsumerRing {
     pub fn trb_count(&self) -> NonZeroU16 {
         self.trb_count
     }
+
+    pub fn snapshot(&self) -> ConsumerRingSnapshot {
+        ConsumerRingSnapshot {
+            phys_addr: self.phys_addr(),
+            trb_count: self.trb_count.get(),
+            dequeue_index: self.dequeue_index,
+            dequeue_pointer: self.dequeue_pointer(),
+            consumer_cycle_state: self.consumer_cycle_state,
+            slot_count: self.storage.len().min(CONSUMER_RING_SNAPSHOT_SLOTS),
+            slots: consumer_slots(self),
+        }
+    }
+}
+
+fn producer_slots(ring: &ProducerRing) -> [RingSlotSnapshot; PRODUCER_RING_SNAPSHOT_SLOTS] {
+    let mut slots = core::array::from_fn(|index| RingSlotSnapshot::empty(index as u16));
+    let count = ring.storage.len().min(PRODUCER_RING_SNAPSHOT_SLOTS);
+    for (index, slot) in slots.iter_mut().enumerate().take(count) {
+        let trb = ring.storage.read(index);
+        let is_link = index == ring.link_index() || trb.trb_type() == trb_type::LINK;
+        *slot = RingSlotSnapshot {
+            index: index as u16,
+            occupied: is_link || ring.is_outstanding_index(index),
+            trb_type: trb.trb_type(),
+            cycle_bit: trb.cycle_bit(),
+            is_enqueue: index == ring.enqueue_index,
+            is_reclaim: index == ring.reclaim_index,
+            is_dequeue: false,
+            is_recent: false,
+            is_error: false,
+            is_link,
+        };
+    }
+    slots
+}
+
+fn consumer_slots(ring: &ConsumerRing) -> [RingSlotSnapshot; CONSUMER_RING_SNAPSHOT_SLOTS] {
+    let mut slots = core::array::from_fn(|index| RingSlotSnapshot::empty(index as u16));
+    let count = ring.storage.len().min(CONSUMER_RING_SNAPSHOT_SLOTS);
+    for (index, slot) in slots.iter_mut().enumerate().take(count) {
+        let trb = ring.storage.read(index);
+        let expected_cycle = if index < ring.dequeue_index {
+            !ring.consumer_cycle_state
+        } else {
+            ring.consumer_cycle_state
+        };
+        *slot = RingSlotSnapshot {
+            index: index as u16,
+            occupied: trb.trb_type() != 0 && trb.cycle_bit() == expected_cycle,
+            trb_type: trb.trb_type(),
+            cycle_bit: trb.cycle_bit(),
+            is_enqueue: false,
+            is_reclaim: false,
+            is_dequeue: index == ring.dequeue_index,
+            is_recent: false,
+            is_error: false,
+            is_link: false,
+        };
+    }
+    slots
 }
 
 #[cfg(test)]
@@ -464,5 +608,103 @@ mod tests {
             ConsumerRing::new(usize::from(u16::MAX) + 1, &dma_profile()),
             Err(RingError::InvalidCapacity)
         ));
+    }
+
+    #[test_case]
+    fn test_producer_ring_snapshot_reports_indices_and_outstanding() {
+        setup_allocator(&[test_region()]);
+
+        let mut ring = ProducerRing::new(8, &dma_profile()).expect("producer ring");
+        let mut first_trb = make_trb(trb_type::NORMAL);
+        first_trb.set_transfer_length(8);
+        first_trb.set_ioc(true);
+        first_trb.set_chain_bit(true);
+        let first = ring.enqueue(first_trb).expect("enqueue first");
+        let _second = ring
+            .enqueue(make_trb(trb_type::ADDRESS_DEVICE))
+            .expect("enqueue second");
+        ring.complete_through(first).expect("reclaim first");
+
+        let snapshot = ring.snapshot();
+        assert_eq!(snapshot.phys_addr, ring.phys_addr());
+        assert_eq!(snapshot.capacity, ring.capacity());
+        assert_eq!(snapshot.enqueue_index, 2);
+        assert_eq!(snapshot.reclaim_index, 1);
+        assert_eq!(snapshot.outstanding, 1);
+        assert!(snapshot.producer_cycle_state);
+        assert_eq!(snapshot.slot_count, 8);
+        assert_eq!(snapshot.slots[0].index, 0);
+        assert_eq!(snapshot.slots[0].trb_type, trb_type::NORMAL);
+        assert!(!snapshot.slots[0].occupied);
+        assert!(!snapshot.slots[0].is_enqueue);
+        assert!(!snapshot.slots[0].is_reclaim);
+        assert_eq!(snapshot.slots[1].index, 1);
+        assert_eq!(snapshot.slots[1].trb_type, trb_type::ADDRESS_DEVICE);
+        assert!(snapshot.slots[1].occupied);
+        assert!(snapshot.slots[1].is_reclaim);
+        assert_eq!(snapshot.slots[2].index, 2);
+        assert!(snapshot.slots[2].is_enqueue);
+    }
+
+    #[test_case]
+    fn test_producer_ring_snapshot_includes_link_slot() {
+        setup_allocator(&[test_region()]);
+
+        let ring = ProducerRing::new(6, &dma_profile()).expect("producer ring");
+        let link = ring.snapshot().slots[5];
+
+        assert_eq!(link.index, 5);
+        assert_eq!(link.trb_type, trb_type::LINK);
+        assert!(link.occupied);
+        assert!(link.is_link);
+        assert!(link.cycle_bit);
+    }
+
+    #[test_case]
+    fn test_consumer_ring_snapshot_reports_pointer_and_cycle_state() {
+        setup_allocator(&[test_region()]);
+
+        let mut ring = ConsumerRing::new(4, &dma_profile()).expect("consumer ring");
+        let mut first = make_trb(trb_type::TRANSFER_EVENT);
+        first.set_parameter(0x1234_5000);
+        first.set_status((13u32 << 24) | 7);
+        first
+            .set_control((5u32 << 24) | (2u32 << 16) | (u32::from(trb_type::TRANSFER_EVENT) << 10));
+        first.set_cycle_bit(true);
+        ring.storage.write(0, first);
+
+        let mut second = make_trb(trb_type::COMMAND_COMPLETION_EVENT);
+        second.set_parameter(0xDEAD_BEEF);
+        second.set_status(1u32 << 24);
+        second.set_control((3u32 << 24) | (u32::from(trb_type::COMMAND_COMPLETION_EVENT) << 10));
+        second.set_cycle_bit(true);
+        ring.storage.write(1, second);
+
+        let initial = ring.snapshot();
+        assert_eq!(initial.phys_addr, ring.phys_addr());
+        assert_eq!(initial.trb_count, 4);
+        assert_eq!(initial.dequeue_index, 0);
+        assert_eq!(initial.dequeue_pointer, ring.phys_addr());
+        assert!(initial.consumer_cycle_state);
+        assert_eq!(initial.slot_count, 4);
+        assert_eq!(initial.slots[0].index, 0);
+        assert_eq!(initial.slots[0].trb_type, trb_type::TRANSFER_EVENT);
+        assert!(initial.slots[0].occupied);
+        assert!(initial.slots[0].is_dequeue);
+        assert_eq!(initial.slots[1].index, 1);
+        assert_eq!(
+            initial.slots[1].trb_type,
+            trb_type::COMMAND_COMPLETION_EVENT
+        );
+        assert!(initial.slots[1].occupied);
+
+        let _ = ring.dequeue().expect("first");
+
+        let snapshot = ring.snapshot();
+        assert_eq!(snapshot.dequeue_index, 1);
+        assert_eq!(snapshot.dequeue_pointer, ring.phys_addr() + 16);
+        assert!(snapshot.consumer_cycle_state);
+        assert!(!snapshot.slots[0].occupied);
+        assert!(snapshot.slots[1].is_dequeue);
     }
 }

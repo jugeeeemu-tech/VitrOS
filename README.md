@@ -67,6 +67,15 @@ KERNEL_FEATURES=visualize-allocator cargo run
 KERNEL_FEATURES=visualize-pipeline cargo run
 ```
 
+### 入力経路可視化
+
+```bash
+KERNEL_FEATURES=visualize-input cargo run
+```
+
+起動後、shell で `visualize input on` を実行すると、右側オーバーレイに
+`HID RX -> Decode -> Input Queue -> Shell -> Render` が表示されます。
+
 ## プロジェクト構造
 
 ```

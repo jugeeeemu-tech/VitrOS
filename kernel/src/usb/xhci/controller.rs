@@ -82,6 +82,9 @@ impl XhciController {
             }
         }
 
+        #[cfg(feature = "visualize-input")]
+        crate::input_trace::record_interrupt_notify();
+
         self.process_events();
     }
 
@@ -234,6 +237,18 @@ impl XhciController {
                 slot_id,
                 endpoint_id,
             } => {
+                #[cfg(feature = "visualize-input")]
+                {
+                    crate::input_trace::record_transfer_event(
+                        slot_id,
+                        endpoint_id,
+                        trb_pointer,
+                        completion_code,
+                        transfer_length,
+                    );
+                    crate::input_trace::record_event_ring_os_read(slot_id, endpoint_id);
+                }
+
                 if !completion_is_nonfatal(completion_code) {
                     crate::warn!(
                         "[xHCI] Transfer event failed: slot={}, ep={}, trb=0x{:X}, remaining={}, code={:?}",
