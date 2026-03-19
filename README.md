@@ -73,8 +73,10 @@ KERNEL_FEATURES=visualize-pipeline cargo run
 KERNEL_FEATURES=visualize-input cargo run
 ```
 
-起動後、shell で `visualize input on` を実行すると、右側オーバーレイに
-`HID RX -> Decode -> Input Queue -> Shell -> Render` が表示されます。
+起動後、shell で `visualize input on` を実行すると、右側に入力経路の可視化
+オーバーレイが表示されます。オーバーレイには `Input Path Visualization`
+ヘッダと、`OS`、`xHCI`、`Keyboard / USB Device`、`Transfer Ring`、
+`Report Buffer DMA`、`Event Ring`、それらを結ぶ経路が表示されます。
 
 ## プロジェクト構造
 
