@@ -1,5 +1,6 @@
 use alloc::collections::VecDeque;
 use alloc::string::String;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::Write;
 
@@ -14,8 +15,10 @@ const SEPARATOR_COLOR: u32 = 0x00404040;
 const TEXT_COLOR: u32 = 0xFFFFFFFF;
 const PROMPT_COLOR: u32 = 0x0000FF00;
 const CLEAR_COLOR: u32 = 0x00000000;
+pub(crate) const CURSOR_WIDTH_PX: u32 = 2;
 const HISTORY_TOP_Y: u32 = LINE_HEIGHT_PX * 2;
 const SEPARATOR_Y: u32 = LINE_HEIGHT_PX + 4;
+const BODY_TOP_ROW: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TerminalStatus<'a> {
@@ -113,6 +116,7 @@ pub(crate) struct TerminalLayout {
     height_px: u32,
     columns: usize,
     rows: usize,
+    body_rows: usize,
     history_rows: usize,
 }
 
@@ -124,13 +128,15 @@ impl TerminalLayout {
     pub(crate) fn from_viewport(width_px: u32, height_px: u32) -> Self {
         let columns = (width_px / CELL_WIDTH_PX) as usize;
         let rows = (height_px / LINE_HEIGHT_PX) as usize;
-        let history_rows = rows.saturating_sub(3);
+        let body_rows = rows.saturating_sub(BODY_TOP_ROW);
+        let history_rows = body_rows.saturating_sub(1);
 
         Self {
             width_px,
             height_px,
             columns,
             rows,
+            body_rows,
             history_rows,
         }
     }
@@ -155,6 +161,10 @@ impl TerminalLayout {
         self.history_rows
     }
 
+    pub(crate) fn body_rows(&self) -> usize {
+        self.body_rows
+    }
+
     pub(crate) fn can_render(&self) -> bool {
         self.width_px >= CELL_WIDTH_PX && self.rows >= 3
     }
@@ -172,40 +182,57 @@ impl TerminalLayout {
         HISTORY_TOP_Y + (row as u32) * LINE_HEIGHT_PX
     }
 
-    pub(crate) fn prompt_row(&self, visible_history_lines: usize) -> usize {
-        2 + visible_history_lines.min(self.history_rows)
+    pub(crate) fn prompt_row(&self, visible_history_rows: usize) -> usize {
+        BODY_TOP_ROW + visible_history_rows.min(self.body_rows)
     }
 
-    pub(crate) fn prompt_y(&self, visible_history_lines: usize) -> u32 {
-        (self.prompt_row(visible_history_lines) as u32) * LINE_HEIGHT_PX
-    }
-
-    pub(crate) fn prompt_line_region(&self, row: usize) -> Region {
+    pub(crate) fn prompt_block_region(&self, row: usize, row_count: usize) -> Region {
         Region::new(
             0,
             (row as u32) * LINE_HEIGHT_PX,
             self.width_px,
-            LINE_HEIGHT_PX,
+            ((row_count as u32) * LINE_HEIGHT_PX)
+                .min(self.height_px.saturating_sub((row as u32) * LINE_HEIGHT_PX)),
         )
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CursorRect {
+    pub(crate) x: u32,
+    pub(crate) y: u32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PromptSnapshot {
-    pub(crate) row: usize,
+    pub(crate) top_row: usize,
+    pub(crate) history_rows: usize,
     pub(crate) prompt_display: String,
     pub(crate) prompt_cols: usize,
     pub(crate) input_x_px: u32,
-    pub(crate) input_y_px: u32,
-    pub(crate) visible_input: String,
-    pub(crate) hidden_cols: usize,
+    pub(crate) visible_rows: Vec<String>,
+    pub(crate) hidden_rows: usize,
+    pub(crate) cursor: Option<CursorRect>,
+}
+
+impl PromptSnapshot {
+    pub(crate) fn row_count(&self) -> usize {
+        self.visible_rows.len()
+    }
+
+    fn row_y(&self, index: usize) -> u32 {
+        ((self.top_row + index) as u32) * LINE_HEIGHT_PX
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PromptDiff {
     AppendChar { x: u32, y: u32, ch: char },
     EraseChar { x: u32, y: u32 },
-    RedrawLine,
+    RedrawBody,
+    RedrawPrompt,
     CoveredByBodyRedraw,
 }
 
@@ -217,25 +244,43 @@ pub(crate) fn capture_prompt_snapshot(
 ) -> PromptSnapshot {
     let prompt_display = prefix_to_fit(prompt, layout.columns);
     let prompt_cols = text_columns(prompt_display);
-    let visible_history_lines = history.visible_line_count(layout.history_rows, layout.columns);
-    let row = layout.prompt_row(visible_history_lines);
-    let input_y_px = layout.prompt_y(visible_history_lines);
     let input_x_px = (prompt_cols as u32) * CELL_WIDTH_PX;
     let available_cols = layout.columns.saturating_sub(prompt_cols);
-    let visible_input = if available_cols == 0 {
-        ""
-    } else {
-        tail_to_fit(input_line, available_cols)
-    };
+    let wrapped_rows = wrap_prompt_input_rows(input_line, available_cols);
+    let total_visible_history_rows =
+        history.visible_line_count(layout.body_rows().saturating_sub(1), layout.columns);
+    let available_prompt_rows = layout
+        .body_rows()
+        .saturating_sub(total_visible_history_rows);
+    let prompt_overflow_rows = wrapped_rows
+        .len()
+        .saturating_sub(available_prompt_rows.max(1));
+    let history_rows = total_visible_history_rows.saturating_sub(prompt_overflow_rows);
+    let visible_prompt_rows = wrapped_rows
+        .len()
+        .min(layout.body_rows().saturating_sub(history_rows).max(1));
+    let hidden_rows = wrapped_rows.len().saturating_sub(visible_prompt_rows);
+    let top_row = layout.prompt_row(history_rows);
+    let visible_rows = wrapped_rows[hidden_rows..].to_vec();
+    let cursor = visible_rows.last().and_then(|last_row| {
+        let x = input_x_px + (last_row.len() as u32) * CELL_WIDTH_PX;
+        (x < layout.width_px()).then_some(CursorRect {
+            x,
+            y: ((top_row + visible_rows.len().saturating_sub(1)) as u32) * LINE_HEIGHT_PX,
+            width: CURSOR_WIDTH_PX,
+            height: LINE_HEIGHT_PX,
+        })
+    });
 
     PromptSnapshot {
-        row,
+        top_row,
+        history_rows,
         prompt_display: String::from(prompt_display),
         prompt_cols,
         input_x_px,
-        input_y_px,
-        visible_input: String::from(visible_input),
-        hidden_cols: text_columns(input_line).saturating_sub(text_columns(visible_input)),
+        visible_rows,
+        hidden_rows,
+        cursor,
     }
 }
 
@@ -249,46 +294,64 @@ pub(crate) fn diff_prompt(
     }
 
     let Some(previous) = previous else {
-        return Some(PromptDiff::RedrawLine);
+        return Some(PromptDiff::RedrawPrompt);
     };
 
     if previous == next {
         return None;
     }
 
-    if previous.row != next.row
-        || previous.prompt_display != next.prompt_display
-        || previous.prompt_cols != next.prompt_cols
-        || previous.hidden_cols != next.hidden_cols
-    {
-        return Some(PromptDiff::RedrawLine);
+    if previous.history_rows != next.history_rows {
+        return Some(PromptDiff::RedrawBody);
     }
 
-    if next.visible_input.len() == previous.visible_input.len() + 1
-        && next
-            .visible_input
-            .starts_with(previous.visible_input.as_str())
+    if previous.top_row != next.top_row
+        || previous.prompt_display != next.prompt_display
+        || previous.prompt_cols != next.prompt_cols
+        || previous.hidden_rows != next.hidden_rows
+        || previous.row_count() != next.row_count()
     {
-        let ch = next.visible_input.as_bytes()[previous.visible_input.len()] as char;
+        return Some(PromptDiff::RedrawPrompt);
+    }
+
+    if previous.visible_rows[..previous.row_count().saturating_sub(1)]
+        != next.visible_rows[..next.row_count().saturating_sub(1)]
+    {
+        return Some(PromptDiff::RedrawPrompt);
+    }
+
+    let previous_last = previous
+        .visible_rows
+        .last()
+        .expect("prompt snapshot must include at least one visible row");
+    let next_last = next
+        .visible_rows
+        .last()
+        .expect("prompt snapshot must include at least one visible row");
+
+    if next_last.len() == previous_last.len() + 1 && next_last.starts_with(previous_last.as_str()) {
+        let Some(cursor) = previous.cursor else {
+            return Some(PromptDiff::RedrawPrompt);
+        };
+        let ch = next_last.as_bytes()[previous_last.len()] as char;
         return Some(PromptDiff::AppendChar {
-            x: next.input_x_px + (previous.visible_input.len() as u32) * CELL_WIDTH_PX,
-            y: next.input_y_px,
+            x: cursor.x,
+            y: cursor.y,
             ch,
         });
     }
 
-    if previous.visible_input.len() == next.visible_input.len() + 1
-        && previous
-            .visible_input
-            .starts_with(next.visible_input.as_str())
-    {
+    if previous_last.len() == next_last.len() + 1 && previous_last.starts_with(next_last.as_str()) {
+        let Some(cursor) = next.cursor else {
+            return Some(PromptDiff::RedrawPrompt);
+        };
         return Some(PromptDiff::EraseChar {
-            x: next.input_x_px + (next.visible_input.len() as u32) * CELL_WIDTH_PX,
-            y: next.input_y_px,
+            x: cursor.x,
+            y: cursor.y,
         });
     }
 
-    Some(PromptDiff::RedrawLine)
+    Some(PromptDiff::RedrawPrompt)
 }
 
 pub(crate) fn render_status_region(
@@ -313,29 +376,50 @@ pub(crate) fn render_body_region(
     if !layout.can_render() {
         return;
     }
-    draw_history_contents(writer, layout, history);
+    draw_history_contents(writer, layout, history, prompt.history_rows);
     draw_prompt_contents(writer, prompt);
 }
 
-pub(crate) fn clear_prompt_line(writer: &mut TaskWriter, layout: &TerminalLayout, row: usize) {
-    let region = layout.prompt_line_region(row);
+pub(crate) fn clear_prompt_block(
+    writer: &mut TaskWriter,
+    layout: &TerminalLayout,
+    prompt: &PromptSnapshot,
+) {
+    let region = layout.prompt_block_region(prompt.top_row, prompt.row_count());
     writer.fill_rect(region.x, region.y, region.width, region.height, CLEAR_COLOR);
 }
 
 pub(crate) fn draw_prompt_contents(writer: &mut TaskWriter, prompt: &PromptSnapshot) {
-    writer.set_color(PROMPT_COLOR);
-    writer.draw_string_at(0, prompt.input_y_px, prompt.prompt_display.as_str());
+    for (index, line) in prompt.visible_rows.iter().enumerate() {
+        let y = prompt.row_y(index);
+        if prompt.hidden_rows == 0 && index == 0 {
+            writer.set_color(PROMPT_COLOR);
+            writer.draw_string_at(0, y, prompt.prompt_display.as_str());
+        }
 
-    if prompt.visible_input.is_empty() {
-        return;
+        if line.is_empty() {
+            continue;
+        }
+
+        writer.set_color(TEXT_COLOR);
+        writer.draw_string_at(prompt.input_x_px, y, line);
     }
+}
 
-    writer.set_color(TEXT_COLOR);
-    writer.draw_string_at(
-        prompt.input_x_px,
-        prompt.input_y_px,
-        prompt.visible_input.as_str(),
-    );
+pub(crate) fn draw_prompt_cursor(writer: &mut TaskWriter, prompt: &PromptSnapshot) {
+    let Some(cursor) = prompt.cursor else {
+        return;
+    };
+
+    writer.fill_rect(cursor.x, cursor.y, cursor.width, cursor.height, TEXT_COLOR);
+}
+
+pub(crate) fn clear_prompt_cursor(writer: &mut TaskWriter, prompt: &PromptSnapshot) {
+    let Some(cursor) = prompt.cursor else {
+        return;
+    };
+
+    writer.fill_rect(cursor.x, cursor.y, cursor.width, cursor.height, CLEAR_COLOR);
 }
 
 fn draw_status_contents(
@@ -376,10 +460,11 @@ fn draw_history_contents(
     writer: &mut TaskWriter,
     layout: &TerminalLayout,
     history: &TerminalHistory,
+    history_rows: usize,
 ) {
     writer.set_color(TEXT_COLOR);
     for (row, line) in history
-        .visible_lines(layout.history_rows, layout.columns)
+        .visible_lines(history_rows, layout.columns)
         .into_iter()
         .enumerate()
     {
@@ -426,8 +511,8 @@ impl TerminalRenderer {
             &frame.status,
             &mut self.status_scratch,
         );
-        draw_history_contents(writer, &self.layout, history);
         let prompt = capture_prompt_snapshot(&self.layout, history, frame.prompt, frame.input_line);
+        draw_history_contents(writer, &self.layout, history, prompt.history_rows);
         draw_prompt_contents(writer, &prompt);
     }
 }
@@ -520,6 +605,21 @@ fn wrap_line_into(line: &str, columns: usize, wrapped: &mut Vec<String>) {
     for chunk in line.as_bytes().chunks(columns) {
         wrapped.push(String::from_utf8_lossy(chunk).into_owned());
     }
+}
+
+fn wrap_prompt_input_rows(line: &str, columns: usize) -> Vec<String> {
+    if columns == 0 {
+        return vec![String::new()];
+    }
+
+    let mut wrapped = Vec::new();
+    wrap_line_into(line, columns, &mut wrapped);
+
+    if !line.is_empty() && line.len() % columns == 0 {
+        wrapped.push(String::new());
+    }
+
+    wrapped
 }
 
 #[cfg(test)]
@@ -803,7 +903,7 @@ mod tests {
     }
 
     #[test_case]
-    fn test_terminal_renderer_places_prompt_immediately_after_last_visible_history_line() {
+    fn test_terminal_renderer_places_prompt_immediately_after_visible_history() {
         let width_px = 160;
         let height_px = 50;
         let buffer = test_buffer(Region::new(0, 0, width_px, height_px));
@@ -883,7 +983,7 @@ mod tests {
     }
 
     #[test_case]
-    fn test_terminal_renderer_shows_tail_of_long_input_line() {
+    fn test_terminal_renderer_wraps_long_input_across_prompt_rows() {
         let width_px = 80;
         let height_px = 50;
         let buffer = test_buffer(Region::new(0, 0, width_px, height_px));
@@ -907,11 +1007,113 @@ mod tests {
             matches!(
                 command,
                 DrawCommand::DrawString {
+                    x: 0,
+                    y: 20,
+                    text,
+                    color: PROMPT_COLOR,
+                } if text == "> "
+            )
+        }));
+        assert!(commands.iter().any(|command| {
+            matches!(
+                command,
+                DrawCommand::DrawString {
                     x: 16,
                     y: 20,
                     text,
                     color: TEXT_COLOR,
-                } if text == "cdefghi"
+                } if text == "abcdefgh"
+            )
+        }));
+        assert!(commands.iter().any(|command| {
+            matches!(
+                command,
+                DrawCommand::DrawString {
+                    x: 16,
+                    y: 30,
+                    text,
+                    color: TEXT_COLOR,
+                } if text == "i"
+            )
+        }));
+    }
+
+    #[test_case]
+    fn test_terminal_renderer_scrolls_history_when_wrap_reaches_bottom() {
+        let width_px = 80;
+        let height_px = 50;
+        let buffer = test_buffer(Region::new(0, 0, width_px, height_px));
+        let mut writer = TaskWriter::new(Arc::clone(&buffer), TEXT_COLOR);
+        let mut renderer = TerminalRenderer::new(width_px, height_px);
+        let mut history = TerminalHistory::new();
+        history.append_line("alpha", renderer.columns());
+        history.append_line("beta", renderer.columns());
+        let frame = TerminalFrame {
+            status: TerminalStatus {
+                title: "v",
+                fps: None,
+                uptime_ms: None,
+            },
+            prompt: "> ",
+            input_line: "abcdefghi",
+        };
+
+        renderer.render(&mut writer, &history, &frame);
+        let commands = flushed_commands(&mut writer, &buffer);
+
+        assert!(!commands.iter().any(|command| {
+            matches!(
+                command,
+                DrawCommand::DrawString {
+                    x: 0,
+                    y: 20,
+                    text,
+                    color: TEXT_COLOR,
+                } if text == "alpha"
+            )
+        }));
+        assert!(commands.iter().any(|command| {
+            matches!(
+                command,
+                DrawCommand::DrawString {
+                    x: 0,
+                    y: 20,
+                    text,
+                    color: TEXT_COLOR,
+                } if text == "beta"
+            )
+        }));
+        assert!(commands.iter().any(|command| {
+            matches!(
+                command,
+                DrawCommand::DrawString {
+                    x: 0,
+                    y: 30,
+                    text,
+                    color: PROMPT_COLOR,
+                } if text == "> "
+            )
+        }));
+        assert!(commands.iter().any(|command| {
+            matches!(
+                command,
+                DrawCommand::DrawString {
+                    x: 16,
+                    y: 30,
+                    text,
+                    color: TEXT_COLOR,
+                } if text == "abcdefgh"
+            )
+        }));
+        assert!(commands.iter().any(|command| {
+            matches!(
+                command,
+                DrawCommand::DrawString {
+                    x: 16,
+                    y: 40,
+                    text,
+                    color: TEXT_COLOR,
+                } if text == "i"
             )
         }));
     }
@@ -934,7 +1136,7 @@ mod tests {
     }
 
     #[test_case]
-    fn test_prompt_diff_falls_back_to_redraw_when_tail_window_shifts() {
+    fn test_prompt_diff_falls_back_to_redraw_when_wrap_state_changes() {
         let layout = TerminalLayout::new(80, 50);
         let history = TerminalHistory::new();
         let previous = capture_prompt_snapshot(&layout, &history, "> ", "abcdefg");
@@ -942,7 +1144,163 @@ mod tests {
 
         assert_eq!(
             diff_prompt(Some(&previous), &next, false),
-            Some(PromptDiff::RedrawLine)
+            Some(PromptDiff::RedrawPrompt)
+        );
+    }
+
+    #[test_case]
+    fn test_prompt_diff_requests_body_redraw_when_history_window_changes() {
+        let layout = TerminalLayout::new(80, 50);
+        let mut history = TerminalHistory::new();
+        history.append_line("alpha", layout.columns());
+        history.append_line("beta", layout.columns());
+        let previous = capture_prompt_snapshot(&layout, &history, "> ", "");
+        let next = capture_prompt_snapshot(&layout, &history, "> ", "abcdefghi");
+
+        assert_eq!(
+            diff_prompt(Some(&previous), &next, false),
+            Some(PromptDiff::RedrawBody)
+        );
+    }
+
+    #[test_case]
+    fn test_capture_prompt_snapshot_wraps_input_and_positions_cursor() {
+        let layout = TerminalLayout::new(80, 50);
+        let history = TerminalHistory::new();
+        let prompt = capture_prompt_snapshot(&layout, &history, "> ", "abcdefghi");
+
+        assert_eq!(prompt.top_row, 2);
+        assert_eq!(prompt.history_rows, 0);
+        assert_eq!(
+            prompt.visible_rows,
+            vec![String::from("abcdefgh"), String::from("i")]
+        );
+        assert_eq!(
+            prompt.cursor,
+            Some(CursorRect {
+                x: 24,
+                y: 30,
+                width: CURSOR_WIDTH_PX,
+                height: LINE_HEIGHT_PX,
+            })
+        );
+    }
+
+    #[test_case]
+    fn test_capture_prompt_snapshot_wraps_cursor_to_next_row_on_exact_boundary() {
+        let layout = TerminalLayout::new(80, 50);
+        let history = TerminalHistory::new();
+        let prompt = capture_prompt_snapshot(&layout, &history, "> ", "abcdefgh");
+
+        assert_eq!(
+            prompt.visible_rows,
+            vec![String::from("abcdefgh"), String::new()]
+        );
+        assert_eq!(
+            prompt.cursor,
+            Some(CursorRect {
+                x: 16,
+                y: 30,
+                width: CURSOR_WIDTH_PX,
+                height: LINE_HEIGHT_PX,
+            })
+        );
+    }
+
+    #[test_case]
+    fn test_capture_prompt_snapshot_uses_empty_rows_before_scrolling_history() {
+        let layout = TerminalLayout::new(80, 50);
+        let mut history = TerminalHistory::new();
+        history.append_line("alpha", layout.columns());
+        let prompt = capture_prompt_snapshot(&layout, &history, "> ", "abcdefghi");
+
+        assert_eq!(prompt.top_row, 3);
+        assert_eq!(prompt.history_rows, 1);
+        assert_eq!(
+            prompt.visible_rows,
+            vec![String::from("abcdefgh"), String::from("i")]
+        );
+        assert_eq!(
+            prompt.cursor,
+            Some(CursorRect {
+                x: 24,
+                y: 40,
+                width: CURSOR_WIDTH_PX,
+                height: LINE_HEIGHT_PX,
+            })
+        );
+    }
+
+    #[test_case]
+    fn test_capture_prompt_snapshot_scrolls_history_when_wrap_reaches_bottom() {
+        let layout = TerminalLayout::new(80, 50);
+        let mut history = TerminalHistory::new();
+        history.append_line("alpha", layout.columns());
+        history.append_line("beta", layout.columns());
+        let prompt = capture_prompt_snapshot(&layout, &history, "> ", "abcdefghi");
+
+        assert_eq!(prompt.top_row, 3);
+        assert_eq!(prompt.history_rows, 1);
+        assert_eq!(
+            prompt.visible_rows,
+            vec![String::from("abcdefgh"), String::from("i")]
+        );
+        assert_eq!(
+            prompt.cursor,
+            Some(CursorRect {
+                x: 24,
+                y: 40,
+                width: CURSOR_WIDTH_PX,
+                height: LINE_HEIGHT_PX,
+            })
+        );
+    }
+
+    #[test_case]
+    fn test_capture_prompt_snapshot_scrolls_history_again_for_third_prompt_row() {
+        let layout = TerminalLayout::new(80, 50);
+        let mut history = TerminalHistory::new();
+        history.append_line("alpha", layout.columns());
+        history.append_line("beta", layout.columns());
+        let prompt = capture_prompt_snapshot(&layout, &history, "> ", "abcdefghijklmnopq");
+
+        assert_eq!(prompt.top_row, 2);
+        assert_eq!(prompt.history_rows, 0);
+        assert_eq!(
+            prompt.visible_rows,
+            vec![
+                String::from("abcdefgh"),
+                String::from("ijklmnop"),
+                String::from("q"),
+            ]
+        );
+        assert_eq!(
+            prompt.cursor,
+            Some(CursorRect {
+                x: 24,
+                y: 40,
+                width: CURSOR_WIDTH_PX,
+                height: LINE_HEIGHT_PX,
+            })
+        );
+    }
+
+    #[test_case]
+    fn test_capture_prompt_snapshot_prefers_prompt_tail_when_prompt_exceeds_body() {
+        let layout = TerminalLayout::new(80, 50);
+        let history = TerminalHistory::new();
+        let prompt = capture_prompt_snapshot(&layout, &history, "> ", "abcdefghijklmnopqrstuvwxy");
+
+        assert_eq!(prompt.top_row, 2);
+        assert_eq!(prompt.history_rows, 0);
+        assert_eq!(prompt.hidden_rows, 1);
+        assert_eq!(
+            prompt.visible_rows,
+            vec![
+                String::from("ijklmnop"),
+                String::from("qrstuvwx"),
+                String::from("y"),
+            ]
         );
     }
 }

@@ -10,12 +10,13 @@ use crate::shell::commands::{VisualizationAction, VisualizationCommand, Visualiz
 use crate::shell::line_editor::{LineEditResult, LineEditor, line_edit_command_from_text_input};
 use crate::shell::terminal::{
     CELL_WIDTH_PX, LINE_HEIGHT_PX, PromptDiff, PromptSnapshot, TerminalHistory, TerminalLayout,
-    TerminalStatus, capture_prompt_snapshot, clear_prompt_line, diff_prompt, draw_prompt_contents,
-    render_body_region, render_status_region,
+    TerminalStatus, capture_prompt_snapshot, clear_prompt_block, clear_prompt_cursor, diff_prompt,
+    draw_prompt_contents, draw_prompt_cursor, render_body_region, render_status_region,
 };
 use crate::shell::{CommandExecutor, CommandOutcome};
 use crate::text_input::TextInputEngine;
 
+const CURSOR_BLINK_INTERVAL_MS: u64 = 500;
 const FRAME_INTERVAL_MS: u64 = 16;
 const STATUS_UPDATE_INTERVAL_MS: u64 = 1000;
 const SHELL_TITLE: &str = "vitrOS kernel shell";
@@ -77,6 +78,7 @@ struct ShellRuntime {
     text_input: TextInputEngine,
     command_executor: CommandExecutor,
     status_sampler: StatusSampler,
+    cursor_blink: CursorBlinkState,
     render_state: RenderState,
     status_scratch: String,
 }
@@ -103,6 +105,10 @@ impl ShellRuntime {
             text_input: TextInputEngine::default(),
             command_executor: CommandExecutor::new(),
             status_sampler: StatusSampler::new(initial_frame_count, initial_uptime_ms),
+            cursor_blink: CursorBlinkState::new(current_time_ms(
+                initial_frame_count,
+                initial_uptime_ms,
+            )),
             render_state: RenderState::new(),
             status_scratch: String::with_capacity(64),
         }
@@ -112,16 +118,24 @@ impl ShellRuntime {
         self.sync_layout();
         self.drain_input(environment);
         self.sync_layout();
-        let (status, status_changed) = self.terminal_status(environment);
+        let frame_count = environment.frame_count();
+        let uptime_ms = environment.uptime_ms();
+        let current_time_ms = current_time_ms(frame_count, uptime_ms);
+        self.apply_pending_cursor_reset(current_time_ms);
+        let cursor_visible = self.cursor_blink.is_visible(current_time_ms);
+        let (status, status_changed) = self.terminal_status(frame_count, uptime_ms);
         if status_changed {
             self.render_state.status_dirty = true;
+        }
+        if self.render_state.last_cursor_visible != Some(cursor_visible) {
+            self.render_state.cursor_dirty = true;
         }
 
         if !self.render_state.any_dirty() {
             return;
         }
 
-        self.render(writer, &status);
+        self.render(writer, &status, cursor_visible);
     }
 
     fn drain_input<E: RuntimeEnvironment>(&mut self, environment: &mut E) {
@@ -144,9 +158,11 @@ impl ShellRuntime {
                 if !self.render_state.body_dirty {
                     self.render_state.prompt_dirty = true;
                 }
+                self.render_state.cursor_reset_pending = true;
             }
             LineEditResult::LineCommitted(line) => {
                 self.handle_committed_line(line);
+                self.render_state.cursor_reset_pending = true;
             }
         }
     }
@@ -197,9 +213,11 @@ impl ShellRuntime {
             .resize_viewport(target_width, self.screen_height_px);
         self.render_state.last_status = None;
         self.render_state.last_prompt = None;
+        self.render_state.last_cursor_visible = None;
         self.render_state.status_dirty = true;
         self.render_state.body_dirty = true;
         self.render_state.prompt_dirty = false;
+        self.render_state.cursor_dirty = false;
     }
 
     fn target_viewport_width(&self) -> u32 {
@@ -213,13 +231,12 @@ impl ShellRuntime {
         self.screen_width_px
     }
 
-    fn terminal_status<E: RuntimeEnvironment>(
+    fn terminal_status(
         &mut self,
-        environment: &E,
+        frame_count: u64,
+        uptime_ms: Option<u64>,
     ) -> (TerminalStatus<'static>, bool) {
-        let (fps, uptime_ms, changed) = self
-            .status_sampler
-            .update(environment.frame_count(), environment.uptime_ms());
+        let (fps, uptime_ms, changed) = self.status_sampler.update(frame_count, uptime_ms);
         (
             TerminalStatus {
                 title: SHELL_TITLE,
@@ -230,15 +247,22 @@ impl ShellRuntime {
         )
     }
 
-    fn render(&mut self, writer: &mut TaskWriter, status: &TerminalStatus<'static>) {
+    fn render(
+        &mut self,
+        writer: &mut TaskWriter,
+        status: &TerminalStatus<'static>,
+        cursor_visible: bool,
+    ) {
         if !self.layout.can_render() {
             writer.fill_rect(0, 0, self.layout.width_px(), self.layout.height_px(), 0);
             writer.flush();
             self.render_state.last_status = Some(RenderedStatus::from(*status));
             self.render_state.last_prompt = None;
+            self.render_state.last_cursor_visible = Some(false);
             self.render_state.status_dirty = false;
             self.render_state.body_dirty = false;
             self.render_state.prompt_dirty = false;
+            self.render_state.cursor_dirty = false;
             return;
         }
 
@@ -253,24 +277,64 @@ impl ShellRuntime {
             PROMPT,
             self.line_editor.current_line(),
         );
+        let previous_cursor_visible = self.render_state.last_cursor_visible.unwrap_or(false);
 
         if self.render_state.body_dirty {
             render_body_region(writer, &self.layout, &self.history, &next_prompt);
-            self.render_state.last_prompt = Some(next_prompt);
             self.render_state.body_dirty = false;
             self.render_state.prompt_dirty = false;
         } else if self.render_state.prompt_dirty {
             if let Some(diff) =
                 diff_prompt(self.render_state.last_prompt.as_ref(), &next_prompt, false)
             {
-                self.apply_prompt_diff(writer, &next_prompt, diff);
+                match diff {
+                    PromptDiff::RedrawBody => {
+                        render_body_region(writer, &self.layout, &self.history, &next_prompt);
+                    }
+                    prompt_diff => {
+                        if previous_cursor_visible
+                            && !matches!(
+                                prompt_diff,
+                                PromptDiff::RedrawPrompt | PromptDiff::CoveredByBodyRedraw
+                            )
+                        {
+                            if let Some(previous_prompt) = self.render_state.last_prompt.as_ref() {
+                                clear_prompt_cursor(writer, previous_prompt);
+                            }
+                        }
+                        self.apply_prompt_diff(writer, &next_prompt, prompt_diff);
+                    }
+                }
             }
-            self.render_state.last_prompt = Some(next_prompt);
             self.render_state.prompt_dirty = false;
+        } else if self.render_state.cursor_dirty {
+            match (previous_cursor_visible, cursor_visible) {
+                (true, false) => {
+                    if let Some(previous_prompt) = self.render_state.last_prompt.as_ref() {
+                        clear_prompt_cursor(writer, previous_prompt);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if self.render_state.body_dirty || self.render_state.prompt_dirty {
+            unreachable!("dirty flags must be cleared before cursor overlay");
+        }
+
+        if self.render_state.last_prompt.as_ref() != Some(&next_prompt)
+            || self.render_state.cursor_dirty
+        {
+            if cursor_visible {
+                draw_prompt_cursor(writer, &next_prompt);
+            }
         }
 
         writer.flush();
+        self.render_state.last_prompt = Some(next_prompt);
+        self.render_state.last_cursor_visible = Some(cursor_visible);
         self.render_state.status_dirty = false;
+        self.render_state.cursor_dirty = false;
     }
 
     fn apply_prompt_diff(
@@ -287,16 +351,21 @@ impl ShellRuntime {
             PromptDiff::EraseChar { x, y } => {
                 writer.fill_rect(x, y, CELL_WIDTH_PX, LINE_HEIGHT_PX, 0);
             }
-            PromptDiff::RedrawLine => {
+            PromptDiff::RedrawPrompt => {
                 if let Some(previous) = self.render_state.last_prompt.as_ref() {
-                    clear_prompt_line(writer, &self.layout, previous.row);
-                    if previous.row != next_prompt.row {
-                        clear_prompt_line(writer, &self.layout, next_prompt.row);
+                    clear_prompt_block(writer, &self.layout, previous);
+                    if previous.top_row != next_prompt.top_row
+                        || previous.row_count() != next_prompt.row_count()
+                    {
+                        clear_prompt_block(writer, &self.layout, next_prompt);
                     }
                 } else {
-                    clear_prompt_line(writer, &self.layout, next_prompt.row);
+                    clear_prompt_block(writer, &self.layout, next_prompt);
                 }
                 draw_prompt_contents(writer, next_prompt);
+            }
+            PromptDiff::RedrawBody => {
+                unreachable!("body redraw diffs must be handled before prompt-only diff rendering");
             }
             PromptDiff::CoveredByBodyRedraw => {}
         }
@@ -317,6 +386,14 @@ impl ShellRuntime {
         }
         self.render_state.body_dirty = true;
         self.render_state.prompt_dirty = false;
+        self.render_state.cursor_reset_pending = true;
+    }
+
+    fn apply_pending_cursor_reset(&mut self, current_time_ms: u64) {
+        if self.render_state.cursor_reset_pending {
+            self.cursor_blink.reset(current_time_ms);
+            self.render_state.cursor_reset_pending = false;
+        }
     }
 }
 
@@ -339,9 +416,12 @@ impl From<TerminalStatus<'_>> for RenderedStatus {
 struct RenderState {
     last_status: Option<RenderedStatus>,
     last_prompt: Option<PromptSnapshot>,
+    last_cursor_visible: Option<bool>,
     status_dirty: bool,
     body_dirty: bool,
     prompt_dirty: bool,
+    cursor_dirty: bool,
+    cursor_reset_pending: bool,
 }
 
 impl RenderState {
@@ -349,15 +429,43 @@ impl RenderState {
         Self {
             last_status: None,
             last_prompt: None,
+            last_cursor_visible: None,
             status_dirty: true,
             body_dirty: true,
             prompt_dirty: false,
+            cursor_dirty: false,
+            cursor_reset_pending: false,
         }
     }
 
     fn any_dirty(&self) -> bool {
-        self.status_dirty || self.body_dirty || self.prompt_dirty
+        self.status_dirty || self.body_dirty || self.prompt_dirty || self.cursor_dirty
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CursorBlinkState {
+    last_reset_ms: u64,
+}
+
+impl CursorBlinkState {
+    fn new(initial_time_ms: u64) -> Self {
+        Self {
+            last_reset_ms: initial_time_ms,
+        }
+    }
+
+    fn reset(&mut self, current_time_ms: u64) {
+        self.last_reset_ms = current_time_ms;
+    }
+
+    fn is_visible(&self, current_time_ms: u64) -> bool {
+        ((current_time_ms.saturating_sub(self.last_reset_ms) / CURSOR_BLINK_INTERVAL_MS) % 2) == 0
+    }
+}
+
+fn current_time_ms(frame_count: u64, uptime_ms: Option<u64>) -> u64 {
+    uptime_ms.unwrap_or(frame_count.saturating_mul(FRAME_INTERVAL_MS))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -602,7 +710,8 @@ mod tests {
             ..FakeEnvironment::default()
         };
 
-        let (initial, initial_changed) = runtime.terminal_status(&environment);
+        let (initial, initial_changed) =
+            runtime.terminal_status(environment.frame_count, environment.uptime_ms);
         assert_eq!(initial.title, SHELL_TITLE);
         assert_eq!(initial.fps, None);
         assert_eq!(initial.uptime_ms, Some(1_000));
@@ -610,14 +719,16 @@ mod tests {
 
         environment.frame_count = 60;
         environment.uptime_ms = Some(1_999);
-        let (before_interval, before_changed) = runtime.terminal_status(&environment);
+        let (before_interval, before_changed) =
+            runtime.terminal_status(environment.frame_count, environment.uptime_ms);
         assert_eq!(before_interval.fps, None);
         assert_eq!(before_interval.uptime_ms, Some(1_000));
         assert!(!before_changed);
 
         environment.frame_count = 130;
         environment.uptime_ms = Some(2_000);
-        let (after_interval, after_changed) = runtime.terminal_status(&environment);
+        let (after_interval, after_changed) =
+            runtime.terminal_status(environment.frame_count, environment.uptime_ms);
         assert_eq!(after_interval.fps, Some(120));
         assert_eq!(after_interval.uptime_ms, Some(2_000));
         assert!(after_changed);
@@ -661,9 +772,23 @@ mod tests {
         runtime.tick(&mut environment, &mut writer);
         let commands = flushed_commands(&mut writer, &buffer);
 
-        assert_eq!(commands.len(), 1);
+        assert!(commands.iter().any(|command| {
+            matches!(
+                command,
+                DrawCommand::FillRect {
+                    x: 16,
+                    y: 40,
+                    width: 2,
+                    height,
+                    color: 0,
+                } if *height == LINE_HEIGHT_PX
+            )
+        }));
         assert!(matches!(
-            commands[0],
+            commands
+                .iter()
+                .find(|command| matches!(command, DrawCommand::DrawChar { .. }))
+                .expect("append should draw a character"),
             DrawCommand::DrawChar {
                 x: 16,
                 y: 40,
@@ -671,6 +796,18 @@ mod tests {
                 ..
             }
         ));
+        assert!(commands.iter().any(|command| {
+            matches!(
+                command,
+                DrawCommand::FillRect {
+                    x: 24,
+                    y: 40,
+                    width: 2,
+                    height,
+                    color: 0xFFFF_FFFF,
+                } if *height == LINE_HEIGHT_PX
+            )
+        }));
     }
 
     #[test_case]
@@ -695,24 +832,50 @@ mod tests {
         runtime.tick(&mut environment, &mut writer);
         let commands = flushed_commands(&mut writer, &buffer);
 
-        assert_eq!(commands.len(), 1);
-        assert!(matches!(
-            commands[0],
-            DrawCommand::FillRect {
-                x: 16,
-                y: 40,
-                width,
-                height,
-                color: 0,
-            } if width == CELL_WIDTH_PX && height == LINE_HEIGHT_PX
-        ));
+        assert!(commands.iter().any(|command| {
+            matches!(
+                command,
+                DrawCommand::FillRect {
+                    x: 24,
+                    y: 40,
+                    width: 2,
+                    height,
+                    color: 0,
+                } if *height == LINE_HEIGHT_PX
+            )
+        }));
+        assert!(commands.iter().any(|command| {
+            matches!(
+                command,
+                DrawCommand::FillRect {
+                    x: 16,
+                    y: 40,
+                    width,
+                    height,
+                    color: 0,
+                } if *width == CELL_WIDTH_PX && *height == LINE_HEIGHT_PX
+            )
+        }));
+        assert!(commands.iter().any(|command| {
+            matches!(
+                command,
+                DrawCommand::FillRect {
+                    x: 16,
+                    y: 40,
+                    width: 2,
+                    height,
+                    color: 0xFFFF_FFFF,
+                } if *height == LINE_HEIGHT_PX
+            )
+        }));
     }
 
     #[test_case]
-    fn test_tick_redraws_prompt_line_when_tail_window_shifts() {
+    fn test_tick_redraws_prompt_block_when_wrap_does_not_scroll_history() {
         let buffer = test_buffer(Region::new(0, 0, 80, 50));
         let mut writer = TaskWriter::new(Arc::clone(&buffer), 0x00FF_FFFF);
         let mut runtime = runtime_with_size(80, 50, 10, Some(1_000));
+        runtime.history.clear();
         let mut environment = FakeEnvironment {
             frame_count: 10,
             uptime_ms: Some(1_000),
@@ -722,13 +885,9 @@ mod tests {
         runtime.tick(&mut environment, &mut writer);
         let _ = flushed_commands(&mut writer, &buffer);
 
-        for ch in "abcdefgh".chars() {
+        for ch in "abcdefghi".chars() {
             environment.events.push_back(key_event_for_char(ch));
         }
-        runtime.tick(&mut environment, &mut writer);
-        let _ = flushed_commands(&mut writer, &buffer);
-
-        environment.events.push_back(key_event_for_char('i'));
         runtime.tick(&mut environment, &mut writer);
         let commands = flushed_commands(&mut writer, &buffer);
 
@@ -741,7 +900,30 @@ mod tests {
                     width: 80,
                     height,
                     color: 0,
-                } if *height == LINE_HEIGHT_PX
+                } if *height == LINE_HEIGHT_PX * 2
+            )
+        }));
+        assert!(!commands.iter().any(|command| {
+            matches!(
+                command,
+                DrawCommand::FillRect {
+                    x: 0,
+                    y: 20,
+                    width: 80,
+                    height,
+                    color: 0,
+                } if *height == LINE_HEIGHT_PX * 3
+            )
+        }));
+        assert!(commands.iter().any(|command| {
+            matches!(
+                command,
+                DrawCommand::DrawString {
+                    x: 0,
+                    y: 20,
+                    text,
+                    ..
+                } if text == "> "
             )
         }));
         assert!(commands.iter().any(|command| {
@@ -752,7 +934,107 @@ mod tests {
                     y: 20,
                     text,
                     ..
-                } if text == "bcdefghi"
+                } if text == "abcdefgh"
+            )
+        }));
+        assert!(commands.iter().any(|command| {
+            matches!(
+                command,
+                DrawCommand::DrawString {
+                    x: 16,
+                    y: 30,
+                    text,
+                    ..
+                } if text == "i"
+            )
+        }));
+    }
+
+    #[test_case]
+    fn test_tick_redraws_body_when_wrap_scrolls_history() {
+        let buffer = test_buffer(Region::new(0, 0, 80, 50));
+        let mut writer = TaskWriter::new(Arc::clone(&buffer), 0x00FF_FFFF);
+        let mut runtime = runtime_with_size(80, 50, 10, Some(1_000));
+        let mut environment = FakeEnvironment {
+            frame_count: 10,
+            uptime_ms: Some(1_000),
+            ..FakeEnvironment::default()
+        };
+
+        runtime.tick(&mut environment, &mut writer);
+        let _ = flushed_commands(&mut writer, &buffer);
+
+        for ch in "abcdefghi".chars() {
+            environment.events.push_back(key_event_for_char(ch));
+        }
+        runtime.tick(&mut environment, &mut writer);
+        let commands = flushed_commands(&mut writer, &buffer);
+
+        assert!(commands.iter().any(|command| {
+            matches!(
+                command,
+                DrawCommand::FillRect {
+                    x: 0,
+                    y: 20,
+                    width: 80,
+                    height,
+                    color: 0,
+                } if *height == LINE_HEIGHT_PX * 3
+            )
+        }));
+        assert!(!commands.iter().any(|command| {
+            matches!(
+                command,
+                DrawCommand::DrawString {
+                    x: 0,
+                    y: 20,
+                    text,
+                    ..
+                } if text == "uilt-in co"
+            )
+        }));
+        assert!(commands.iter().any(|command| {
+            matches!(
+                command,
+                DrawCommand::DrawString {
+                    x: 0,
+                    y: 20,
+                    text,
+                    ..
+                } if text == "mmands"
+            )
+        }));
+        assert!(commands.iter().any(|command| {
+            matches!(
+                command,
+                DrawCommand::DrawString {
+                    x: 0,
+                    y: 30,
+                    text,
+                    ..
+                } if text == "> "
+            )
+        }));
+        assert!(commands.iter().any(|command| {
+            matches!(
+                command,
+                DrawCommand::DrawString {
+                    x: 16,
+                    y: 30,
+                    text,
+                    ..
+                } if text == "abcdefgh"
+            )
+        }));
+        assert!(commands.iter().any(|command| {
+            matches!(
+                command,
+                DrawCommand::DrawString {
+                    x: 16,
+                    y: 40,
+                    text,
+                    ..
+                } if text == "i"
             )
         }));
     }
@@ -857,6 +1139,119 @@ mod tests {
     #[test_case]
     fn test_prompt_constant_matches_expected_prefix() {
         assert_eq!(PROMPT, "> ");
+    }
+
+    #[test_case]
+    fn test_tick_cursor_blinks_without_redrawing_prompt_text() {
+        let buffer = test_buffer(Region::new(0, 0, 640, 480));
+        let mut writer = TaskWriter::new(Arc::clone(&buffer), 0x00FF_FFFF);
+        let mut runtime = runtime(10, Some(1_000));
+        let mut environment = FakeEnvironment {
+            frame_count: 10,
+            uptime_ms: Some(1_000),
+            ..FakeEnvironment::default()
+        };
+
+        runtime.tick(&mut environment, &mut writer);
+        let _ = flushed_commands(&mut writer, &buffer);
+
+        environment.uptime_ms = Some(1_600);
+        runtime.tick(&mut environment, &mut writer);
+        let commands = flushed_commands(&mut writer, &buffer);
+
+        assert_eq!(commands.len(), 1);
+        assert!(matches!(
+            commands[0],
+            DrawCommand::FillRect {
+                x: 16,
+                y: 40,
+                width: 2,
+                height,
+                color: 0,
+            } if height == LINE_HEIGHT_PX
+        ));
+    }
+
+    #[test_case]
+    fn test_tick_key_input_resets_hidden_cursor_to_visible() {
+        let buffer = test_buffer(Region::new(0, 0, 640, 480));
+        let mut writer = TaskWriter::new(Arc::clone(&buffer), 0x00FF_FFFF);
+        let mut runtime = runtime(10, Some(1_000));
+        let mut environment = FakeEnvironment {
+            frame_count: 10,
+            uptime_ms: Some(1_000),
+            ..FakeEnvironment::default()
+        };
+
+        runtime.tick(&mut environment, &mut writer);
+        let _ = flushed_commands(&mut writer, &buffer);
+
+        environment.uptime_ms = Some(1_600);
+        runtime.tick(&mut environment, &mut writer);
+        let _ = flushed_commands(&mut writer, &buffer);
+
+        environment.events.push_back(key_event(KeyCode::H));
+        runtime.tick(&mut environment, &mut writer);
+        let commands = flushed_commands(&mut writer, &buffer);
+
+        assert!(commands.iter().any(|command| {
+            matches!(
+                command,
+                DrawCommand::DrawChar {
+                    x: 16,
+                    y: 40,
+                    ch: b'h',
+                    ..
+                }
+            )
+        }));
+        assert!(commands.iter().any(|command| {
+            matches!(
+                command,
+                DrawCommand::FillRect {
+                    x: 24,
+                    y: 40,
+                    width: 2,
+                    height,
+                    color: 0xFFFF_FFFF,
+                } if *height == LINE_HEIGHT_PX
+            )
+        }));
+    }
+
+    #[test_case]
+    fn test_tick_enter_resets_hidden_cursor_to_visible_on_empty_prompt() {
+        let buffer = test_buffer(Region::new(0, 0, 640, 480));
+        let mut writer = TaskWriter::new(Arc::clone(&buffer), 0x00FF_FFFF);
+        let mut runtime = runtime(10, Some(1_000));
+        let mut environment = FakeEnvironment {
+            frame_count: 10,
+            uptime_ms: Some(1_000),
+            ..FakeEnvironment::default()
+        };
+
+        runtime.tick(&mut environment, &mut writer);
+        let _ = flushed_commands(&mut writer, &buffer);
+
+        environment.uptime_ms = Some(1_600);
+        runtime.tick(&mut environment, &mut writer);
+        let _ = flushed_commands(&mut writer, &buffer);
+
+        environment.events.push_back(key_event(KeyCode::Enter));
+        runtime.tick(&mut environment, &mut writer);
+        let commands = flushed_commands(&mut writer, &buffer);
+
+        assert_eq!(commands.len(), 1);
+        assert!(matches!(
+            commands[0],
+            DrawCommand::FillRect {
+                x: 16,
+                y: 40,
+                width: 2,
+                height,
+                color: 0xFFFF_FFFF,
+            } if height == LINE_HEIGHT_PX
+        ));
     }
 
     #[cfg(feature = "visualize-input")]
