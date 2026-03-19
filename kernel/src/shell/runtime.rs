@@ -168,12 +168,15 @@ impl ShellRuntime {
     }
 
     fn handle_committed_line(&mut self, line: String) {
+        self.history
+            .append_line(&format!("{}{}", PROMPT, line), self.layout.columns());
+        self.render_state.body_dirty = true;
+        self.render_state.prompt_dirty = false;
+
         if line.is_empty() {
             return;
         }
 
-        self.history
-            .append_line(&format!("{}{}", PROMPT, line), self.layout.columns());
         let outcome = self.command_executor.execute_line(&line);
         self.apply_command_outcome(outcome);
     }
@@ -671,9 +674,8 @@ mod tests {
     }
 
     #[test_case]
-    fn test_empty_enter_does_not_change_history() {
+    fn test_empty_enter_appends_prompt_only_history_line() {
         let mut runtime = runtime(0, Some(0));
-        let before = history_lines(&runtime);
         let mut environment = FakeEnvironment {
             events: core::iter::once(key_event(KeyCode::Enter)).collect(),
             ..FakeEnvironment::default()
@@ -681,7 +683,37 @@ mod tests {
 
         runtime.drain_input(&mut environment);
 
-        assert_eq!(history_lines(&runtime), before);
+        assert_eq!(
+            history_lines(&runtime),
+            vec![
+                String::from(SHELL_TITLE),
+                String::from("run 'help' to list built-in commands"),
+                String::from("> "),
+            ]
+        );
+    }
+
+    #[test_case]
+    fn test_repeated_empty_enter_appends_prompt_only_line_each_time() {
+        let mut runtime = runtime(0, Some(0));
+        let mut environment = FakeEnvironment {
+            events: core::iter::repeat_with(|| key_event(KeyCode::Enter))
+                .take(2)
+                .collect(),
+            ..FakeEnvironment::default()
+        };
+
+        runtime.drain_input(&mut environment);
+
+        assert_eq!(
+            history_lines(&runtime),
+            vec![
+                String::from(SHELL_TITLE),
+                String::from("run 'help' to list built-in commands"),
+                String::from("> "),
+                String::from("> "),
+            ]
+        );
     }
 
     #[test_case]
@@ -1220,7 +1252,7 @@ mod tests {
     }
 
     #[test_case]
-    fn test_tick_enter_resets_hidden_cursor_to_visible_on_empty_prompt() {
+    fn test_tick_empty_enter_redraws_body_and_resets_cursor_to_visible() {
         let buffer = test_buffer(Region::new(0, 0, 640, 480));
         let mut writer = TaskWriter::new(Arc::clone(&buffer), 0x00FF_FFFF);
         let mut runtime = runtime(10, Some(1_000));
@@ -1241,17 +1273,52 @@ mod tests {
         runtime.tick(&mut environment, &mut writer);
         let commands = flushed_commands(&mut writer, &buffer);
 
-        assert_eq!(commands.len(), 1);
-        assert!(matches!(
-            commands[0],
-            DrawCommand::FillRect {
-                x: 16,
-                y: 40,
-                width: 2,
-                height,
-                color: 0xFFFF_FFFF,
-            } if height == LINE_HEIGHT_PX
-        ));
+        assert!(commands.iter().any(|command| {
+            matches!(
+                command,
+                DrawCommand::FillRect {
+                    x: 0,
+                    y: 20,
+                    width: 640,
+                    height: 460,
+                    color: 0,
+                }
+            )
+        }));
+        assert!(commands.iter().any(|command| {
+            matches!(
+                command,
+                DrawCommand::DrawString {
+                    x: 0,
+                    y: 40,
+                    text,
+                    ..
+                } if text == "> "
+            )
+        }));
+        assert!(commands.iter().any(|command| {
+            matches!(
+                command,
+                DrawCommand::DrawString {
+                    x: 0,
+                    y: 50,
+                    text,
+                    ..
+                } if text == "> "
+            )
+        }));
+        assert!(commands.iter().any(|command| {
+            matches!(
+                command,
+                DrawCommand::FillRect {
+                    x: 16,
+                    y: 50,
+                    width: 2,
+                    height,
+                    color: 0xFFFF_FFFF,
+                } if *height == LINE_HEIGHT_PX
+            )
+        }));
     }
 
     #[cfg(feature = "visualize-input")]
