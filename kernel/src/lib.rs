@@ -24,6 +24,8 @@ pub mod heap_window;
 pub mod hpet;
 pub mod idt;
 pub mod input;
+#[cfg(feature = "visualize-input")]
+pub mod input_trace;
 pub mod io;
 pub mod msi;
 pub mod msr;
@@ -36,6 +38,7 @@ pub mod serial;
 pub mod shell;
 pub mod stack;
 pub mod sync;
+pub mod text_input;
 pub mod timer;
 pub mod timer_device;
 pub mod usb;

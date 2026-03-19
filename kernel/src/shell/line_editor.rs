@@ -1,6 +1,6 @@
 use alloc::string::String;
 
-use crate::input::{self, KeyCode, KeyEvent, KeyEventKind};
+use crate::text_input::TextInputEvent;
 
 pub const MAX_LINE_LEN: usize = 256;
 
@@ -79,15 +79,12 @@ impl Default for LineEditor {
     }
 }
 
-pub fn line_edit_command_from_key_event(event: KeyEvent) -> Option<LineEditCommand> {
-    if event.kind != KeyEventKind::Press {
-        return None;
-    }
-
-    match event.code {
-        KeyCode::Backspace => Some(LineEditCommand::Backspace),
-        KeyCode::Enter => Some(LineEditCommand::Commit),
-        _ => input::key_event_to_ascii(event).map(LineEditCommand::Insert),
+pub fn line_edit_command_from_text_input(event: TextInputEvent) -> Option<LineEditCommand> {
+    match event {
+        TextInputEvent::Insert(ch) => Some(LineEditCommand::Insert(ch)),
+        TextInputEvent::Backspace => Some(LineEditCommand::Backspace),
+        TextInputEvent::Commit => Some(LineEditCommand::Commit),
+        TextInputEvent::Unsupported => None,
     }
 }
 
@@ -96,65 +93,39 @@ mod tests {
     use alloc::string::String;
 
     use super::{
-        LineEditCommand, LineEditResult, LineEditor, MAX_LINE_LEN, line_edit_command_from_key_event,
+        LineEditCommand, LineEditResult, LineEditor, MAX_LINE_LEN,
+        line_edit_command_from_text_input,
     };
-    use crate::input::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-
-    fn key_event_with_kind(code: KeyCode, shift: bool, kind: KeyEventKind) -> KeyEvent {
-        KeyEvent {
-            code,
-            kind,
-            modifiers: KeyModifiers {
-                shift,
-                ..KeyModifiers::default()
-            },
-        }
-    }
-
-    fn key_event(code: KeyCode, shift: bool) -> KeyEvent {
-        key_event_with_kind(code, shift, KeyEventKind::Press)
-    }
+    use crate::text_input::TextInputEvent;
 
     #[test_case]
-    fn test_line_edit_command_from_key_event_maps_enter_and_backspace() {
+    fn test_line_edit_command_from_text_input_maps_enter_and_backspace() {
         assert_eq!(
-            line_edit_command_from_key_event(key_event(KeyCode::Backspace, false)),
+            line_edit_command_from_text_input(TextInputEvent::Backspace),
             Some(LineEditCommand::Backspace)
         );
         assert_eq!(
-            line_edit_command_from_key_event(key_event(KeyCode::Enter, false)),
+            line_edit_command_from_text_input(TextInputEvent::Commit),
             Some(LineEditCommand::Commit)
         );
     }
 
     #[test_case]
-    fn test_line_edit_command_from_key_event_maps_printable_ascii() {
+    fn test_line_edit_command_from_text_input_maps_printable_ascii() {
         assert_eq!(
-            line_edit_command_from_key_event(key_event(KeyCode::A, false)),
+            line_edit_command_from_text_input(TextInputEvent::Insert('a')),
             Some(LineEditCommand::Insert('a'))
         );
         assert_eq!(
-            line_edit_command_from_key_event(key_event(KeyCode::Digit1, true)),
+            line_edit_command_from_text_input(TextInputEvent::Insert('!')),
             Some(LineEditCommand::Insert('!'))
         );
     }
 
     #[test_case]
-    fn test_line_edit_command_from_key_event_ignores_unsupported_keys() {
+    fn test_line_edit_command_from_text_input_ignores_unsupported_keys() {
         assert_eq!(
-            line_edit_command_from_key_event(key_event(KeyCode::Tab, false)),
-            None
-        );
-        assert_eq!(
-            line_edit_command_from_key_event(key_event(KeyCode::ArrowLeft, false)),
-            None
-        );
-        assert_eq!(
-            line_edit_command_from_key_event(key_event_with_kind(
-                KeyCode::A,
-                false,
-                KeyEventKind::Release,
-            )),
+            line_edit_command_from_text_input(TextInputEvent::Unsupported),
             None
         );
     }

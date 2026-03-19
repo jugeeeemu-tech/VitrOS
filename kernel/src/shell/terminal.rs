@@ -1,5 +1,6 @@
 use alloc::collections::VecDeque;
 use alloc::string::String;
+use alloc::vec::Vec;
 use core::fmt::Write;
 
 use crate::graphics::{Region, TaskWriter};
@@ -32,40 +33,34 @@ pub struct TerminalFrame<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalHistory {
-    columns: usize,
     lines: VecDeque<String>,
     scrollback_offset: usize,
 }
 
 impl TerminalHistory {
-    pub fn new(columns: usize) -> Self {
+    pub fn new() -> Self {
         Self {
-            columns: columns.max(1),
             lines: VecDeque::new(),
             scrollback_offset: 0,
         }
     }
 
-    pub fn append_line(&mut self, line: &str) {
-        let mut appended = 0;
-
-        if line.is_empty() {
-            self.lines.push_back(String::new());
-            appended = 1;
-        } else {
-            for chunk in line.as_bytes().chunks(self.columns) {
-                self.lines
-                    .push_back(String::from_utf8_lossy(chunk).into_owned());
-                appended += 1;
-            }
-        }
+    pub fn append_line(&mut self, line: &str, columns: usize) {
+        let appended = wrapped_line_count(line, columns);
+        self.lines.push_back(String::from(line));
 
         if self.scrollback_offset > 0 {
             self.scrollback_offset = self.scrollback_offset.saturating_add(appended);
         }
 
         while self.lines.len() > MAX_HISTORY_LINES {
-            self.lines.pop_front();
+            let removed = self
+                .lines
+                .pop_front()
+                .expect("history length must match stored lines");
+            self.scrollback_offset = self
+                .scrollback_offset
+                .saturating_sub(wrapped_line_count(&removed, columns));
         }
     }
 
@@ -86,27 +81,28 @@ impl TerminalHistory {
         self.lines.len()
     }
 
-    pub fn visible_line_count(&self, visible_rows: usize) -> usize {
-        let offset = self.clamped_scrollback_offset(visible_rows);
-        let end = self.lines.len().saturating_sub(offset);
-        let start = end.saturating_sub(visible_rows);
-        end.saturating_sub(start)
+    pub fn visible_line_count(&self, visible_rows: usize, columns: usize) -> usize {
+        self.visible_lines(visible_rows, columns).len()
     }
 
-    pub fn iter_visible_lines(&self, visible_rows: usize) -> impl Iterator<Item = &str> + '_ {
-        let offset = self.clamped_scrollback_offset(visible_rows);
-        let end = self.lines.len().saturating_sub(offset);
+    pub fn visible_lines(&self, visible_rows: usize, columns: usize) -> Vec<String> {
+        let wrapped = self.wrapped_lines(columns);
+        let offset = self.clamped_scrollback_offset(visible_rows, wrapped.len());
+        let end = wrapped.len().saturating_sub(offset);
         let start = end.saturating_sub(visible_rows);
-
-        self.lines
-            .iter()
-            .skip(start)
-            .take(end.saturating_sub(start))
-            .map(String::as_str)
+        wrapped[start..end].to_vec()
     }
 
-    fn clamped_scrollback_offset(&self, visible_rows: usize) -> usize {
-        let hidden_rows = self.lines.len().saturating_sub(visible_rows);
+    fn wrapped_lines(&self, columns: usize) -> Vec<String> {
+        let mut wrapped = Vec::new();
+        for line in &self.lines {
+            wrap_line_into(line, columns, &mut wrapped);
+        }
+        wrapped
+    }
+
+    fn clamped_scrollback_offset(&self, visible_rows: usize, total_rows: usize) -> usize {
+        let hidden_rows = total_rows.saturating_sub(visible_rows);
         self.scrollback_offset.min(hidden_rows)
     }
 }
@@ -122,6 +118,10 @@ pub(crate) struct TerminalLayout {
 
 impl TerminalLayout {
     pub(crate) fn new(width_px: u32, height_px: u32) -> Self {
+        Self::from_viewport(width_px, height_px)
+    }
+
+    pub(crate) fn from_viewport(width_px: u32, height_px: u32) -> Self {
         let columns = (width_px / CELL_WIDTH_PX) as usize;
         let rows = (height_px / LINE_HEIGHT_PX) as usize;
         let history_rows = rows.saturating_sub(3);
@@ -133,6 +133,10 @@ impl TerminalLayout {
             rows,
             history_rows,
         }
+    }
+
+    pub(crate) fn resize_viewport(&mut self, width_px: u32, height_px: u32) {
+        *self = Self::from_viewport(width_px, height_px);
     }
 
     pub(crate) fn width_px(&self) -> u32 {
@@ -213,7 +217,7 @@ pub(crate) fn capture_prompt_snapshot(
 ) -> PromptSnapshot {
     let prompt_display = prefix_to_fit(prompt, layout.columns);
     let prompt_cols = text_columns(prompt_display);
-    let visible_history_lines = history.visible_line_count(layout.history_rows);
+    let visible_history_lines = history.visible_line_count(layout.history_rows, layout.columns);
     let row = layout.prompt_row(visible_history_lines);
     let input_y_px = layout.prompt_y(visible_history_lines);
     let input_x_px = (prompt_cols as u32) * CELL_WIDTH_PX;
@@ -374,8 +378,12 @@ fn draw_history_contents(
     history: &TerminalHistory,
 ) {
     writer.set_color(TEXT_COLOR);
-    for (row, line) in history.iter_visible_lines(layout.history_rows).enumerate() {
-        writer.draw_string_at(0, layout.history_line_y(row), line);
+    for (row, line) in history
+        .visible_lines(layout.history_rows, layout.columns)
+        .into_iter()
+        .enumerate()
+    {
+        writer.draw_string_at(0, layout.history_line_y(row), &line);
     }
 }
 
@@ -493,6 +501,27 @@ fn tail_to_fit(text: &str, max_columns: usize) -> &str {
     &text[start..]
 }
 
+fn wrapped_line_count(line: &str, columns: usize) -> usize {
+    let columns = columns.max(1);
+    if line.is_empty() {
+        1
+    } else {
+        line.as_bytes().chunks(columns).count()
+    }
+}
+
+fn wrap_line_into(line: &str, columns: usize, wrapped: &mut Vec<String>) {
+    let columns = columns.max(1);
+    if line.is_empty() {
+        wrapped.push(String::new());
+        return;
+    }
+
+    for chunk in line.as_bytes().chunks(columns) {
+        wrapped.push(String::from_utf8_lossy(chunk).into_owned());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use alloc::sync::Arc;
@@ -518,127 +547,129 @@ mod tests {
 
     #[test_case]
     fn test_terminal_history_append_line_adds_single_line() {
-        let mut history = TerminalHistory::new(8);
-        history.append_line("hello");
+        let mut history = TerminalHistory::new();
+        history.append_line("hello", 8);
 
         assert_eq!(history.len(), 1);
-        assert_eq!(
-            history.iter_visible_lines(1).collect::<Vec<_>>(),
-            vec!["hello"]
-        );
+        assert_eq!(history.visible_lines(1, 8), vec![String::from("hello")]);
     }
 
     #[test_case]
     fn test_terminal_history_append_line_preserves_empty_line() {
-        let mut history = TerminalHistory::new(8);
-        history.append_line("");
+        let mut history = TerminalHistory::new();
+        history.append_line("", 8);
 
         assert_eq!(history.len(), 1);
-        assert_eq!(history.iter_visible_lines(1).collect::<Vec<_>>(), vec![""]);
+        assert_eq!(history.visible_lines(1, 8), vec![String::from("")]);
     }
 
     #[test_case]
     fn test_terminal_history_append_line_does_not_add_extra_line_for_exact_width() {
-        let mut history = TerminalHistory::new(4);
-        history.append_line("rust");
+        let mut history = TerminalHistory::new();
+        history.append_line("rust", 4);
 
         assert_eq!(history.len(), 1);
-        assert_eq!(
-            history.iter_visible_lines(4).collect::<Vec<_>>(),
-            vec!["rust"]
-        );
+        assert_eq!(history.visible_lines(4, 4), vec![String::from("rust")]);
     }
 
     #[test_case]
     fn test_terminal_history_append_line_wraps_multiple_rows() {
-        let mut history = TerminalHistory::new(4);
-        history.append_line("abcdefghijkl");
+        let mut history = TerminalHistory::new();
+        history.append_line("abcdefghijkl", 4);
 
-        assert_eq!(history.len(), 3);
+        assert_eq!(history.len(), 1);
         assert_eq!(
-            history.iter_visible_lines(4).collect::<Vec<_>>(),
-            vec!["abcd", "efgh", "ijkl"]
+            history.visible_lines(4, 4),
+            vec![
+                String::from("abcd"),
+                String::from("efgh"),
+                String::from("ijkl")
+            ]
         );
     }
 
     #[test_case]
     fn test_terminal_history_discards_oldest_lines_when_capacity_exceeded() {
-        let mut history = TerminalHistory::new(8);
+        let mut history = TerminalHistory::new();
         for index in 0..(MAX_HISTORY_LINES + 1) {
             let mut line = String::new();
             let _ = write!(line, "line{:03}", index);
-            history.append_line(&line);
+            history.append_line(&line, 8);
         }
 
         assert_eq!(history.len(), MAX_HISTORY_LINES);
-        let visible = history
-            .iter_visible_lines(MAX_HISTORY_LINES)
-            .collect::<Vec<_>>();
-        assert_eq!(visible.first().copied(), Some("line001"));
-        assert_eq!(visible.last().copied(), Some("line512"));
+        let visible = history.visible_lines(MAX_HISTORY_LINES, 8);
+        assert_eq!(visible.first().map(String::as_str), Some("line001"));
+        assert_eq!(visible.last().map(String::as_str), Some("line512"));
     }
 
     #[test_case]
     fn test_terminal_history_clear_resets_lines_and_scrollback() {
-        let mut history = TerminalHistory::new(8);
-        history.append_line("hello");
+        let mut history = TerminalHistory::new();
+        history.append_line("hello", 8);
         history.set_scrollback_offset(3);
 
         history.clear();
 
         assert_eq!(history.len(), 0);
         assert_eq!(history.scrollback_offset(), 0);
-        assert!(history.iter_visible_lines(5).next().is_none());
+        assert!(history.visible_lines(5, 8).is_empty());
     }
 
     #[test_case]
     fn test_terminal_history_visible_line_count_matches_visible_window() {
-        let mut history = TerminalHistory::new(8);
+        let mut history = TerminalHistory::new();
         for line in ["0", "1", "2", "3"] {
-            history.append_line(line);
+            history.append_line(line, 8);
         }
 
-        assert_eq!(history.visible_line_count(2), 2);
+        assert_eq!(history.visible_line_count(2, 8), 2);
 
         history.set_scrollback_offset(99);
-        assert_eq!(history.visible_line_count(2), 2);
+        assert_eq!(history.visible_line_count(2, 8), 2);
     }
 
     #[test_case]
     fn test_terminal_history_visible_lines_clamp_scrollback_offset() {
-        let mut history = TerminalHistory::new(8);
+        let mut history = TerminalHistory::new();
         for line in ["0", "1", "2", "3", "4"] {
-            history.append_line(line);
+            history.append_line(line, 8);
         }
         history.set_scrollback_offset(99);
 
         assert_eq!(
-            history.iter_visible_lines(2).collect::<Vec<_>>(),
-            vec!["0", "1"]
+            history.visible_lines(2, 8),
+            vec![String::from("0"), String::from("1")]
         );
     }
 
     #[test_case]
     fn test_terminal_history_appending_during_scrollback_keeps_visible_window() {
-        let mut history = TerminalHistory::new(2);
+        let mut history = TerminalHistory::new();
         for line in ["aa", "bb", "cc", "dd"] {
-            history.append_line(line);
+            history.append_line(line, 2);
         }
         history.set_scrollback_offset(1);
-        let before = history
-            .iter_visible_lines(2)
-            .map(String::from)
-            .collect::<Vec<_>>();
+        let before = history.visible_lines(2, 2);
 
-        history.append_line("eeff");
-        let after = history
-            .iter_visible_lines(2)
-            .map(String::from)
-            .collect::<Vec<_>>();
+        history.append_line("eeff", 2);
+        let after = history.visible_lines(2, 2);
 
         assert_eq!(before, vec![String::from("bb"), String::from("cc")]);
         assert_eq!(after, before);
         assert_eq!(history.scrollback_offset(), 3);
+    }
+
+    #[test_case]
+    fn test_terminal_history_rewraps_logical_lines_for_new_width() {
+        let mut history = TerminalHistory::new();
+        history.append_line("abcdefgh", 8);
+
+        assert_eq!(history.visible_lines(4, 8), vec![String::from("abcdefgh")]);
+        assert_eq!(
+            history.visible_lines(4, 4),
+            vec![String::from("abcd"), String::from("efgh")]
+        );
     }
 
     #[test_case]
@@ -654,7 +685,7 @@ mod tests {
         let buffer = test_buffer(Region::new(0, 0, 4, 20));
         let mut writer = TaskWriter::new(Arc::clone(&buffer), TEXT_COLOR);
         let mut renderer = TerminalRenderer::new(4, 20);
-        let history = TerminalHistory::new(renderer.columns());
+        let history = TerminalHistory::new();
         let frame = TerminalFrame {
             status: TerminalStatus {
                 title: "vitrOS",
@@ -685,9 +716,9 @@ mod tests {
         let buffer = test_buffer(Region::new(0, 0, width_px, height_px));
         let mut writer = TaskWriter::new(Arc::clone(&buffer), TEXT_COLOR);
         let mut renderer = TerminalRenderer::new(width_px, height_px);
-        let mut history = TerminalHistory::new(renderer.columns());
-        history.append_line("alpha");
-        history.append_line("beta");
+        let mut history = TerminalHistory::new();
+        history.append_line("alpha", renderer.columns());
+        history.append_line("beta", renderer.columns());
         let frame = TerminalFrame {
             status: TerminalStatus {
                 title: "vitrOS",
@@ -778,8 +809,8 @@ mod tests {
         let buffer = test_buffer(Region::new(0, 0, width_px, height_px));
         let mut writer = TaskWriter::new(Arc::clone(&buffer), TEXT_COLOR);
         let mut renderer = TerminalRenderer::new(width_px, height_px);
-        let mut history = TerminalHistory::new(renderer.columns());
-        history.append_line("alpha");
+        let mut history = TerminalHistory::new();
+        history.append_line("alpha", renderer.columns());
         let frame = TerminalFrame {
             status: TerminalStatus {
                 title: "vitrOS",
@@ -824,7 +855,7 @@ mod tests {
         let buffer = test_buffer(Region::new(0, 0, width_px, height_px));
         let mut writer = TaskWriter::new(Arc::clone(&buffer), TEXT_COLOR);
         let mut renderer = TerminalRenderer::new(width_px, height_px);
-        let history = TerminalHistory::new(renderer.columns());
+        let history = TerminalHistory::new();
         let frame = TerminalFrame {
             status: TerminalStatus {
                 title: "title",
@@ -858,7 +889,7 @@ mod tests {
         let buffer = test_buffer(Region::new(0, 0, width_px, height_px));
         let mut writer = TaskWriter::new(Arc::clone(&buffer), TEXT_COLOR);
         let mut renderer = TerminalRenderer::new(width_px, height_px);
-        let history = TerminalHistory::new(renderer.columns());
+        let history = TerminalHistory::new();
         let frame = TerminalFrame {
             status: TerminalStatus {
                 title: "v",
@@ -888,7 +919,7 @@ mod tests {
     #[test_case]
     fn test_prompt_diff_appends_single_char_when_window_is_stable() {
         let layout = TerminalLayout::new(160, 50);
-        let history = TerminalHistory::new(layout.columns());
+        let history = TerminalHistory::new();
         let previous = capture_prompt_snapshot(&layout, &history, "> ", "ab");
         let next = capture_prompt_snapshot(&layout, &history, "> ", "abc");
 
@@ -905,7 +936,7 @@ mod tests {
     #[test_case]
     fn test_prompt_diff_falls_back_to_redraw_when_tail_window_shifts() {
         let layout = TerminalLayout::new(80, 50);
-        let history = TerminalHistory::new(layout.columns());
+        let history = TerminalHistory::new();
         let previous = capture_prompt_snapshot(&layout, &history, "> ", "abcdefg");
         let next = capture_prompt_snapshot(&layout, &history, "> ", "abcdefgh");
 

@@ -7,7 +7,7 @@ pub mod terminal;
 
 pub use self::commands::{CommandEffect, CommandExecutor, CommandOutcome};
 pub use self::line_editor::{
-    LineEditCommand, LineEditResult, LineEditor, MAX_LINE_LEN, line_edit_command_from_key_event,
+    LineEditCommand, LineEditResult, LineEditor, MAX_LINE_LEN, line_edit_command_from_text_input,
 };
 pub use self::runtime::shell_task;
 pub use self::terminal::{

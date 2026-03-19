@@ -3,15 +3,18 @@ use alloc::string::String;
 
 use crate::graphics::{self, TaskWriter};
 use crate::hpet;
-use crate::input::{self, KeyEvent};
+use crate::input::{self, PolledKeyEvent};
 use crate::shell::commands::CommandEffect;
-use crate::shell::line_editor::{LineEditResult, LineEditor, line_edit_command_from_key_event};
+#[cfg(feature = "visualize-input")]
+use crate::shell::commands::{VisualizationAction, VisualizationCommand, VisualizationTarget};
+use crate::shell::line_editor::{LineEditResult, LineEditor, line_edit_command_from_text_input};
 use crate::shell::terminal::{
     CELL_WIDTH_PX, LINE_HEIGHT_PX, PromptDiff, PromptSnapshot, TerminalHistory, TerminalLayout,
     TerminalStatus, capture_prompt_snapshot, clear_prompt_line, diff_prompt, draw_prompt_contents,
     render_body_region, render_status_region,
 };
 use crate::shell::{CommandExecutor, CommandOutcome};
+use crate::text_input::TextInputEngine;
 
 const FRAME_INTERVAL_MS: u64 = 16;
 const STATUS_UPDATE_INTERVAL_MS: u64 = 1000;
@@ -44,7 +47,7 @@ pub extern "C" fn shell_task() -> ! {
 }
 
 trait RuntimeEnvironment {
-    fn poll_key_event(&mut self) -> Option<KeyEvent>;
+    fn poll_key_event(&mut self) -> Option<PolledKeyEvent>;
     fn frame_count(&self) -> u64;
     fn uptime_ms(&self) -> Option<u64>;
 }
@@ -52,8 +55,8 @@ trait RuntimeEnvironment {
 struct KernelRuntimeEnvironment;
 
 impl RuntimeEnvironment for KernelRuntimeEnvironment {
-    fn poll_key_event(&mut self) -> Option<KeyEvent> {
-        input::poll_key_event()
+    fn poll_key_event(&mut self) -> Option<PolledKeyEvent> {
+        input::poll_key_event_internal()
     }
 
     fn frame_count(&self) -> u64 {
@@ -66,9 +69,12 @@ impl RuntimeEnvironment for KernelRuntimeEnvironment {
 }
 
 struct ShellRuntime {
+    screen_width_px: u32,
+    screen_height_px: u32,
     layout: TerminalLayout,
     history: TerminalHistory,
     line_editor: LineEditor,
+    text_input: TextInputEngine,
     command_executor: CommandExecutor,
     status_sampler: StatusSampler,
     render_state: RenderState,
@@ -83,15 +89,18 @@ impl ShellRuntime {
         initial_uptime_ms: Option<u64>,
     ) -> Self {
         let layout = TerminalLayout::new(width_px, height_px);
-        let mut history = TerminalHistory::new(layout.columns());
+        let mut history = TerminalHistory::new();
         for line in INITIAL_MESSAGES {
-            history.append_line(line);
+            history.append_line(line, layout.columns());
         }
 
         Self {
+            screen_width_px: width_px,
+            screen_height_px: height_px,
             layout,
             history,
             line_editor: LineEditor::new(),
+            text_input: TextInputEngine::default(),
             command_executor: CommandExecutor::new(),
             status_sampler: StatusSampler::new(initial_frame_count, initial_uptime_ms),
             render_state: RenderState::new(),
@@ -100,7 +109,9 @@ impl ShellRuntime {
     }
 
     fn tick<E: RuntimeEnvironment>(&mut self, environment: &mut E, writer: &mut TaskWriter) {
+        self.sync_layout();
         self.drain_input(environment);
+        self.sync_layout();
         let (status, status_changed) = self.terminal_status(environment);
         if status_changed {
             self.render_state.status_dirty = true;
@@ -119,8 +130,11 @@ impl ShellRuntime {
         }
     }
 
-    fn process_key_event(&mut self, event: KeyEvent) {
-        let Some(command) = line_edit_command_from_key_event(event) else {
+    fn process_key_event(&mut self, input_event: PolledKeyEvent) {
+        let event = input_event.event;
+        let text_input_event = self.text_input.translate_key_event(event);
+
+        let Some(command) = line_edit_command_from_text_input(text_input_event) else {
             return;
         };
 
@@ -131,7 +145,9 @@ impl ShellRuntime {
                     self.render_state.prompt_dirty = true;
                 }
             }
-            LineEditResult::LineCommitted(line) => self.handle_committed_line(line),
+            LineEditResult::LineCommitted(line) => {
+                self.handle_committed_line(line);
+            }
         }
     }
 
@@ -140,7 +156,8 @@ impl ShellRuntime {
             return;
         }
 
-        self.history.append_line(&format!("{}{}", PROMPT, line));
+        self.history
+            .append_line(&format!("{}{}", PROMPT, line), self.layout.columns());
         let outcome = self.command_executor.execute_line(&line);
         self.apply_command_outcome(outcome);
     }
@@ -150,7 +167,7 @@ impl ShellRuntime {
             match effect {
                 CommandEffect::AppendLines(lines) => {
                     for line in lines {
-                        self.history.append_line(&line);
+                        self.history.append_line(&line, self.layout.columns());
                     }
                     self.render_state.body_dirty = true;
                     self.render_state.prompt_dirty = false;
@@ -160,8 +177,40 @@ impl ShellRuntime {
                     self.render_state.body_dirty = true;
                     self.render_state.prompt_dirty = false;
                 }
+                #[cfg(feature = "visualize-input")]
+                CommandEffect::Visualization(command) => {
+                    self.apply_visualization_command(command);
+                }
             }
         }
+    }
+
+    fn sync_layout(&mut self) {
+        let target_width = self.target_viewport_width();
+        if self.layout.width_px() == target_width
+            && self.layout.height_px() == self.screen_height_px
+        {
+            return;
+        }
+
+        self.layout
+            .resize_viewport(target_width, self.screen_height_px);
+        self.render_state.last_status = None;
+        self.render_state.last_prompt = None;
+        self.render_state.status_dirty = true;
+        self.render_state.body_dirty = true;
+        self.render_state.prompt_dirty = false;
+    }
+
+    fn target_viewport_width(&self) -> u32 {
+        #[cfg(feature = "visualize-input")]
+        {
+            if crate::input_trace::is_enabled() {
+                return crate::input_trace::shell_viewport_width(self.screen_width_px);
+            }
+        }
+
+        self.screen_width_px
     }
 
     fn terminal_status<E: RuntimeEnvironment>(
@@ -251,6 +300,23 @@ impl ShellRuntime {
             }
             PromptDiff::CoveredByBodyRedraw => {}
         }
+    }
+
+    #[cfg(feature = "visualize-input")]
+    fn apply_visualization_command(&mut self, command: VisualizationCommand) {
+        match (command.target, command.action) {
+            (VisualizationTarget::Input, VisualizationAction::On) => {
+                crate::input_trace::set_enabled(true);
+            }
+            (VisualizationTarget::Input, VisualizationAction::Off) => {
+                crate::input_trace::set_enabled(false);
+            }
+            (VisualizationTarget::Input, VisualizationAction::Clear) => {
+                crate::input_trace::clear();
+            }
+        }
+        self.render_state.body_dirty = true;
+        self.render_state.prompt_dirty = false;
     }
 }
 
@@ -363,19 +429,21 @@ mod tests {
     use crate::graphics::Region;
     use crate::graphics::TaskWriter;
     use crate::graphics::buffer::{DrawCommand, WriterBuffer};
-    use crate::input::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+    use crate::input::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, PolledKeyEvent};
+    #[cfg(feature = "visualize-input")]
+    use crate::shell::commands::{VisualizationAction, VisualizationCommand, VisualizationTarget};
     use crate::shell::{CELL_WIDTH_PX, LINE_HEIGHT_PX, MAX_HISTORY_LINES};
     use crate::sync::BlockingMutex;
 
     #[derive(Default)]
     struct FakeEnvironment {
-        events: VecDeque<KeyEvent>,
+        events: VecDeque<PolledKeyEvent>,
         frame_count: u64,
         uptime_ms: Option<u64>,
     }
 
     impl RuntimeEnvironment for FakeEnvironment {
-        fn poll_key_event(&mut self) -> Option<KeyEvent> {
+        fn poll_key_event(&mut self) -> Option<PolledKeyEvent> {
             self.events.pop_front()
         }
 
@@ -388,7 +456,12 @@ mod tests {
         }
     }
 
-    fn key_event(code: KeyCode) -> KeyEvent {
+    fn key_event(code: KeyCode) -> PolledKeyEvent {
+        let event = raw_key_event(code);
+        PolledKeyEvent { event }
+    }
+
+    fn raw_key_event(code: KeyCode) -> KeyEvent {
         KeyEvent {
             code,
             kind: KeyEventKind::Press,
@@ -396,7 +469,7 @@ mod tests {
         }
     }
 
-    fn key_event_for_char(ch: char) -> KeyEvent {
+    fn key_event_for_char(ch: char) -> PolledKeyEvent {
         let code = match ch {
             'a' => KeyCode::A,
             'b' => KeyCode::B,
@@ -432,9 +505,7 @@ mod tests {
     fn history_lines(runtime: &ShellRuntime) -> Vec<String> {
         runtime
             .history
-            .iter_visible_lines(MAX_HISTORY_LINES)
-            .map(String::from)
-            .collect()
+            .visible_lines(MAX_HISTORY_LINES, runtime.layout.columns())
     }
 
     fn test_buffer(region: Region) -> Arc<BlockingMutex<WriterBuffer>> {
@@ -786,5 +857,31 @@ mod tests {
     #[test_case]
     fn test_prompt_constant_matches_expected_prefix() {
         assert_eq!(PROMPT, "> ");
+    }
+
+    #[cfg(feature = "visualize-input")]
+    #[test_case]
+    fn test_visualization_toggle_changes_shell_viewport_width() {
+        crate::input_trace::reset_for_test();
+
+        let mut runtime = runtime_with_size(1024, 768, 0, Some(0));
+        assert_eq!(runtime.layout.width_px(), 1024);
+
+        runtime.apply_visualization_command(VisualizationCommand {
+            target: VisualizationTarget::Input,
+            action: VisualizationAction::On,
+        });
+        runtime.sync_layout();
+        assert_eq!(
+            runtime.layout.width_px(),
+            crate::input_trace::shell_viewport_width(1024)
+        );
+
+        runtime.apply_visualization_command(VisualizationCommand {
+            target: VisualizationTarget::Input,
+            action: VisualizationAction::Off,
+        });
+        runtime.sync_layout();
+        assert_eq!(runtime.layout.width_px(), 1024);
     }
 }

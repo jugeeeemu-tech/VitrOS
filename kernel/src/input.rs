@@ -8,7 +8,6 @@ use lazy_static::lazy_static;
 use spin::Mutex;
 
 const KEY_EVENT_QUEUE_CAPACITY: usize = 256;
-const CHAR_QUEUE_CAPACITY: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyCode {
@@ -118,46 +117,33 @@ pub struct KeyEvent {
     pub modifiers: KeyModifiers,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct QueuedKeyEvent {
+    event: KeyEvent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PolledKeyEvent {
+    pub event: KeyEvent,
+}
+
 lazy_static! {
-    static ref KEY_EVENT_QUEUE: Mutex<VecDeque<KeyEvent>> = Mutex::new(VecDeque::new());
-    static ref CHAR_QUEUE: Mutex<VecDeque<char>> = Mutex::new(VecDeque::new());
+    static ref KEY_EVENT_QUEUE: Mutex<VecDeque<QueuedKeyEvent>> = Mutex::new(VecDeque::new());
 }
 
 static KEY_EVENT_WAIT: WaitQueue = WaitQueue::new();
 static KEY_EVENT_SIGNAL: AtomicBool = AtomicBool::new(false);
-static CHAR_WAIT: WaitQueue = WaitQueue::new();
-static CHAR_SIGNAL: AtomicBool = AtomicBool::new(false);
 
 pub fn poll_key_event() -> Option<KeyEvent> {
-    pop_queue(&KEY_EVENT_QUEUE, &KEY_EVENT_SIGNAL)
+    poll_key_event_internal().map(|entry| entry.event)
 }
 
 pub fn read_key_event() -> KeyEvent {
     loop {
-        if let Some(event) = poll_key_event() {
-            return event;
+        if let Some(entry) = poll_key_event_internal() {
+            return entry.event;
         }
         wait_for_queue(&KEY_EVENT_SIGNAL, &KEY_EVENT_WAIT);
-    }
-}
-
-pub fn getchar() -> char {
-    loop {
-        if let Some(ch) = poll_char() {
-            return ch;
-        }
-        wait_for_queue(&CHAR_SIGNAL, &CHAR_WAIT);
-    }
-}
-
-pub fn key_event_to_ascii(event: KeyEvent) -> Option<char> {
-    if event.kind != KeyEventKind::Press {
-        return None;
-    }
-
-    match key_event_to_char(event) {
-        Some(ch @ ' '..='~') => Some(ch),
-        _ => None,
     }
 }
 
@@ -167,26 +153,14 @@ pub(crate) fn push_key_event(event: KeyEvent) {
         &KEY_EVENT_SIGNAL,
         &KEY_EVENT_WAIT,
         KEY_EVENT_QUEUE_CAPACITY,
-        event,
+        QueuedKeyEvent { event },
         "key event",
     );
-
-    if event.kind == KeyEventKind::Press {
-        if let Some(ch) = key_event_to_char(event) {
-            push_queue(
-                &CHAR_QUEUE,
-                &CHAR_SIGNAL,
-                &CHAR_WAIT,
-                CHAR_QUEUE_CAPACITY,
-                ch,
-                "character",
-            );
-        }
-    }
 }
 
-fn poll_char() -> Option<char> {
-    pop_queue(&CHAR_QUEUE, &CHAR_SIGNAL)
+pub(crate) fn poll_key_event_internal() -> Option<PolledKeyEvent> {
+    pop_queue(&KEY_EVENT_QUEUE, &KEY_EVENT_SIGNAL)
+        .map(|entry| PolledKeyEvent { event: entry.event })
 }
 
 fn wait_for_queue(signal: &AtomicBool, wait_queue: &WaitQueue) {
@@ -205,23 +179,24 @@ fn push_queue<T: Copy>(
     capacity: usize,
     value: T,
     queue_name: &'static str,
-) {
-    let pushed = without_interrupts(|| {
+) -> Option<usize> {
+    let result = without_interrupts(|| {
         let mut queue = queue.lock();
         if queue.len() >= capacity {
-            return false;
+            return None;
         }
         queue.push_back(value);
-        true
+        Some(queue.len())
     });
 
-    if !pushed {
+    let Some(len) = result else {
         warn!("[Input] Dropping {} because queue is full", queue_name);
-        return;
-    }
+        return None;
+    };
 
     signal.store(true, Ordering::Release);
     wait_queue.wake_one();
+    Some(len)
 }
 
 fn pop_queue<T: Copy>(queue: &Mutex<VecDeque<T>>, signal: &AtomicBool) -> Option<T> {
@@ -233,80 +208,19 @@ fn pop_queue<T: Copy>(queue: &Mutex<VecDeque<T>>, signal: &AtomicBool) -> Option
     })
 }
 
-fn key_event_to_char(event: KeyEvent) -> Option<char> {
-    let shifted = event.modifiers.shift;
-    match event.code {
-        KeyCode::A => Some(if shifted { 'A' } else { 'a' }),
-        KeyCode::B => Some(if shifted { 'B' } else { 'b' }),
-        KeyCode::C => Some(if shifted { 'C' } else { 'c' }),
-        KeyCode::D => Some(if shifted { 'D' } else { 'd' }),
-        KeyCode::E => Some(if shifted { 'E' } else { 'e' }),
-        KeyCode::F => Some(if shifted { 'F' } else { 'f' }),
-        KeyCode::G => Some(if shifted { 'G' } else { 'g' }),
-        KeyCode::H => Some(if shifted { 'H' } else { 'h' }),
-        KeyCode::I => Some(if shifted { 'I' } else { 'i' }),
-        KeyCode::J => Some(if shifted { 'J' } else { 'j' }),
-        KeyCode::K => Some(if shifted { 'K' } else { 'k' }),
-        KeyCode::L => Some(if shifted { 'L' } else { 'l' }),
-        KeyCode::M => Some(if shifted { 'M' } else { 'm' }),
-        KeyCode::N => Some(if shifted { 'N' } else { 'n' }),
-        KeyCode::O => Some(if shifted { 'O' } else { 'o' }),
-        KeyCode::P => Some(if shifted { 'P' } else { 'p' }),
-        KeyCode::Q => Some(if shifted { 'Q' } else { 'q' }),
-        KeyCode::R => Some(if shifted { 'R' } else { 'r' }),
-        KeyCode::S => Some(if shifted { 'S' } else { 's' }),
-        KeyCode::T => Some(if shifted { 'T' } else { 't' }),
-        KeyCode::U => Some(if shifted { 'U' } else { 'u' }),
-        KeyCode::V => Some(if shifted { 'V' } else { 'v' }),
-        KeyCode::W => Some(if shifted { 'W' } else { 'w' }),
-        KeyCode::X => Some(if shifted { 'X' } else { 'x' }),
-        KeyCode::Y => Some(if shifted { 'Y' } else { 'y' }),
-        KeyCode::Z => Some(if shifted { 'Z' } else { 'z' }),
-        KeyCode::Digit1 => Some(if shifted { '!' } else { '1' }),
-        KeyCode::Digit2 => Some(if shifted { '@' } else { '2' }),
-        KeyCode::Digit3 => Some(if shifted { '#' } else { '3' }),
-        KeyCode::Digit4 => Some(if shifted { '$' } else { '4' }),
-        KeyCode::Digit5 => Some(if shifted { '%' } else { '5' }),
-        KeyCode::Digit6 => Some(if shifted { '^' } else { '6' }),
-        KeyCode::Digit7 => Some(if shifted { '&' } else { '7' }),
-        KeyCode::Digit8 => Some(if shifted { '*' } else { '8' }),
-        KeyCode::Digit9 => Some(if shifted { '(' } else { '9' }),
-        KeyCode::Digit0 => Some(if shifted { ')' } else { '0' }),
-        KeyCode::Enter => Some('\n'),
-        KeyCode::Backspace => Some('\x08'),
-        KeyCode::Tab => Some('\t'),
-        KeyCode::Space => Some(' '),
-        KeyCode::Minus => Some(if shifted { '_' } else { '-' }),
-        KeyCode::Equal => Some(if shifted { '+' } else { '=' }),
-        KeyCode::LeftBracket => Some(if shifted { '{' } else { '[' }),
-        KeyCode::RightBracket => Some(if shifted { '}' } else { ']' }),
-        KeyCode::Backslash => Some(if shifted { '|' } else { '\\' }),
-        KeyCode::Semicolon => Some(if shifted { ':' } else { ';' }),
-        KeyCode::Apostrophe => Some(if shifted { '"' } else { '\'' }),
-        KeyCode::Grave => Some(if shifted { '~' } else { '`' }),
-        KeyCode::Comma => Some(if shifted { '<' } else { ',' }),
-        KeyCode::Period => Some(if shifted { '>' } else { '.' }),
-        KeyCode::Slash => Some(if shifted { '?' } else { '/' }),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 fn reset_for_test() {
     without_interrupts(|| {
         KEY_EVENT_QUEUE.lock().clear();
-        CHAR_QUEUE.lock().clear();
     });
     KEY_EVENT_SIGNAL.store(false, Ordering::Release);
-    CHAR_SIGNAL.store(false, Ordering::Release);
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        KEY_EVENT_QUEUE_CAPACITY, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
-        key_event_to_ascii, key_event_to_char, poll_char, poll_key_event, push_key_event,
-        reset_for_test,
+        KEY_EVENT_QUEUE_CAPACITY, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, poll_key_event,
+        push_key_event, reset_for_test,
     };
 
     fn key_event_with_kind(code: KeyCode, shift: bool, kind: KeyEventKind) -> KeyEvent {
@@ -324,73 +238,25 @@ mod tests {
         key_event_with_kind(code, shift, KeyEventKind::Press)
     }
 
-    #[test_case]
-    fn test_key_event_to_char_maps_shifted_letters_and_symbols() {
-        assert_eq!(key_event_to_char(key_event(KeyCode::A, false)), Some('a'));
-        assert_eq!(key_event_to_char(key_event(KeyCode::A, true)), Some('A'));
-        assert_eq!(
-            key_event_to_char(key_event(KeyCode::Digit1, true)),
-            Some('!')
-        );
-        assert_eq!(
-            key_event_to_char(key_event(KeyCode::Slash, true)),
-            Some('?')
-        );
-        assert_eq!(
-            key_event_to_char(key_event(KeyCode::Enter, false)),
-            Some('\n')
-        );
-    }
-
-    #[test_case]
-    fn test_key_event_to_ascii_accepts_printable_press_events_only() {
-        assert_eq!(key_event_to_ascii(key_event(KeyCode::A, false)), Some('a'));
-        assert_eq!(
-            key_event_to_ascii(key_event(KeyCode::Digit1, true)),
-            Some('!')
-        );
-        assert_eq!(
-            key_event_to_ascii(key_event(KeyCode::Space, false)),
-            Some(' ')
-        );
-        assert_eq!(
-            key_event_to_ascii(key_event_with_kind(
-                KeyCode::A,
-                false,
-                KeyEventKind::Release
-            )),
-            None
-        );
-    }
-
-    #[test_case]
-    fn test_key_event_to_ascii_ignores_control_and_navigation_keys() {
-        assert_eq!(key_event_to_ascii(key_event(KeyCode::Enter, false)), None);
-        assert_eq!(
-            key_event_to_ascii(key_event(KeyCode::Backspace, false)),
-            None
-        );
-        assert_eq!(key_event_to_ascii(key_event(KeyCode::Tab, false)), None);
-        assert_eq!(
-            key_event_to_ascii(key_event(KeyCode::ArrowLeft, false)),
-            None
-        );
+    fn push_test_key_event(event: KeyEvent) {
+        push_key_event(event);
     }
 
     #[test_case]
     fn test_poll_key_event_returns_enqueued_event() {
         reset_for_test();
         let event = key_event(KeyCode::B, false);
-        push_key_event(event);
+        push_test_key_event(event);
         assert_eq!(poll_key_event(), Some(event));
     }
 
     #[test_case]
-    fn test_push_key_event_enqueues_character_for_press() {
+    fn test_push_key_event_enqueues_only_key_events() {
         reset_for_test();
-        push_key_event(key_event(KeyCode::C, true));
-        let _ = poll_key_event();
-        assert_eq!(poll_char(), Some('C'));
+        let event = key_event(KeyCode::C, true);
+        push_test_key_event(event);
+        assert_eq!(poll_key_event(), Some(event));
+        assert_eq!(poll_key_event(), None);
     }
 
     #[test_case]
