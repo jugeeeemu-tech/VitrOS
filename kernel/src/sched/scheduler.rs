@@ -341,6 +341,21 @@ pub fn schedule() {
     };
 
     next_task.set_state(TaskState::Running);
+    let next_task_context = next_task.context_snapshot();
+    if !next_task_context.is_valid() {
+        panic!(
+            "Invalid task context before switch: task={} id={} class={:?} rsp=0x{:X} saved_rsp={:?} stack=[0x{:X},0x{:X}) rsp_ok={} saved_ok={}",
+            next_task.name(),
+            next_task.id().as_u64(),
+            next_task.sched_class(),
+            next_task_context.context_rsp,
+            next_task_context.saved_rsp_before_fxsave,
+            next_task_context.stack_bottom,
+            next_task_context.stack_top,
+            next_task_context.context_rsp_in_range,
+            next_task_context.saved_rsp_in_range,
+        );
+    }
     let new_context_ptr = next_task.context() as *const Context;
 
     // ===== フェーズ2: 現在のタスクの処理（CURRENT_TASKのみロック） =====

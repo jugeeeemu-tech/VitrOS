@@ -19,6 +19,7 @@ use vitros_kernel::paging;
 use vitros_kernel::pci;
 use vitros_kernel::sched;
 use vitros_kernel::shell;
+use vitros_kernel::stack;
 use vitros_kernel::timer;
 use vitros_kernel::usb;
 
@@ -31,6 +32,8 @@ use sched as task;
 #[cfg(feature = "visualize-allocator")]
 use vitros_kernel::allocator_visualization;
 
+#[cfg(feature = "visualize-input")]
+use vitros_kernel::input_trace;
 #[cfg(feature = "visualize-pipeline")]
 use vitros_kernel::pipeline_visualization;
 
@@ -47,10 +50,15 @@ const INITIAL_HEAP_POOL_MIN_BYTES: usize = 256 * 1024;
 const INITIAL_HEAP_POOL_BASELINE_BYTES: usize = 4 * 1024 * 1024;
 #[cfg(not(feature = "visualize-allocator"))]
 const INITIAL_HEAP_POOL_MAX_BYTES: usize = 64 * 1024 * 1024;
+#[cfg(feature = "visualize-input")]
+const INPUT_TRACE_STACK_SIZE: usize = 64 * 1024;
 
 // パニックハンドラ
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
+    unsafe {
+        asm!("cli", options(nomem, nostack));
+    }
     println!("\n!!! KERNEL PANIC !!!");
     println!("{}", info);
     loop {
@@ -421,6 +429,20 @@ extern "C" fn kernel_main_inner(boot_info_phys_addr: u64) -> ! {
     );
     task::add_task(*shell_task);
 
+    #[cfg(feature = "visualize-input")]
+    {
+        let overlay_task = Box::new(
+            task::Task::new_with_stack_size(
+                "InputTrace",
+                task::nice::DEFAULT - 4,
+                INPUT_TRACE_STACK_SIZE,
+                input_trace::overlay_task,
+            )
+            .expect("Failed to create input trace overlay task"),
+        );
+        task::add_task(*overlay_task);
+    }
+
     info!("All tasks created. Setting up kernel main task...");
 
     // kernel_main_innerを表すタスクを作成し、CURRENT_TASKに設定
@@ -428,10 +450,11 @@ extern "C" fn kernel_main_inner(boot_info_phys_addr: u64) -> ! {
     // このタスクはold_contextとして最初のswitch_context()で保存される側なので、
     // 初期Contextの値（rip=task_wrapper, rdi=idle_task）は上書きされる
     // 保存されるripは「schedule()から戻るアドレス」になる
-    let kernel_main = Box::new(
+    let mut kernel_main = Box::new(
         task::Task::new("KernelMain", task::nice::DEFAULT, idle_task)
             .expect("Failed to create KernelMain task"),
     );
+    kernel_main.adopt_stack_range(stack::stack_bottom(), stack::stack_top());
     task::set_current_task(*kernel_main);
     info!("Kernel main task set as current");
 

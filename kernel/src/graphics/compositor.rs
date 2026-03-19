@@ -133,9 +133,10 @@ fn render_commands_to(shadow_buffer: &mut ShadowBuffer, region: &Region, command
             DrawCommand::Clear { color } => {
                 // 領域全体をクリア
                 unsafe {
-                    super::draw_rect(
+                    super::draw_rect_with_height(
                         shadow_base,
                         shadow_width,
+                        shadow_buffer.height(),
                         region.x as usize,
                         region.y as usize,
                         region.width as usize,
@@ -150,9 +151,10 @@ fn render_commands_to(shadow_buffer: &mut ShadowBuffer, region: &Region, command
                 let global_x = region.x + x;
                 let global_y = region.y + y;
                 unsafe {
-                    super::draw_char(
+                    super::draw_char_with_height(
                         shadow_base,
                         shadow_width,
+                        shadow_buffer.height(),
                         global_x as usize,
                         global_y as usize,
                         *ch,
@@ -166,9 +168,10 @@ fn render_commands_to(shadow_buffer: &mut ShadowBuffer, region: &Region, command
                 let global_x = region.x + x;
                 let global_y = region.y + y;
                 unsafe {
-                    super::draw_string(
+                    super::draw_string_with_height(
                         shadow_base,
                         shadow_width,
+                        shadow_buffer.height(),
                         global_x as usize,
                         global_y as usize,
                         text,
@@ -189,9 +192,10 @@ fn render_commands_to(shadow_buffer: &mut ShadowBuffer, region: &Region, command
                 let global_x = region.x + x;
                 let global_y = region.y + y;
                 unsafe {
-                    super::draw_rect(
+                    super::draw_rect_with_height(
                         shadow_base,
                         shadow_width,
+                        shadow_buffer.height(),
                         global_x as usize,
                         global_y as usize,
                         *width as usize,

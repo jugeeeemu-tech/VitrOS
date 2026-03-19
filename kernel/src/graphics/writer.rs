@@ -3,6 +3,7 @@
 use super::buffer::{DrawCommand, SharedBuffer};
 use super::region::Region;
 use alloc::string::String;
+#[cfg(test)]
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -101,7 +102,11 @@ impl TaskWriter {
     pub fn draw_string_at(&mut self, x: u32, y: u32, text: &str) {
         self.commit_pending_text();
 
-        if x >= self.region.width || y >= self.region.height || text.is_empty() {
+        if x >= self.region.width
+            || y >= self.region.height
+            || y.saturating_add(8) > self.region.height
+            || text.is_empty()
+        {
             return;
         }
 
@@ -154,7 +159,10 @@ impl TaskWriter {
     pub fn draw_char_at(&mut self, x: u32, y: u32, ch: char) {
         self.commit_pending_text();
 
-        if !ch.is_ascii() || x + 8 > self.region.width || y + 8 > self.region.height {
+        if !ch.is_ascii()
+            || x.saturating_add(8) > self.region.width
+            || y.saturating_add(8) > self.region.height
+        {
             return;
         }
 
@@ -263,7 +271,7 @@ impl core::fmt::Write for TaskWriter {
                 self.cursor_y += 10;
             } else {
                 // 領域内に収まるかチェック
-                if self.cursor_x + 8 > self.region.width {
+                if self.cursor_x.saturating_add(8) > self.region.width {
                     // 行の折り返し: 蓄積中のテキストをコミット
                     self.commit_pending_text();
                     self.cursor_x = 0;
@@ -271,7 +279,7 @@ impl core::fmt::Write for TaskWriter {
                 }
 
                 // 縦方向のオーバーフロー処理
-                if self.cursor_y + 8 > self.region.height {
+                if self.cursor_y.saturating_add(8) > self.region.height {
                     // 蓄積中のテキストをコミットしてからクリア
                     self.commit_pending_text();
                     self.local_commands
@@ -353,6 +361,17 @@ mod tests {
                 color: 0x00FF_FFFF,
             } if text == "ab"
         ));
+    }
+
+    #[test_case]
+    fn test_draw_string_at_ignores_vertical_overflow() {
+        let buffer = test_buffer(Region::new(0, 0, 32, 12));
+        let mut writer = TaskWriter::new(Arc::clone(&buffer), 0x00FF_FFFF);
+
+        writer.draw_string_at(0, 5, "ab");
+        writer.flush();
+
+        assert!(buffer.lock().commands().is_empty());
     }
 
     #[test_case]

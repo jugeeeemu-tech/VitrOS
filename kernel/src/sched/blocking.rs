@@ -64,36 +64,39 @@ pub fn is_interrupt_context() -> bool {
 /// # Note
 /// 割り込みを無効化してからロックを取得し、デッドロックを防ぎます。
 pub fn block_current_task() {
-    // Lost Wakeup防止: WAKEUP_PENDINGチェックとBlocked設定をアトミックに実行
-    let should_block = without_interrupts(|| {
-        // ロック順序: WAKEUP_PENDING → CURRENT_TASK
-        // この順序を維持することでデッドロックを防ぐ
-        let mut wakeup_pending = WAKEUP_PENDING.lock();
-        let mut current = CURRENT_TASK.lock();
+    // Lost Wakeup防止: WAKEUP_PENDINGチェック、Blocked設定、schedule() 呼び出しまでを
+    // 同一の割り込み無効区間に閉じ込める。ここに窓があると、Blockedにした直後のタスクが
+    // タイマー割り込み経由で中途半端な状態のまま再スケジュールされうる。
+    without_interrupts(|| {
+        let should_block = {
+            // ロック順序: WAKEUP_PENDING → CURRENT_TASK
+            // この順序を維持することでデッドロックを防ぐ
+            let mut wakeup_pending = WAKEUP_PENDING.lock();
+            let mut current = CURRENT_TASK.lock();
 
-        if let Some(task) = current.as_mut() {
-            let id = task.id().as_u64();
+            if let Some(task) = current.as_mut() {
+                let id = task.id().as_u64();
 
-            // WAKEUP_PENDINGをチェック（両方のロックを保持したまま）
-            if wakeup_pending.remove(&id) {
-                // 既に起床シグナルが発行されている（Lost Wakeup検出）
-                // ブロックせずに即座にリターン
-                return false;
+                // WAKEUP_PENDINGをチェック（両方のロックを保持したまま）
+                if wakeup_pending.remove(&id) {
+                    // 既に起床シグナルが発行されている（Lost Wakeup検出）
+                    // ブロックせずに即座にリターン
+                    false
+                } else {
+                    // WAKEUP_PENDINGにないので、通常通りBlocked状態に設定
+                    // （まだ両方のロックを保持している）
+                    task.set_state(TaskState::Blocked);
+                    true
+                }
+            } else {
+                false
             }
+        };
 
-            // WAKEUP_PENDINGにないので、通常通りBlocked状態に設定
-            // （まだ両方のロックを保持している）
-            task.set_state(TaskState::Blocked);
-            true
-        } else {
-            false
+        if should_block {
+            schedule();
         }
     });
-
-    if should_block {
-        // schedule()は内部で割り込みを無効化する
-        schedule();
-    }
 }
 
 /// 指定タスクをアンブロック（Ready状態に戻す）

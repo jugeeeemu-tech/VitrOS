@@ -8,8 +8,15 @@ use crate::paging::PAGE_SIZE;
 // リンカスクリプトで定義されたシンボル（paging.rsと同じパターン）
 #[cfg(not(test))]
 unsafe extern "C" {
+    static __stack_bottom: u8;
     static __stack_top: u8;
     static __stack_guard: u8;
+}
+
+/// スタック底アドレスを取得
+#[cfg(not(test))]
+pub fn stack_bottom() -> u64 {
+    core::ptr::addr_of!(__stack_bottom) as u64
 }
 
 /// スタックトップアドレスを取得
@@ -33,6 +40,11 @@ pub fn is_guard_page_fault(fault_addr: u64) -> bool {
 }
 
 // テスト環境用スタブ
+#[cfg(test)]
+pub fn stack_bottom() -> u64 {
+    0
+}
+
 #[cfg(test)]
 pub fn stack_top() -> u64 {
     0

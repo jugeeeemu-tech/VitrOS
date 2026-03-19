@@ -12,6 +12,12 @@ pub use font::FONT_8X8;
 pub use region::Region;
 pub use writer::TaskWriter;
 
+#[inline]
+fn fallback_draw_height() -> u32 {
+    let (_, height) = compositor::screen_size();
+    if height == 0 { u32::MAX } else { height }
+}
+
 /// 高速なメモリ塗りつぶし（rep stosd使用）
 ///
 /// x86-64の`rep stosd`命令を使用して、32ビット値を連続してメモリに書き込みます。
@@ -42,8 +48,26 @@ unsafe fn fast_fill_u32(ptr: *mut u32, value: u32, count: usize) {
 // fb_base は有効なフレームバッファアドレスである必要があり、
 // 描画範囲が画面内に収まっていることを呼び出し側が保証する必要があります。
 pub unsafe fn draw_char(fb_base: u64, width: u32, x: usize, y: usize, ch: u8, color: u32) {
+    unsafe { draw_char_with_height(fb_base, width, fallback_draw_height(), x, y, ch, color) }
+}
+
+// フレームバッファに文字を描画（高さクリップ付き）
+//
+// # Safety
+// fb_base は有効なフレームバッファアドレスである必要があり、
+// 描画範囲が画面内に収まっていることを呼び出し側が保証する必要があります。
+pub unsafe fn draw_char_with_height(
+    fb_base: u64,
+    width: u32,
+    height: u32,
+    x: usize,
+    y: usize,
+    ch: u8,
+    color: u32,
+) {
     let fb_ptr = fb_base as *mut u32;
     let stride = width as usize;
+    let height = height as usize;
 
     if ch < 32 || ch > 126 {
         return; // サポート外の文字
@@ -61,7 +85,11 @@ pub unsafe fn draw_char(fb_base: u64, width: u32, x: usize, y: usize, ch: u8, co
     };
 
     // 文字が完全に画面外の場合は早期リターン
-    if x >= stride || y_end == 0 {
+    if x >= stride || y >= height || y_end == 0 {
+        return;
+    }
+    let visible_rows = height.saturating_sub(y).min(8);
+    if visible_rows == 0 {
         return;
     }
 
@@ -70,7 +98,7 @@ pub unsafe fn draw_char(fb_base: u64, width: u32, x: usize, y: usize, ch: u8, co
 
     // 文字が完全に画面内に収まる場合は高速パス
     // SAFETY: 呼び出し元が描画範囲の有効性を保証する
-    if x_end <= stride {
+    if x_end <= stride && y_end <= height {
         // 高速パス: 境界チェック不要
         for row in 0..8 {
             let glyph_row = glyph[row];
@@ -85,9 +113,9 @@ pub unsafe fn draw_char(fb_base: u64, width: u32, x: usize, y: usize, ch: u8, co
             }
         }
     } else {
-        // 低速パス: 右端がクリップされる場合
+        // 低速パス: 右端または下端がクリップされる場合
         let visible_cols = stride.saturating_sub(x).min(8);
-        for row in 0..8 {
+        for row in 0..visible_rows {
             let glyph_row = glyph[row];
             if glyph_row == 0 {
                 continue;
@@ -108,10 +136,31 @@ pub unsafe fn draw_char(fb_base: u64, width: u32, x: usize, y: usize, ch: u8, co
 // fb_base は有効なフレームバッファアドレスである必要があり、
 // 描画範囲が画面内に収まっていることを呼び出し側が保証する必要があります。
 pub unsafe fn draw_string(fb_base: u64, width: u32, x: usize, y: usize, s: &str, color: u32) {
+    unsafe { draw_string_with_height(fb_base, width, fallback_draw_height(), x, y, s, color) }
+}
+
+// 文字列を描画（高さクリップ付き）
+//
+// # Safety
+// fb_base は有効なフレームバッファアドレスである必要があり、
+// 描画範囲が画面内に収まっていることを呼び出し側が保証する必要があります。
+pub unsafe fn draw_string_with_height(
+    fb_base: u64,
+    width: u32,
+    height: u32,
+    x: usize,
+    y: usize,
+    s: &str,
+    color: u32,
+) {
+    if y >= height as usize {
+        return;
+    }
+
     let mut cur_x = x;
     for ch in s.bytes() {
         unsafe {
-            draw_char(fb_base, width, cur_x, y, ch, color);
+            draw_char_with_height(fb_base, width, height, cur_x, y, ch, color);
         }
         // オーバーフローチェック
         if let Some(next_x) = cur_x.checked_add(8) {
@@ -136,6 +185,24 @@ pub unsafe fn draw_rect(
     h: usize,
     color: u32,
 ) {
+    unsafe { draw_rect_with_height(fb_base, width, fallback_draw_height(), x, y, w, h, color) }
+}
+
+// 矩形を描画（高さクリップ付き）
+//
+// # Safety
+// fb_base は有効なフレームバッファアドレスである必要があり、
+// 描画範囲が画面内に収まっていることを呼び出し側が保証する必要があります。
+pub unsafe fn draw_rect_with_height(
+    fb_base: u64,
+    width: u32,
+    height: u32,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    color: u32,
+) {
     // 空の矩形は何もしない
     if w == 0 || h == 0 {
         return;
@@ -143,16 +210,25 @@ pub unsafe fn draw_rect(
 
     let fb = fb_base as *mut u32;
     let stride = width as usize;
+    let height = height as usize;
 
     // 描画範囲を画面境界でクリップ
+    if y >= height {
+        return;
+    }
     let x_end = x.saturating_add(w).min(stride);
+    let y_end = y.saturating_add(h).min(height);
     if x >= x_end {
         return; // 完全に画面外
     }
+    if y >= y_end {
+        return;
+    }
     let clipped_w = x_end - x;
+    let clipped_h = y_end - y;
 
     // 行単位で塗りつぶし（rep stosd使用で高速化）
-    for dy in 0..h {
+    for dy in 0..clipped_h {
         let pixel_y = y.saturating_add(dy);
         // Y座標のオーバーフローチェックは省略（通常の画面サイズでは発生しない）
 
@@ -180,70 +256,54 @@ pub unsafe fn draw_rect_outline(
     h: usize,
     color: u32,
 ) {
-    let fb = fb_base as *mut u32;
+    unsafe {
+        draw_rect_outline_with_height(fb_base, width, fallback_draw_height(), x, y, w, h, color);
+    }
+}
 
+// 矩形の枠線を描画（高さクリップ付き）
+//
+// # Safety
+// fb_base は有効なフレームバッファアドレスである必要があり、
+// 描画範囲が画面内に収まっていることを呼び出し側が保証する必要があります。
+#[allow(dead_code)]
+pub unsafe fn draw_rect_outline_with_height(
+    fb_base: u64,
+    width: u32,
+    height: u32,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    color: u32,
+) {
     if w == 0 || h == 0 {
         return; // サイズが0の場合は何もしない
     }
 
-    // 上下の辺
-    for dx in 0..w {
-        if let Some(pixel_x) = x.checked_add(dx)
-            && pixel_x < width as usize
-        {
-            // 上辺
-            let top_offset = y
-                .checked_mul(width as usize)
-                .and_then(|y_off| y_off.checked_add(pixel_x));
-            if let Some(off) = top_offset {
-                unsafe {
-                    *fb.add(off) = color;
-                }
-            }
-
-            // 下辺
-            if let Some(bottom_y) = y.checked_add(h - 1) {
-                let bottom_offset = bottom_y
-                    .checked_mul(width as usize)
-                    .and_then(|y_off| y_off.checked_add(pixel_x));
-                if let Some(off) = bottom_offset {
-                    unsafe {
-                        *fb.add(off) = color;
-                    }
-                }
-            }
-        }
-    }
-
-    // 左右の辺
-    for dy in 0..h {
-        if let Some(pixel_y) = y.checked_add(dy) {
-            // 左辺
-            if x < width as usize {
-                let left_offset = pixel_y
-                    .checked_mul(width as usize)
-                    .and_then(|y_off| y_off.checked_add(x));
-                if let Some(off) = left_offset {
-                    unsafe {
-                        *fb.add(off) = color;
-                    }
-                }
-            }
-
-            // 右辺
-            if let Some(right_x) = x.checked_add(w - 1)
-                && right_x < width as usize
-            {
-                let right_offset = pixel_y
-                    .checked_mul(width as usize)
-                    .and_then(|y_off| y_off.checked_add(right_x));
-                if let Some(off) = right_offset {
-                    unsafe {
-                        *fb.add(off) = color;
-                    }
-                }
-            }
-        }
+    unsafe {
+        draw_rect_with_height(fb_base, width, height, x, y, w, 1, color);
+        draw_rect_with_height(
+            fb_base,
+            width,
+            height,
+            x,
+            y.saturating_add(h.saturating_sub(1)),
+            w,
+            1,
+            color,
+        );
+        draw_rect_with_height(fb_base, width, height, x, y, 1, h, color);
+        draw_rect_with_height(
+            fb_base,
+            width,
+            height,
+            x.saturating_add(w.saturating_sub(1)),
+            y,
+            1,
+            h,
+            color,
+        );
     }
 }
 
@@ -288,9 +348,10 @@ impl FramebufferWriter {
         let width_pixels = width_chars * 8;
         let height_pixels = 10; // 1行分の高さ
         unsafe {
-            draw_rect(
+            draw_rect_with_height(
                 self.fb_base,
                 self.width,
+                self.height,
                 self.x,
                 self.y,
                 width_pixels,
@@ -337,7 +398,15 @@ impl core::fmt::Write for FramebufferWriter {
                 }
 
                 unsafe {
-                    draw_char(self.fb_base, self.width, self.x, self.y, ch, self.color);
+                    draw_char_with_height(
+                        self.fb_base,
+                        self.width,
+                        self.height,
+                        self.x,
+                        self.y,
+                        ch,
+                        self.color,
+                    );
                 }
                 self.x += 8;
             }

@@ -3,6 +3,7 @@
 //! このモジュールはタスクの基本的な構造体、状態、優先度を定義します。
 
 use alloc::boxed::Box;
+use alloc::vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::paging::KERNEL_VIRTUAL_BASE;
@@ -165,31 +166,72 @@ pub enum TaskState {
     Terminated,
 }
 
-/// タスクスタック
-const STACK_SIZE: usize = 16384; // 16KB
+/// デフォルトのタスクスタックサイズ
+const DEFAULT_STACK_SIZE: usize = 16384; // 16KB
+const STACK_ALIGNMENT: usize = 16;
+const FXSAVE_AREA_SIZE: u64 = 512;
+const FXSAVE_SAVED_RSP_OFFSET: u64 = 504;
 
-#[repr(align(16))]
-pub(super) struct TaskStack([u8; STACK_SIZE]);
+pub(super) struct TaskStack {
+    storage: Box<[u128]>,
+    size_bytes: usize,
+}
 
 impl TaskStack {
-    pub(super) const fn new() -> Self {
-        Self([0; STACK_SIZE])
+    pub(super) fn new() -> Self {
+        Self::with_size(DEFAULT_STACK_SIZE)
+    }
+
+    pub(super) fn with_size(size_bytes: usize) -> Self {
+        let size_bytes = size_bytes
+            .max(DEFAULT_STACK_SIZE)
+            .next_multiple_of(STACK_ALIGNMENT);
+        let word_count = size_bytes / STACK_ALIGNMENT;
+        let storage = vec![0; word_count].into_boxed_slice();
+        Self {
+            storage,
+            size_bytes,
+        }
+    }
+
+    fn base(&self) -> u64 {
+        let base = self.storage.as_ptr() as u64;
+        if base >= KERNEL_VIRTUAL_BASE {
+            base
+        } else {
+            KERNEL_VIRTUAL_BASE + base
+        }
+    }
+
+    pub(super) fn bottom(&self) -> u64 {
+        self.base()
     }
 
     /// スタックの最上位アドレスを取得（仮想アドレス）
     pub(super) fn top(&self) -> u64 {
-        let base = self.0.as_ptr() as u64;
-        let physical_top = base + STACK_SIZE as u64;
+        self.bottom() + self.size_bytes as u64
+    }
 
-        // ヒープは物理アドレスで割り当てられるため、カーネル仮想アドレスに変換
-        // カーネルは KERNEL_VIRTUAL_BASE (0xFFFF800000000000) 以降で動作
-        if physical_top >= KERNEL_VIRTUAL_BASE {
-            // 既に仮想アドレス
-            physical_top
-        } else {
-            // 物理アドレスを仮想アドレスに変換
-            KERNEL_VIRTUAL_BASE + physical_top
-        }
+    pub(super) fn contains_addr(&self, addr: u64) -> bool {
+        let bottom = self.bottom();
+        let top = self.top();
+        addr >= bottom && addr < top
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskContextSnapshot {
+    pub stack_bottom: u64,
+    pub stack_top: u64,
+    pub context_rsp: u64,
+    pub context_rsp_in_range: bool,
+    pub saved_rsp_before_fxsave: Option<u64>,
+    pub saved_rsp_in_range: bool,
+}
+
+impl TaskContextSnapshot {
+    pub fn is_valid(&self) -> bool {
+        self.context_rsp_in_range && self.saved_rsp_in_range
     }
 }
 
@@ -221,6 +263,8 @@ pub struct Task {
     /// タスク専用スタック（ヒープに割り当て）
     #[allow(dead_code)]
     stack: Box<TaskStack>,
+    /// 既存の外部スタックを引き継ぐタスク向けの許可範囲
+    adopted_stack_range: Option<(u64, u64)>,
 }
 
 impl Task {
@@ -242,8 +286,18 @@ impl Task {
         nice: Nice,
         entry_point: extern "C" fn() -> !,
     ) -> Result<Self, TaskError> {
+        Self::new_with_stack_size(name, nice, DEFAULT_STACK_SIZE, entry_point)
+    }
+
+    /// Normalクラスのタスクを指定スタックサイズで作成
+    pub fn new_with_stack_size(
+        name: &'static str,
+        nice: Nice,
+        stack_size: usize,
+        entry_point: extern "C" fn() -> !,
+    ) -> Result<Self, TaskError> {
         // スタックをヒープに割り当て
-        let stack = Box::new(TaskStack::new());
+        let stack = Box::new(TaskStack::with_size(stack_size));
         let stack_top = stack.top();
 
         let context = Context::new(entry_point as u64, stack_top)?;
@@ -263,6 +317,7 @@ impl Task {
             context,
             state: TaskState::Ready,
             stack,
+            adopted_stack_range: None,
         })
     }
 
@@ -305,6 +360,7 @@ impl Task {
             context,
             state: TaskState::Ready,
             stack,
+            adopted_stack_range: None,
         })
     }
 
@@ -338,6 +394,7 @@ impl Task {
             context,
             state: TaskState::Ready,
             stack,
+            adopted_stack_range: None,
         })
     }
 
@@ -413,6 +470,47 @@ impl Task {
     /// コンテキストへの可変参照を取得
     pub fn context_mut(&mut self) -> &mut Context {
         &mut self.context
+    }
+
+    pub fn adopt_stack_range(&mut self, stack_bottom: u64, stack_top: u64) {
+        self.adopted_stack_range = Some((stack_bottom, stack_top));
+    }
+
+    pub fn context_snapshot(&self) -> TaskContextSnapshot {
+        let (stack_bottom, stack_top) = self
+            .adopted_stack_range
+            .unwrap_or_else(|| (self.stack.bottom(), self.stack.top()));
+        let context_rsp = self.context.rsp;
+        let fxsave_end = context_rsp.checked_add(FXSAVE_AREA_SIZE);
+        let context_rsp_in_range = context_rsp % STACK_ALIGNMENT as u64 == 0
+            && self.stack.contains_addr(context_rsp)
+            && fxsave_end.is_some_and(|end| end <= stack_top);
+        let context_rsp_in_range = if self.adopted_stack_range.is_some() {
+            context_rsp % STACK_ALIGNMENT as u64 == 0
+                && context_rsp >= stack_bottom
+                && fxsave_end.is_some_and(|end| end <= stack_top)
+        } else {
+            context_rsp_in_range
+        };
+        let saved_rsp_before_fxsave = if context_rsp_in_range {
+            // SAFETY: `context_rsp` がこのタスクの stack 範囲内にあり、
+            // fxsave 領域全体が stack 内に収まることを確認済み。
+            Some(unsafe { *((context_rsp + FXSAVE_SAVED_RSP_OFFSET) as *const u64) })
+        } else {
+            None
+        };
+        let saved_rsp_in_range = saved_rsp_before_fxsave
+            .map(|saved_rsp| saved_rsp >= stack_bottom && saved_rsp <= stack_top)
+            .unwrap_or(false);
+
+        TaskContextSnapshot {
+            stack_bottom,
+            stack_top,
+            context_rsp,
+            context_rsp_in_range,
+            saved_rsp_before_fxsave,
+            saved_rsp_in_range,
+        }
     }
 }
 

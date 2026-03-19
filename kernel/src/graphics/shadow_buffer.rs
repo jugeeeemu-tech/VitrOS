@@ -203,9 +203,10 @@ impl DrawTarget for ShadowBuffer {
     fn fill_rect(&mut self, x: u32, y: u32, w: u32, h: u32, color: u32) {
         // SAFETY: base_addrは自身のバッファを指す有効なアドレス
         unsafe {
-            super::draw_rect(
+            super::draw_rect_with_height(
                 self.base_addr(),
                 self.width,
+                self.height,
                 x as usize,
                 y as usize,
                 w as usize,
@@ -219,9 +220,10 @@ impl DrawTarget for ShadowBuffer {
     fn draw_char(&mut self, x: u32, y: u32, ch: u8, color: u32) {
         // SAFETY: base_addrは自身のバッファを指す有効なアドレス
         unsafe {
-            super::draw_char(
+            super::draw_char_with_height(
                 self.base_addr(),
                 self.width,
+                self.height,
                 x as usize,
                 y as usize,
                 ch,
@@ -234,9 +236,10 @@ impl DrawTarget for ShadowBuffer {
     fn draw_string(&mut self, x: u32, y: u32, s: &str, color: u32) {
         // SAFETY: base_addrは自身のバッファを指す有効なアドレス
         unsafe {
-            super::draw_string(
+            super::draw_string_with_height(
                 self.base_addr(),
                 self.width,
+                self.height,
                 x as usize,
                 y as usize,
                 s,
@@ -355,5 +358,26 @@ mod tests {
         assert_eq!(hw[1], 0xFFFF_FFFFu32);
         assert_eq!(hw[14], 0xFFFF_FFFFu32);
         assert!(buffer.dirty_regions.is_empty());
+    }
+
+    #[test_case]
+    fn test_draw_string_clips_bottom_edge() {
+        let mut buffer = ShadowBuffer::new(8, 8);
+
+        buffer.draw_string(0, 7, "A", 0x00FF_FFFF);
+
+        assert_eq!(buffer.buffer.len(), 64);
+        assert_eq!(buffer.dirty_regions, vec![Region::new(0, 7, 8, 1)]);
+        assert!(buffer.buffer.iter().filter(|pixel| **pixel != 0).count() <= 8);
+    }
+
+    #[test_case]
+    fn test_fill_rect_clips_bottom_edge() {
+        let mut buffer = ShadowBuffer::new(4, 4);
+
+        buffer.fill_rect(0, 3, 4, 4, 0x0012_3456);
+
+        assert_eq!(buffer.buffer[12..16], [0x0012_3456; 4]);
+        assert_eq!(buffer.buffer[8..12], [0; 4]);
     }
 }
